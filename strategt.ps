@@ -1,0 +1,192 @@
+// @version=5
+strategy("GILDO FVG v10.1 — Institutional Positional", overlay=true, initial_capital=10000, default_qty_value=100, pyramiding=0)
+
+isFvgToShow = input.bool(true, title='Display FVG')
+bullishFvgColor = input.color(color.new(color.green, 50), 'Bullish FVG Color')
+bearishFvgColor = input.color(color.new(color.red, 50), 'Bearish FVG Color')
+mitigatedFvgColor = input.color(color.new(color.gray, 50), 'Mitigated FVG Color')
+fvgHistoryNbr = input.int(5, 'Number of FVGs to show', minval=1, maxval=50)
+isMitigatedFvgToReduce = input.bool(true, title='Reduce mitigated FVG')
+minFvgPowerPct = input.float(0.1, "Min FVG Power %", step=0.01)
+demandZoneColor = input.color(color.new(color.blue, 50), 'Demand Zone Color')
+supplyZoneColor = input.color(color.new(color.orange, 50), 'Supply Zone Color')
+htfTF = input.timeframe("240", "HTF Bias (4H)")
+atrPeriod = input.int(14, "ATR Period", minval=1)
+slMultiplier = input.float(4.0, "SL ATR Multiplier", step=0.1)
+tpMultiplier = input.float(25.0, "TP ATR Multiplier (Positional: Wider Targets)", step=0.1)  // Increased for longer holds
+useTrailing = input.bool(true, "Use Trailing Stop")
+trailOffsetMult = input.float(8.0, "Trailing Offset ATR Multiplier (Wide for Positional)", step=0.1)  
+holdUntilOpposite = input.bool(true, "Hold Until Opposite BOS/CHoCH")  
+
+htfClose = request.security(syminfo.tickerid, htfTF, close)
+htfEMA = ta.ema(htfClose, 50)
+isBullishHTF = close > htfEMA
+isBearishHTF = close < htfEMA
+
+volOK = volume > ta.sma(volume, 20) * 1.2
+atrVal = ta.atr(atrPeriod)
+atrOK = atrVal > ta.sma(atrVal, 20)
+marketOK = volOK and atrOK
+var bool lastBullFvg = false
+var bool lastBearFvg = false
+var bool lastPositionWasLong = false
+var bool lastPositionWasShort = false
+var float longTrailStop = na
+var float longTp = na
+var float entryAtrLong = na
+var float shortTrailStop = na
+var float shortTp = na
+var float entryAtrShort = na
+var array<box> fvgBoxes = array.new_box()
+var array<bool> fvgTypes = array.new_bool()
+var array<label> fvgLabels = array.new_label()
+var array<box> zoneBoxes = array.new_box()
+var array<label> zoneLabels = array.new_label()
+var array<bool> isMitigated = array.new_bool()
+var float prevStructureHigh = na
+var float prevStructureLow = na
+structureHigh = ta.highest(high[1], 20)  // Exclude current bar
+structureLow = ta.lowest(low[1], 20)
+prevStructureHigh := nz(prevStructureHigh, structureHigh)
+prevStructureLow := nz(prevStructureLow, structureLow)
+if barstate.isconfirmed
+    prevStructureHigh := structureHigh
+    prevStructureLow := structureLow
+
+plot(structureHigh, color=color.new(color.red, 0), title="Structure High")
+plot(structureLow, color=color.new(color.green, 0), title="Structure Low")
+
+
+isBullishFVG = high[3] < low[1] and not lastBullFvg  // Dedupe
+isBearishFVG = low[3] > high[1] and not lastBearFvg
+lastBullFvg := isBullishFVG
+lastBearFvg := isBearishFVG
+gapClose = close[2]
+bullishPowerOK = isBullishFVG and (low[1] - high[3]) / gapClose * 100 >= minFvgPowerPct
+bearishPowerOK = isBearishFVG and (low[3] - high[1]) / gapClose * 100 >= minFvgPowerPct
+
+
+extendRight = 500  // Extend far for visibility
+if bullishPowerOK and isBullishHTF and marketOK and isFvgToShow
+    boxBull = box.new(left=bar_index[2], top=low[1], right=bar_index + extendRight, bottom=high[3], bgcolor=bullishFvgColor, extend=extend.none)
+    labelBull = label.new(bar_index[1], low[1], text="FVG", style=label.style_label_up, color=color.new(color.green, 0), size=size.small)
+    // Demand zone matching FVG edges
+    boxDemand = box.new(left=bar_index[3], top=low[1], right=bar_index + 20, bottom=high[3], bgcolor=demandZoneColor, border_color=color.blue)
+    labelDemand = label.new(bar_index[3], (low[1] + high[3])/2, text="Demand", style=label.style_label_left, color=color.new(color.blue, 0), size=size.small)
+    array.push(fvgBoxes, boxBull)
+    array.push(fvgTypes, true)
+    array.push(fvgLabels, labelBull)
+    array.push(zoneBoxes, boxDemand)
+    array.push(zoneLabels, labelDemand)
+    array.push(isMitigated, false)
+
+if bearishPowerOK and isBearishHTF and marketOK and isFvgToShow
+    boxBear = box.new(left=bar_index[2], top=low[3], right=bar_index + extendRight, bottom=high[1], bgcolor=bearishFvgColor, extend=extend.none)
+    labelBear = label.new(bar_index[1], high[1], text="FVG", style=label.style_label_down, color=color.new(color.red, 0), size=size.small)
+    // Supply zone matching FVG edges
+    boxSupply = box.new(left=bar_index[3], top=low[3], right=bar_index + 20, bottom=high[1], bgcolor=supplyZoneColor, border_color=color.orange)
+    labelSupply = label.new(bar_index[3], (low[3] + high[1])/2, text="Supply", style=label.style_label_right, color=color.new(color.orange, 0), size=size.small)
+    array.push(fvgBoxes, boxBear)
+    array.push(fvgTypes, false)
+    array.push(fvgLabels, labelBear)
+    array.push(zoneBoxes, boxSupply)
+    array.push(zoneLabels, labelSupply)
+    array.push(isMitigated, false)
+
+
+if array.size(fvgBoxes) > fvgHistoryNbr
+    oldBox = array.shift(fvgBoxes)
+    box.delete(oldBox)
+    array.shift(fvgTypes)
+    oldLabel = array.shift(fvgLabels)
+    label.delete(oldLabel)
+    array.shift(zoneBoxes)
+    oldZoneLabel = array.shift(zoneLabels)
+    label.delete(oldZoneLabel)
+    array.shift(isMitigated)
+
+isBOS = ta.crossover(close, prevStructureHigh[1])  // Use prev to allow cross
+isCHOCH = ta.crossunder(close, prevStructureLow[1])
+if isBOS
+    label.new(bar_index, prevStructureHigh[1], "BOS", style=label.style_label_down, color=color.new(color.yellow, 0), size=size.small)
+    line.new(bar_index - 1, prevStructureHigh[1], bar_index + 5, prevStructureHigh[1], color=color.yellow, width=2)  // Brief plot
+if isCHOCH
+    label.new(bar_index, prevStructureLow[1], "CHoCH", style=label.style_label_up, color=color.new(color.yellow, 0), size=size.small)
+    line.new(bar_index - 1, prevStructureLow[1], bar_index + 5, prevStructureLow[1], color=color.yellow, width=2)  // Brief plot
+
+// === ENTRY LOGIC ===
+atr = ta.atr(atrPeriod)
+inPosition = strategy.position_size != 0
+if array.size(fvgBoxes) > 0 and not inPosition
+    for i = math.max(0, array.size(fvgBoxes) - fvgHistoryNbr) to array.size(fvgBoxes) - 1  // Only recent
+        if i < array.size(isMitigated)
+            fvg = array.get(fvgBoxes, i)
+            isBull = array.get(fvgTypes, i)
+            mitigated = array.get(isMitigated, i)
+            if not mitigated
+                fvgBottom = box.get_bottom(fvg)
+                fvgTop = box.get_top(fvg)
+                touchesFVG = high >= fvgBottom and low <= fvgTop  // Full touch
+                if isBull and touchesFVG and isBullishHTF and marketOK
+                    strategy.entry("Buy", strategy.long, comment="buy")
+                    longTrailStop := close - atr * slMultiplier
+                    longTp := close + atr * tpMultiplier
+                    entryAtrLong := atr
+                    array.set(isMitigated, i, true)
+                    box.set_bgcolor(fvg, mitigatedFvgColor)
+                    if isMitigatedFvgToReduce
+                        box.set_right(fvg, bar_index)
+                    lastPositionWasLong := true
+                    lastPositionWasShort := false
+                   
+                if not isBull and touchesFVG and isBearishHTF and marketOK
+                    strategy.entry("Sell", strategy.short, comment="sell")
+                    shortTrailStop := close + atr * slMultiplier
+                    shortTp := close - atr * tpMultiplier
+                    entryAtrShort := atr
+                    array.set(isMitigated, i, true)
+                    box.set_bgcolor(fvg, mitigatedFvgColor)
+                    if isMitigatedFvgToReduce
+                        box.set_right(fvg, bar_index)
+                    lastPositionWasShort := true
+                    lastPositionWasLong := false
+                   
+// === UPDATE TRAILING STOPS ===
+if strategy.position_size > 0
+    if useTrailing
+        potentialStop = high - entryAtrLong * trailOffsetMult
+        longTrailStop := math.max(longTrailStop, potentialStop)
+    strategy.exit("Exit Buy", from_entry="Buy",comment ="close", stop=longTrailStop, limit=longTp)
+if strategy.position_size < 0
+    if useTrailing
+        potentialStop = low + entryAtrShort * trailOffsetMult
+        shortTrailStop := math.min(shortTrailStop, potentialStop)
+    strategy.exit("Exit Sell", from_entry="Sell",comment ="close", stop=shortTrailStop, limit=shortTp)//
+
+//
+if holdUntilOpposite and inPosition
+    if strategy.position_size > 0 and lastPositionWasLong and isCHOCH  
+        strategy.close("Buy", comment="Close")
+        longTrailStop := na
+        longTp := na
+        entryAtrLong := na
+    if strategy.position_size < 0 and lastPositionWasShort and isBOS  
+        strategy.close("Sell", comment="Close")
+        shortTrailStop := na
+        shortTp := na
+        entryAtrShort := na
+
+
+plot(htfEMA, color=color.new(color.blue, 0), title="HTF EMA")
+plotshape(strategy.position_size > 0, title="Buy Signal", style=shape.triangleup, color=color.new(color.green, 0), location=location.belowbar)
+plotshape(strategy.position_size < 0, title="Sell Signal", style=shape.triangledown, color=color.new(color.red, 0), location=location.abovebar)
+
+if barstate.islast
+    trades = strategy.closedtrades
+    wins = 0
+    for i = 0 to trades - 1
+        if strategy.closedtrades.profit(i) > 0
+            wins += 1
+    winRate = trades > 0 ? (wins / trades) * 100 : 0.0
+    var table perfTable = table.new(position.top_right, 1, 1, bgcolor=color.white, border_width=1)
+    table.cell(perfTable, 0, 0, "Win Rate: " + str.tostring(winRate, "#.##") + "%", text_color=color.black, text_size=size.small)

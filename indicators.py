@@ -1,0 +1,2 @@
+def ema(bars):
+    pass
