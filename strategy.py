@@ -85,6 +85,11 @@ entryAtrShort = None
 prevStructureHigh = data["high"].iloc[-21:-1].max()
 prevStructureLow =  data["low"].iloc[-21:-1].min()
 
+# Track previous bar's structure values for crossover/crossunder detection
+# These need to be persisted between runs (store in a file or class state)
+prevStructureHigh_prev = prevStructureHigh  # Will be updated after each bar
+prevStructureLow_prev = prevStructureLow   # Will be updated after each bar
+
 isBullishFVG = data["high"].iloc[-4] < data["low"].iloc[-2] and not lastBullFvg
 isBearishFVG = data["low"].iloc[-4] > data["high"].iloc[-2] and not lastBearFvg
 lastBullFvg = isBullishFVG
@@ -136,7 +141,7 @@ if fvg_zones and not inPosition:
             and isBullishHTF
             and marketOK
         ):
-            # TODO: place buy order here
+            # TODO: buy order here
             longTrailStop = close - atr * slMultiplier
             longTp = close + atr * tpMultiplier
             entryAtrLong = atr
@@ -159,3 +164,72 @@ if fvg_zones and not inPosition:
             lastPositionWasShort = True
             lastPositionWasLong = False
             inPosition = True
+
+
+# BOS/CHoCH detection using crossover/crossunder
+# PineScript: isBOS = ta.crossover(close, prevStructureHigh[1])
+# prevStructureHigh[1] means the value from 1 bar ago
+current_close = data["close"].iloc[-1]
+previous_close = data["close"].iloc[-2]
+
+isBOS = crossover(
+    current_close,
+    previous_close,
+    prevStructureHigh_prev,  # prevStructureHigh[1] in PineScript
+    prevStructureHigh_prev   # same threshold for both bars
+)
+
+# PineScript: isCHOCH = ta.crossunder(close, prevStructureLow[1])
+isCHOCH = crossunder(
+    current_close,
+    previous_close,
+    prevStructureLow_prev,   # prevStructureLow[1] in PineScript
+    prevStructureLow_prev    # same threshold for both bars
+)
+
+# Update previous structure values for next bar (after using them)
+prevStructureHigh_prev = prevStructureHigh
+prevStructureLow_prev = prevStructureLow
+
+
+
+
+# === UPDATE TRAILING STOPS ===
+current_high = data["high"].iloc[-1]
+current_low = data["low"].iloc[-1]
+
+if inPosition and lastPositionWasLong:
+    if useTrailing and entryAtrLong is not None:
+        potentialStop = current_high - entryAtrLong * trailOffsetMult
+        if longTrailStop is not None:
+            longTrailStop = max(longTrailStop, potentialStop)
+        else:
+            longTrailStop = potentialStop
+    # TODO: place exit order with stop=longTrailStop, limit=longTp
+
+if inPosition and lastPositionWasShort:
+    if useTrailing and entryAtrShort is not None:
+        potentialStop = current_low + entryAtrShort * trailOffsetMult
+        if shortTrailStop is not None:
+            shortTrailStop = min(shortTrailStop, potentialStop)
+        else:
+            shortTrailStop = potentialStop
+    # TODO: place exit order with stop=shortTrailStop, limit=shortTp
+
+# === CLOSE ON OPPOSITE BOS/CHoCH ===
+if holdUntilOpposite and inPosition:
+    if lastPositionWasLong and isCHOCH:
+        # TODO: close long position
+        longTrailStop = None
+        longTp = None
+        entryAtrLong = None
+        inPosition = False
+        lastPositionWasLong = False
+
+    if lastPositionWasShort and isBOS:
+        # TODO: close short position
+        shortTrailStop = None
+        shortTp = None
+        entryAtrShort = None
+        inPosition = False
+        lastPositionWasShort = False

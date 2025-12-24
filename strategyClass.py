@@ -26,12 +26,30 @@ class Strategy:
         self.isBullishHTF = None
         self.isBearishHTF = None
         self.marketOK = None
-        self.lastBullFvg = False
-        self.lastBearFvg = False
         self.bullishPowerOK = None
         self.bearishPowerOK = None
+        self.isBOS = None
+        self.isCHOCH = None
+        self.prevStructureHigh = None
+        self.prevStructureLow = None
+
+        self.inPosition = False
+        self.lastBullFvg = False
+        self.lastBearFvg = False
+        self.lastPositionWasLong = False
+        self.lastPositionWasShort = False
+        self.longTrailStop = None
+        self.longTp = None
+        self.entryAtrLong = None
+        self.shortTrailStop = None
+        self.shortTp = None
+        self.entryAtrShort = None
 
         self.calculate_indicators()
+
+        self.fvg_zones: list[dict] = []
+        self.add_fvg_zones()
+
 
     def gather_data(self):
         data = load_data(self.asset)
@@ -44,9 +62,9 @@ class Strategy:
         new_row = fetch_data(self.asset, self.timeframe, 1)
         self.cur_close = new_row["close"].iloc[0]
         self.cur_volume = new_row["volume"].iloc[0]
-        self.data = pd.concat([self.data, new_row], ignore_index=True)
+        self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
 
-    def calculate_indicators(self):
+    def update_trend_indicators(self):
         bars = fetch_data("gold", "4h", 50)
         htfEMA = ema(bars, 50)
 
@@ -54,7 +72,7 @@ class Strategy:
         self.isBearishHTF = self.cur_close < htfEMA
 
         volOK = self.cur_volume > sma(self.data["volume"], 20) * 1.2
-        atrVal = get_atr(ATR_PERIOD)
+        atrVal = get_atr(self.data, ATR_PERIOD)
         atrOK = atrVal > sma(atrVal, 20)
         self.marketOK = volOK and atrOK
 
@@ -62,20 +80,124 @@ class Strategy:
         self.lastBullFvg  = self.data["high"].iloc[-4] < self.data["low"].iloc[-2] and not self.lastBullFvg
         self.lastBearFvg = self.data["low"].iloc[-4] > self.data["high"].iloc[-2] and not self.lastBearFvg
 
+    def calc_BOS_and_CHOCH(self):       
+        self.prevStructureHigh = self.data["high"].iloc[-21:-1].max()
+        self.prevStructureLow = self.data["low"].iloc[-21:-1].min()
+
+        previous_close = self.data["close"].iloc[-2]
+
+        self.isBOS = crossover(
+            self.cur_close,
+            previous_close,
+            self.prevStructureHigh,  # prevStructureHigh[1] in PineScript
+        )
+
+        # PineScript: isCHOCH = ta.crossunder(close, prevStructureLow[1])
+        self.isCHOCH = crossunder(
+            self.cur_close,
+            previous_close,
+            self.prevStructureLow,   # prevStructureLow[1] in PineScript
+        )
+
+    def calculate_indicators(self):
+        self.update_trend_indicators()
+
         gapClose = self.data["close"].iloc[-3]
 
         self.bullishPowerOK = (
-            self.isBullishFVG
+            self.lastBullFvg
             and (self.data["low"].iloc[-2] - self.data["high"].iloc[-4]) / gapClose * 100 >= MIN_FVG_POWER_PCT
         )
 
         self.bearishPowerOK = (
-            self.isBearishFVG
+            self.lastBearFvg
             and (self.data["low"].iloc[-4] - self.data["high"].iloc[-2]) / gapClose * 100 >= MIN_FVG_POWER_PCT
         )
 
+        self.calc_BOS_and_CHOCH()
+
+    def add_fvg_zones(self):
+        # === FVG ZONE CREATION (equivalent to the box.new blocks) ===
+        if self.bullishPowerOK and self.isBullishHTF and self.marketOK and IS_FVG_TO_SHOW:
+            # Bullish FVG uses low[1] as top and high[3] as bottom in Pine
+            self.fvg_zones.append(
+                {
+                    "direction": "bull",
+                    "top": self.data["low"].iloc[-2],     # low[1]
+                    "bottom": self.data["high"].iloc[-4], # high[3]
+                    "mitigated": False,
+                }
+            )
+
+        if self.bearishPowerOK and self.isBearishHTF and self.marketOK and IS_FVG_TO_SHOW:
+            # Bearish FVG uses low[3] as top and high[1] as bottom in Pine
+            self.fvg_zones.append(
+                {
+                    "direction": "bear",
+                    "top": self.data["low"].iloc[-4],     # low[3]
+                    "bottom": self.data["high"].iloc[-2], # high[1]
+                    "mitigated": False,
+                }
+            )
+
+        # Limit number of stored FVGs, similar to fvgHistoryNbr trimming in Pine
+        if len(self.fvg_zones) > FVG_HISTORY_NBR:
+            self.fvg_zones = self.fvg_zones[-FVG_HISTORY_NBR:]
+
+    def entry_logic(self):
+        current_high = self.data["high"].iloc[-1]
+        current_low = self.data["low"].iloc[-1]
+
+        atr = get_atr(self.data, ATR_PERIOD)
+
+        for zone in self.fvg_zones[-FVG_HISTORY_NBR:]:
+            if zone["mitigated"]:
+                continue
+
+            fvg_bottom = zone["bottom"]
+            fvg_top = zone["top"]
+
+            # Full touch: current bar's high/low overlaps the FVG zone
+            touchesFVG = current_high >= fvg_bottom and current_low <= fvg_top
+
+            if (
+                zone["direction"] == "bull"
+                and touchesFVG
+                and self.isBullishHTF
+                and self.marketOK
+            ):
+                # TODO: buy order here
+                self.longTrailStop = self.cur_close - atr * SL_MULTIPLIER
+                self.longTp = self.cur_close + atr * TP_MULTIPLIER
+                self.entryAtrLong = atr
+                zone["mitigated"] = True
+                self.lastPositionWasLong = True
+                self.lastPositionWasShort = False
+                self.inPosition = True
+
+            elif (
+                zone["direction"] == "bear"
+                and touchesFVG
+                and self.isBearishHTF
+                and self.marketOK
+            ):
+                # TODO: place sell order here
+                self.shortTrailStop = self.cur_close + atr * SL_MULTIPLIER
+                self.shortTp = self.cur_close - atr * TP_MULTIPLIER
+                self.entryAtrShort = atr
+                zone["mitigated"] = True
+                self.lastPositionWasShort = True
+                self.lastPositionWasLong = False
+                self.inPosition = True
 
 
+    def first_iteration(self):
+        self.data = self.gather_data()
+        self.calculate_indicators()
+        self.add_fvg_zones()
+
+    def run_iteration(self):
+        pass
 
 if __name__ == "__main__":
     for pair in ASSETS.items():
