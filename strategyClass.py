@@ -34,10 +34,20 @@ class Order:
     def close_order(self):
         pass
 
-    def check_stops(self):
-        # compares cur price with tp and trailing sl
-        pass
+    def check_stops(self, current_price):
+        if self.side == "BUY":
+            if current_price <= self.trailing_stop_loss:
+                self.close_order()
 
+            if current_price >= self.take_profit:
+                self.close_order()
+        
+        elif self.side == "SELL":
+            if current_price >= self.trailing_stop_loss:
+                self.close_order()
+
+            if current_price <= self.take_profit:
+                self.close_order()
 
 
 class Strategy:
@@ -94,7 +104,7 @@ class Strategy:
 
         volOK = self.cur_volume > sma(self.data["volume"], 20) * 1.2
         atrVal = get_atr(self.data, ATR_PERIOD)
-        atrOK = atrVal > sma(atrVal, 20)
+        atrOK = atrVal.iloc[-1] > sma(atrVal, 20)
         self.marketOK = volOK and atrOK
 
 
@@ -166,10 +176,13 @@ class Strategy:
             self.fvg_zones = self.fvg_zones[-FVG_HISTORY_NBR:]
 
     def entry_logic(self):
+        if len(self.fvg_zones) == 0 or self.inPosition:
+            return
+
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
 
-        atr = get_atr(self.data, ATR_PERIOD)
+        atr = get_atr(self.data, ATR_PERIOD).iloc[-1]
 
         for zone in self.fvg_zones[-FVG_HISTORY_NBR:]:
             if zone["mitigated"]:
@@ -195,6 +208,7 @@ class Strategy:
                 self.lastPositionWasLong = True
                 self.lastPositionWasShort = False
                 self.inPosition = True
+                break
 
 
             elif (
@@ -211,12 +225,15 @@ class Strategy:
                 self.lastPositionWasShort = True
                 self.lastPositionWasLong = False
                 self.inPosition = True
+                break
 
-    def stop_logic(self):
+    def update_stops(self):
+        pos = self.active_order
+        if pos is None:
+            return
+
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
-
-        pos = self.active_order
 
         # === UPDATE TRAILING STOPS ===
         if self.inPosition and self.lastPositionWasLong:
@@ -226,7 +243,6 @@ class Strategy:
                     pos.trailing_stop_loss = max(pos.trailing_stop_loss, potentialStop)
                 else:
                     pos.trailing_stop_loss = potentialStop
-            # TODO: place exit order with stop=pos.trailing_stop_loss, limit=pos.take_profit
 
         if self.inPosition and self.lastPositionWasShort:
             if USE_TRAILING and pos.entry_atr is not None:
@@ -235,18 +251,17 @@ class Strategy:
                     pos.trailing_stop_loss = min(pos.trailing_stop_loss, potentialStop)
                 else:
                     pos.trailing_stop_loss = potentialStop
-            # TODO: place exit order with stop=pos.trailing_stop_loss, limit=pos.take_profit
 
         # === CLOSE ON OPPOSITE BOS/CHoCH ===
         if HOLD_UNTIL_OPPOSITE and self.inPosition:
             if self.lastPositionWasLong and self.isCHOCH:
-                # TODO: close long position
+                self.active_order.close_order()
                 self.active_order = None
                 self.inPosition = False
                 self.lastPositionWasLong = False
 
             if self.lastPositionWasShort and self.isBOS:
-                # TODO: close short position
+                self.active_order.close_order()
                 self.active_order = None
                 self.inPosition = False
                 self.lastPositionWasShort = False
@@ -258,15 +273,14 @@ class Strategy:
         self.calculate_indicators()
         self.add_fvg_zones()
         self.entry_logic()
-        self.stop_logic()
+        self.update_stops()
 
     def run_bar_iteration(self):
-        self.cur_close = self.data["close"].iloc[-1]
-        self.cur_volume = self.data["volume"].iloc[-1]
+        self.fetch_new_data()
         self.calculate_indicators()
         self.add_fvg_zones()
         self.entry_logic()
-        self.stop_logic()
+        self.update_stops()
 
     def run_websocket_iteration(self):
         if self.active_order is None:
