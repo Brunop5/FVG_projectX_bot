@@ -13,26 +13,131 @@ TP_MULTIPLIER = 25.0               # TP ATR Multiplier (Positional: Wider Target
 USE_TRAILING = True                # use trailing stop
 TRAIL_OFFSET_MULT = 8.0            # Trailing Offset ATR Multiplier (Wide for Positional)
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
+
 ASSETS = {"gold":"30min"}
+USERNAME = "TestName"
+API_KEY = "apikey"
 
 class Order:
     def __init__(self, side: str, entry_price: float,
                 take_profit: float, trailing_stop_loss,
-                entry_atr: float):
+                account_id, asset_id, auth):
         self.side = side
         self.entry_price = entry_price
         self.take_profit = take_profit
         self.trailing_stop_loss = trailing_stop_loss
-        self.entry_atr = entry_atr
+
+        self.account_id = account_id
+        self.asset_id = asset_id
+        self.auth_token = auth
 
         self.place_order()
 
     def place_order(self):
-        # place order through api
-        pass
+        """
+        Place an order using ProjectX Gateway API.
+        Based on: https://gateway.docs.projectx.com/docs/api-reference/order/order-place
+        """
+
+        order_size = getattr(self, 'order_size', 1)  # Default to 1 contract
+        
+        if not self.auth_token:
+            print("Error: auth_token is required to place order")
+            return {'success': False, 'message': 'auth_token is required'}
+        
+        url = " https://api.topstepx.com/api/Order/place"
+        
+        headers = {
+            'accept': 'text/plain',
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.auth_token}'
+        }
+        
+        # Map side: "BUY" -> 0 (Bid), "SELL" -> 1 (Ask)
+        side_code = 0 if self.side.upper() == "BUY" else 1
+        
+        payload = {
+            "accountId": self.account_id,
+            "contractId": self.asset_id,
+            "type": 2,  # 2 = Market order
+            "side": side_code,  # 0 = Bid (buy), 1 = Ask (sell)
+            "size": order_size,
+            "limitPrice": None,
+            "stopPrice": None,
+            "trailPrice": None,
+            "customTag": None,
+        }
+        
+        try:
+            import requests
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("success", False):
+                    self.order_id = result.get("orderId")
+                    print(f"Order placed successfully. Order ID: {self.order_id}")
+                    return {
+                        'success': True,
+                        'order_id': self.order_id,
+                        'message': 'Order placed successfully'
+                    }
+                else:
+                    error_msg = result.get("errorMessage", "Unknown error")
+                    print(f"Order placement failed: {error_msg}")
+                    return {
+                        'success': False,
+                        'order_id': None,
+                        'message': error_msg
+                    }
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text}"
+                print(f"Order placement failed: {error_msg}")
+                return {
+                    'success': False,
+                    'order_id': None,
+                    'message': error_msg
+                }
+        
+        except ImportError:
+            return {
+                'success': False,
+                'order_id': None,
+                'message': 'requests library not installed. Install with: pip install requests'
+            }
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            print(error_msg)
+            return {
+                'success': False,
+                'order_id': None,
+                'message': error_msg
+            }
 
     def close_order(self):
-        pass
+        url = "https://api.topstepx.com/api/Position/closeContract"
+
+        headers = {
+            "Authorization": f"Bearer {self.auth_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "accountId": self.account_id,
+            "contractId": self.asset_id
+        }
+
+        response = requests.post(url, json=payload, headers=headers)
+        
+        # Raise for HTTP errors
+        response.raise_for_status()
+
+        # Parse response as JSON
+        try:
+            return response.json()
+        except ValueError:
+            raise Exception(f"Unexpected response: {response.text}")
 
     def check_stops(self, current_price):
         if self.side == "BUY":
@@ -81,6 +186,19 @@ class Strategy:
         self.fvg_zones: list[dict] = []
         self.add_fvg_zones()
 
+        self.auth_token = None
+        self.account_id = None
+        
+        self.init_api()
+
+    def init_api(self):
+        res = login_to_api(USERNAME, API_KEY)
+        if not res["sucess"]:
+            raise RuntimeError("API login failed")
+        
+        self.auth_token = res["token"]
+
+        self.account_id = get_account_id(self.auth_token)
 
     def gather_data(self):
         data = load_data(self.asset)
@@ -91,6 +209,8 @@ class Strategy:
 
     def fetch_new_data(self):
         new_row = fetch_data(self.asset, self.timeframe, 1)
+        if new_row is None:
+            return
         self.cur_close = new_row["close"].iloc[0]
         self.cur_volume = new_row["volume"].iloc[0]
         self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
@@ -203,7 +323,8 @@ class Strategy:
                 trailStop = self.cur_close - atr * SL_MULTIPLIER
                 tp = self.cur_close + atr * TP_MULTIPLIER
                 entryAtr = atr
-                self.active_order = Order("BUY", self.cur_close, tp, trailStop, entryAtr)
+                self.active_order = Order("BUY", self.cur_close, tp, trailStop, entryAtr,
+                                          self.account_id, self.asset, self.auth_token)
                 zone["mitigated"] = True
                 self.lastPositionWasLong = True
                 self.lastPositionWasShort = False
@@ -220,7 +341,8 @@ class Strategy:
                 trailStop = self.cur_close + atr * SL_MULTIPLIER
                 tp = self.cur_close - atr * TP_MULTIPLIER
                 entryAtr = atr
-                self.active_order = Order("SELL", self.cur_close, tp, trailStop, entryAtr)
+                self.active_order = Order("SELL", self.cur_close, tp, trailStop, entryAtr,
+                                          self.account_id, self.asset, self.auth_token)
                 zone["mitigated"] = True
                 self.lastPositionWasShort = True
                 self.lastPositionWasLong = False
@@ -288,6 +410,5 @@ class Strategy:
         self.active_order.check_stops()
 
 if __name__ == "__main__":
-    for pair in ASSETS.items():
-        strat = Strategy(pair)
-        print(strat.marketOK)
+    res = login_to_api("f", "d")
+    print(res)
