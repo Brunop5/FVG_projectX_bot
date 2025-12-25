@@ -15,8 +15,35 @@ TRAIL_OFFSET_MULT = 8.0            # Trailing Offset ATR Multiplier (Wide for Po
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 ASSETS = {"gold":"30min"}
 
+class Order:
+    def __init__(self, side: str, entry_price: float,
+                take_profit: float, trailing_stop_loss,
+                entry_atr: float):
+        self.side = side
+        self.entry_price = entry_price
+        self.take_profit = take_profit
+        self.trailing_stop_loss = trailing_stop_loss
+        self.entry_atr = entry_atr
+
+        self.place_order()
+
+    def place_order(self):
+        # place order through api
+        pass
+
+    def close_order(self):
+        pass
+
+    def check_stops(self):
+        # compares cur price with tp and trailing sl
+        pass
+
+
+
 class Strategy:
     def __init__(self, asset_pair):
+        self.active_order = None
+
         self.timeframe = asset_pair[1]
         self.asset = asset_pair[0]
         self.data = self.gather_data()
@@ -38,12 +65,6 @@ class Strategy:
         self.lastBearFvg = False
         self.lastPositionWasLong = False
         self.lastPositionWasShort = False
-        self.longTrailStop = None
-        self.longTp = None
-        self.entryAtrLong = None
-        self.shortTrailStop = None
-        self.shortTp = None
-        self.entryAtrShort = None
 
         self.calculate_indicators()
 
@@ -80,7 +101,7 @@ class Strategy:
         self.lastBullFvg  = self.data["high"].iloc[-4] < self.data["low"].iloc[-2] and not self.lastBullFvg
         self.lastBearFvg = self.data["low"].iloc[-4] > self.data["high"].iloc[-2] and not self.lastBearFvg
 
-    def calc_BOS_and_CHOCH(self):       
+    def calc_BOS_and_CHOCH(self):
         self.prevStructureHigh = self.data["high"].iloc[-21:-1].max()
         self.prevStructureLow = self.data["low"].iloc[-21:-1].min()
 
@@ -166,14 +187,15 @@ class Strategy:
                 and self.isBullishHTF
                 and self.marketOK
             ):
-                # TODO: buy order here
-                self.longTrailStop = self.cur_close - atr * SL_MULTIPLIER
-                self.longTp = self.cur_close + atr * TP_MULTIPLIER
-                self.entryAtrLong = atr
+                trailStop = self.cur_close - atr * SL_MULTIPLIER
+                tp = self.cur_close + atr * TP_MULTIPLIER
+                entryAtr = atr
+                self.active_order = Order("BUY", self.cur_close, tp, trailStop, entryAtr)
                 zone["mitigated"] = True
                 self.lastPositionWasLong = True
                 self.lastPositionWasShort = False
                 self.inPosition = True
+
 
             elif (
                 zone["direction"] == "bear"
@@ -181,23 +203,75 @@ class Strategy:
                 and self.isBearishHTF
                 and self.marketOK
             ):
-                # TODO: place sell order here
-                self.shortTrailStop = self.cur_close + atr * SL_MULTIPLIER
-                self.shortTp = self.cur_close - atr * TP_MULTIPLIER
-                self.entryAtrShort = atr
+                trailStop = self.cur_close + atr * SL_MULTIPLIER
+                tp = self.cur_close - atr * TP_MULTIPLIER
+                entryAtr = atr
+                self.active_order = Order("SELL", self.cur_close, tp, trailStop, entryAtr)
                 zone["mitigated"] = True
                 self.lastPositionWasShort = True
                 self.lastPositionWasLong = False
                 self.inPosition = True
+
+    def stop_logic(self):
+        current_high = self.data["high"].iloc[-1]
+        current_low = self.data["low"].iloc[-1]
+
+        pos = self.active_order
+
+        # === UPDATE TRAILING STOPS ===
+        if self.inPosition and self.lastPositionWasLong:
+            if USE_TRAILING and pos.entry_atr is not None:
+                potentialStop = current_high - pos.entry_atr * TRAIL_OFFSET_MULT
+                if pos.trailing_stop_loss is not None:
+                    pos.trailing_stop_loss = max(pos.trailing_stop_loss, potentialStop)
+                else:
+                    pos.trailing_stop_loss = potentialStop
+            # TODO: place exit order with stop=pos.trailing_stop_loss, limit=pos.take_profit
+
+        if self.inPosition and self.lastPositionWasShort:
+            if USE_TRAILING and pos.entry_atr is not None:
+                potentialStop = current_low + pos.entry_atr * TRAIL_OFFSET_MULT
+                if pos.trailing_stop_loss is not None:
+                    pos.trailing_stop_loss = min(pos.trailing_stop_loss, potentialStop)
+                else:
+                    pos.trailing_stop_loss = potentialStop
+            # TODO: place exit order with stop=pos.trailing_stop_loss, limit=pos.take_profit
+
+        # === CLOSE ON OPPOSITE BOS/CHoCH ===
+        if HOLD_UNTIL_OPPOSITE and self.inPosition:
+            if self.lastPositionWasLong and self.isCHOCH:
+                # TODO: close long position
+                self.active_order = None
+                self.inPosition = False
+                self.lastPositionWasLong = False
+
+            if self.lastPositionWasShort and self.isBOS:
+                # TODO: close short position
+                self.active_order = None
+                self.inPosition = False
+                self.lastPositionWasShort = False
+
 
 
     def first_iteration(self):
         self.data = self.gather_data()
         self.calculate_indicators()
         self.add_fvg_zones()
+        self.entry_logic()
+        self.stop_logic()
 
-    def run_iteration(self):
-        pass
+    def run_bar_iteration(self):
+        self.cur_close = self.data["close"].iloc[-1]
+        self.cur_volume = self.data["volume"].iloc[-1]
+        self.calculate_indicators()
+        self.add_fvg_zones()
+        self.entry_logic()
+        self.stop_logic()
+
+    def run_websocket_iteration(self):
+        if self.active_order is None:
+            return
+        self.active_order.check_stops()
 
 if __name__ == "__main__":
     for pair in ASSETS.items():
