@@ -102,7 +102,8 @@ def _map_timeframe_to_unit(timeframe):
         number = int(''.join(filter(str.isdigit, timeframe)) or 30)
         return (3, number)
 
-def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
+def fetch_data_(asset, timeframe, num_bars, auth_token=None, live=False):
+
     """
     Fetch historical bar data from TopStepX API.
     
@@ -184,6 +185,38 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
         print(f"Error parsing response: {str(e)}")
         return None
 
+def fetch_data(ugh, eeehm, lol, tok=None, l=False):
+    """Fetch 100 bars of 30m BTC-USDT perpetual futures data from Binance Futures."""
+    url = "https://fapi.binance.com/fapi/v1/continuousKlines"
+    params = {
+        "pair": "BTCUSDT",
+        "contractType": "PERPETUAL",
+        "interval": "1m",
+        "limit": 100  # number of candles (max ~1500 allowed)
+    }
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+    
+    # Extract only first 6 items from each bar
+    rows = [
+        {
+            "timestamp": int(bar[0]),
+            "open": float(bar[1]),
+            "high": float(bar[2]),
+            "low": float(bar[3]),
+            "close": float(bar[4]),
+            "volume": float(bar[5])
+        }
+        for bar in data
+    ]
+    
+    df = pd.DataFrame(rows)
+    
+    # Optional: convert timestamp to datetime
+    #df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    return df
+    
 
 def load_data(asset):
     """

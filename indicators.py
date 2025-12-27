@@ -38,12 +38,13 @@ def sma(bars, length):
     return float(sma_value)
 
 
-def get_atr(data, length):
+def get_atr(data: pd.DataFrame, length: int) -> pd.Series:
     """
     Average True Range - matches PineScript ta.atr()
     Uses RMA (Wilder's smoothing) of True Range, not SMA.
-    Returns a Series with the last 'length' ATR values.
+    Returns a Series of ATR values starting from the first valid ATR.
     """
+    # Validate input
     if not isinstance(data, pd.DataFrame):
         raise ValueError("get_atr requires a DataFrame with 'high', 'low', 'close' columns")
     
@@ -51,39 +52,32 @@ def get_atr(data, length):
     if not all(col in data.columns for col in required_cols):
         raise ValueError(f"DataFrame must have columns: {required_cols}")
     
-    if len(data) < length + 1:  # Need at least length+1 bars for TR calculation
-        return None
+    if len(data) < length + 1:
+        return pd.Series(dtype=float)  # Not enough data for ATR
     
     # Calculate True Range
     high = data['high']
     low = data['low']
     close = data['close']
     
-    # TR = max(high - low, abs(high - prev_close), abs(low - prev_close))
     tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
     
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     
-    # ATR uses RMA (Wilder's smoothing), not SMA
-    # RMA formula: RMA = (prev_RMA * (length - 1) + current_value) / length
-    # For first value, use SMA
-    atr_values = pd.Series(index=true_range.index, dtype=float)
+    # Prepare ATR Series
+    atr = pd.Series(index=true_range.index, dtype=float)
     
-    # Initialize first ATR value as SMA of first 'length' TR values
-    if len(true_range) >= length:
-        atr_values.iloc[length - 1] = true_range.iloc[:length].mean()
-        
-        # Calculate subsequent ATR values using RMA
-        for i in range(length, len(true_range)):
-            prev_atr = atr_values.iloc[i - 1]
-            current_tr = true_range.iloc[i]
-            atr_values.iloc[i] = (prev_atr * (length - 1) + current_tr) / length
+    # First ATR value is simple average of first `length` TR values
+    atr.iloc[length - 1] = true_range.iloc[:length].mean()
     
-    # Return the last 'length' ATR values as a Series
-    return atr_values.iloc[-length:].reset_index(drop=True)
-
+    # Compute subsequent ATR values using Wilder's smoothing
+    for i in range(length, len(true_range)):
+        atr.iloc[i] = (atr.iloc[i - 1] * (length - 1) + true_range.iloc[i]) / length
+    
+    # Return ATR starting from the first computed ATR
+    return atr.iloc[length - 1:].reset_index(drop=True)
 
 def crossover(current_value, previous_value, threshold):
     return current_value > threshold and previous_value <= threshold
