@@ -1,6 +1,9 @@
 from api_functions import *
 from indicators import *
 import pandas as pd
+import json
+from time import sleep
+import threading
 
 IS_FVG_TO_SHOW = True              # Display FVG
 FVG_HISTORY_NBR = 5                # Number of FVGs to show (1-50)
@@ -14,26 +17,51 @@ USE_TRAILING = True                # use trailing stop
 TRAIL_OFFSET_MULT = 8.0            # Trailing Offset ATR Multiplier (Wide for Positional)
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
-ASSETS = {"gold":"30min"}
+ASSETS = {"gold":"1min"}
 USERNAME = "TestName"
 API_KEY = "apikey"
 
+
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+SENDER="bruno@platek.sk"
+PASSWORD="2ZSsATNUnr"
+RECIPIENT="bruno@platek.sk"
+def send_email(subject, body, sender=SENDER, password=PASSWORD, recipient=RECIPIENT):
+    msg = MIMEMultipart()
+    msg['From'] = sender
+    msg['To'] = recipient
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        with smtplib.SMTP('smtps.platon.sk', 587) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+        print("✅ Email sent successfully!")
+    except Exception as e:
+        print("❌ Failed to send email:", e)
+
+
 class Order:
     def __init__(self, side: str, entry_price: float,
-                take_profit: float, trailing_stop_loss,
-                account_id, asset_id, auth):
+                take_profit: float, trailing_stop_loss, entry_atr,
+                account_id, asset_id, auth_token):
         self.side = side
         self.entry_price = entry_price
         self.take_profit = take_profit
         self.trailing_stop_loss = trailing_stop_loss
+        self.entry_atr = entry_atr
 
         self.account_id = account_id
         self.asset_id = asset_id
-        self.auth_token = auth
-
-        self.place_order()
+        self.auth_token = auth_token
 
     def place_order(self):
+        send_email("Bot placed an order!", f"{self.side}, f{self.entry_price}, {self.take_profit}")
+        return
         """
         Place an order using ProjectX Gateway API.
         Based on: https://gateway.docs.projectx.com/docs/api-reference/order/order-place
@@ -170,8 +198,8 @@ class Strategy:
         self.marketOK = None
         self.bullishPowerOK = None
         self.bearishPowerOK = None
-        self.isBOS = None
-        self.isCHOCH = None
+        self.isBOS = False
+        self.isCHOCH = False
         self.prevStructureHigh = None
         self.prevStructureLow = None
 
@@ -181,6 +209,8 @@ class Strategy:
         self.lastPositionWasLong = False
         self.lastPositionWasShort = False
 
+        self.load_metadata()
+
         self.calculate_indicators()
 
         self.fvg_zones: list[dict] = []
@@ -189,7 +219,22 @@ class Strategy:
         self.auth_token = None
         self.account_id = None
         
-        self.init_api()
+        #self.init_api()
+
+    def load_metadata(self):
+        path = "metadata.json"
+        if not os.path.exists(path):
+            return
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+
+        if data["active_order"] is not None:
+            self.active_order = Order(**data["active_order"])
+        self.inPosition = bool(data["inPosition"])
+        self.lastPositionWasLong = bool(data["lastPositionWasLong"])
+        self.lastPositionWasShort = bool(data["lastPositionWasShort"])
 
     def init_api(self):
         res = login_to_api(USERNAME, API_KEY)
@@ -325,6 +370,7 @@ class Strategy:
                 entryAtr = atr
                 self.active_order = Order("BUY", self.cur_close, tp, trailStop, entryAtr,
                                           self.account_id, self.asset, self.auth_token)
+                self.active_order.place_order()
                 zone["mitigated"] = True
                 self.lastPositionWasLong = True
                 self.lastPositionWasShort = False
@@ -343,6 +389,7 @@ class Strategy:
                 entryAtr = atr
                 self.active_order = Order("SELL", self.cur_close, tp, trailStop, entryAtr,
                                           self.account_id, self.asset, self.auth_token)
+                self.active_order.place_order()
                 zone["mitigated"] = True
                 self.lastPositionWasShort = True
                 self.lastPositionWasLong = False
@@ -388,6 +435,22 @@ class Strategy:
                 self.inPosition = False
                 self.lastPositionWasShort = False
 
+    def save_data(self):
+        order_dict = None
+        if self.active_order is not None:
+            order_dict = self.active_order.__dict__
+
+        res_dict = {
+            "active_order" : order_dict,
+            "inPosition" : self.inPosition,
+            "lastPositionWasShort" : self.lastPositionWasShort,
+            "lastPositionWasLong" : self.lastPositionWasLong 
+        }
+
+        with open("metadata.json", "w", encoding="utf-8") as f:
+            json.dump(res_dict, f, indent=2)
+
+        self.data.to_csv(f"{self.asset}.csv")
 
 
     def first_iteration(self):
@@ -397,18 +460,31 @@ class Strategy:
         self.entry_logic()
         self.update_stops()
 
-    def run_bar_iteration(self):
-        self.fetch_new_data()
-        self.calculate_indicators()
-        self.add_fvg_zones()
-        self.entry_logic()
-        self.update_stops()
+    def run_bar_iterations(self):
+        while True:
+            sleep(60) # 1min
+            self.fetch_new_data()
+            self.calculate_indicators()
+            self.add_fvg_zones()
+            self.entry_logic()
+            self.update_stops()
+            self.save_data()
+            print("ran")
 
     def run_websocket_iteration(self):
         if self.active_order is None:
             return
         self.active_order.check_stops()
 
+    def run(self):
+        self.first_iteration()
+
+        t1 = threading.Thread(target=self.run_bar_iterations)
+
+        t1.start()
+
+
+
 if __name__ == "__main__":
-    res = login_to_api("f", "d")
-    print(res)
+    strat = Strategy(("gold", "30min"))
+    strat.run()
