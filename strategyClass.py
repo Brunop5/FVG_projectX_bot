@@ -25,9 +25,11 @@ API_KEY = "apikey"
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-SENDER="bruno@platek.sk"
-PASSWORD="2ZSsATNUnr"
-RECIPIENT="bruno@platek.sk"
+import os
+SENDER = os.getenv("SENDER")
+PASSWORD = os.getenv("PASSWORD")
+RECIPIENT = os.getenv("RECIPIENT")
+
 def send_email(subject, body, sender=SENDER, password=PASSWORD, recipient=RECIPIENT):
     msg = MIMEMultipart()
     msg['From'] = sender
