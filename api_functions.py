@@ -142,10 +142,13 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
     end_time = datetime.utcnow()
     
     # Calculate start time based on timeframe and num_bars
-    if unit == num_bars > 49:  # Days
-        start_time = end_time - timedelta(days=10)
-    else:
+    if num_bars == 50:  # Days
+        start_time = end_time - timedelta(days=30)
+    elif num_bars == 1:
         start_time = end_time - timedelta(days=4)
+    else:
+        start_time = end_time - timedelta(days=10)
+
     
     # Format times in ISO 8601 format
     start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
