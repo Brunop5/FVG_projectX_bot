@@ -4,6 +4,7 @@ import pandas as pd
 import json
 from time import sleep
 import threading
+import os
 
 IS_FVG_TO_SHOW = True              # Display FVG
 FVG_HISTORY_NBR = 5                # Number of FVGs to show (1-50)
@@ -17,34 +18,48 @@ USE_TRAILING = True                # use trailing stop
 TRAIL_OFFSET_MULT = 8.0            # Trailing Offset ATR Multiplier (Wide for Positional)
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
-ASSETS = {"gold":"1min"}
-USERNAME = "TestName"
-API_KEY = "apikey"
+ORDER_SIZE = 1
+ASSETS = [("CON.F.US.RTY.Z24","30min")]
+USERNAME = os.getenv("USERNAME")
+API_KEY = os.getenv("API_KEY")
+
+TIMEFRAME_SECONDS = {
+    "1s": 1,
+    "5s": 5,
+    "30s": 30,
+    "1min": 60,
+    "5min": 300,
+    "15min": 900,
+    "30min": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+}
 
 
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import os
-SENDER = os.getenv("SENDER")
-PASSWORD = os.getenv("PASSWORD")
-RECIPIENT = os.getenv("RECIPIENT")
 
-def send_email(subject, body, sender=SENDER, password=PASSWORD, recipient=RECIPIENT):
-    msg = MIMEMultipart()
-    msg['From'] = sender
-    msg['To'] = recipient
-    msg['Subject'] = subject
-    msg.attach(MIMEText(body, 'plain'))
+# import smtplib
+# from email.mime.text import MIMEText
+# from email.mime.multipart import MIMEMultipart
+# SENDER = os.getenv("SENDER")
+# PASSWORD = os.getenv("PASSWORD")
+# RECIPIENT = os.getenv("RECIPIENT")
 
-    try:
-        with smtplib.SMTP('smtps.platon.sk', 587) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.send_message(msg)
-        print("✅ Email sent successfully!")
-    except Exception as e:
-        print("❌ Failed to send email:", e)
+# def send_email(subject, body, sender=SENDER, password=PASSWORD, recipient=RECIPIENT):
+#     msg = MIMEMultipart()
+#     msg['From'] = sender
+#     msg['To'] = recipient
+#     msg['Subject'] = subject
+#     msg.attach(MIMEText(body, 'plain'))
+
+#     try:
+#         with smtplib.SMTP('smtps.platon.sk', 587) as server:
+#             server.starttls()
+#             server.login(sender, password)
+#             server.send_message(msg)
+#         print("✅ Email sent successfully!")
+#     except Exception as e:
+#         print("❌ Failed to send email:", e)
 
 
 class Order:
@@ -62,15 +77,10 @@ class Order:
         self.auth_token = auth_token
 
     def place_order(self):
-        send_email("Bot placed an order!", f"{self.side}, f{self.entry_price}, {self.take_profit}")
-        return
         """
         Place an order using ProjectX Gateway API.
         Based on: https://gateway.docs.projectx.com/docs/api-reference/order/order-place
-        """
-
-        order_size = getattr(self, 'order_size', 1)  # Default to 1 contract
-        
+        """        
         if not self.auth_token:
             print("Error: auth_token is required to place order")
             return {'success': False, 'message': 'auth_token is required'}
@@ -91,7 +101,7 @@ class Order:
             "contractId": self.asset_id,
             "type": 2,  # 2 = Market order
             "side": side_code,  # 0 = Bid (buy), 1 = Ask (sell)
-            "size": order_size,
+            "size": ORDER_SIZE,
             "limitPrice": None,
             "stopPrice": None,
             "trailPrice": None,
@@ -187,6 +197,10 @@ class Order:
 
 class Strategy:
     def __init__(self, asset_pair):
+        self.auth_token = None
+        self.account_id = None
+        
+        self.init_api()
         self.active_order = None
 
         self.timeframe = asset_pair[1]
@@ -218,11 +232,6 @@ class Strategy:
         self.fvg_zones: list[dict] = []
         self.add_fvg_zones()
 
-        self.auth_token = None
-        self.account_id = None
-        
-        #self.init_api()
-
     def load_metadata(self):
         path = "metadata.json"
         if not os.path.exists(path):
@@ -238,21 +247,43 @@ class Strategy:
         self.lastPositionWasLong = bool(data["lastPositionWasLong"])
         self.lastPositionWasShort = bool(data["lastPositionWasShort"])
 
+    def get_assets(self):
+        url = "https://api.topstepx.com/api/Contract/available"
+
+        headers = {
+            "Authorization": f"Bearer {self.auth_token}",
+            "accept": "text/plain",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "live": True
+        }
+
+        response = requests.post(url, json=payload, headers=headers)
+        response.raise_for_status()
+
+        data = response.text
+        
+        print(data)
+
     def init_api(self):
         res = login_to_api(USERNAME, API_KEY)
-        if not res["sucess"]:
+        if not res["success"]:
             raise RuntimeError("API login failed")
-        
+
         self.auth_token = res["token"]
 
         self.account_id = get_account_id(self.auth_token)
+
+        #print(self.auth_token, self.account_id)
 
     def gather_data(self):
         data = load_data(self.asset)
         if data is not None:
             return data
         
-        return fetch_data(self.asset, self.timeframe, 100)
+        return fetch_data(self.asset, self.timeframe, 100, self.auth_token, )
 
     def fetch_new_data(self):
         new_row = fetch_data(self.asset, self.timeframe, 1)
@@ -464,16 +495,16 @@ class Strategy:
 
     def run_bar_iterations(self):
         while True:
-            sleep(60) # 1min
+            sleep(TIMEFRAME_SECONDS[self.timeframe])
             self.fetch_new_data()
             self.calculate_indicators()
             self.add_fvg_zones()
             self.entry_logic()
             self.update_stops()
             self.save_data()
-            print("ran")
 
     def run_websocket_iteration(self):
+        print("new_data")
         if self.active_order is None:
             return
         self.active_order.check_stops()
@@ -482,11 +513,14 @@ class Strategy:
         self.first_iteration()
 
         t1 = threading.Thread(target=self.run_bar_iterations)
-
+        t2 = threading.Thread(
+            target=lambda: stream_market_data(self.auth_token, self.asset, self.run_websocket_iteration)
+        )
         t1.start()
-
+        t2.start()
 
 
 if __name__ == "__main__":
-    strat = Strategy(("gold", "30min"))
-    strat.run()
+    for asset_pair in ASSETS:
+        strat = Strategy(asset_pair)
+        strat.run()
