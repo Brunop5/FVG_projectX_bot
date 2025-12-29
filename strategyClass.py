@@ -20,9 +20,9 @@ HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 ORDER_SIZE = 1
 ASSETS = [("CON.F.US.BP6.H26","30min")]
-USERNAME = os.getenv("USERNAME")
-API_KEY = os.getenv("API_KEY")
-LIVE = False
+USERNAME = "yourTopstepXUsername"
+API_KEY = "yourApiKey"
+LIVE = True   #or False
 
 TIMEFRAME_SECONDS = {
     "1s": 1,
@@ -290,13 +290,15 @@ class Strategy:
         new_row = fetch_data(self.asset, self.timeframe, 1, LIVE)
         if new_row is None:
             return
-        self.cur_close = new_row["close"].iloc[0]
-        self.cur_volume = new_row["volume"].iloc[0]
+        self.cur_close = new_row["close"].iloc[-1]
+        self.cur_volume = new_row["volume"].iloc[-1]
         self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
 
     def update_trend_indicators(self):
         bars = fetch_data(self.asset, f"{HTF_TF}min", 50, self.auth_token, LIVE)
+        print(bars)
         htfEMA = ema(bars, 50)
+        print(htfEMA)
 
         self.isBullishHTF = self.cur_close > htfEMA
         self.isBearishHTF = self.cur_close < htfEMA
@@ -503,6 +505,9 @@ class Strategy:
             self.entry_logic()
             self.update_stops()
             self.save_data()
+            if self.active_order is None:
+                continue
+            self.active_order.check_stops()
 
     def run_websocket_iteration(self):
         print("new_data")
