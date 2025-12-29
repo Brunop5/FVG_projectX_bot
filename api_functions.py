@@ -63,7 +63,6 @@ def get_account_id(token):
     response.raise_for_status()
 
     data = response.json()
-    
     # The API returns a list of accounts under "accounts"
     accounts = data.get("accounts")
     if not accounts:
@@ -73,34 +72,42 @@ def get_account_id(token):
 
 
 
-def _map_timeframe_to_unit(timeframe):
+def _map_timeframe_to_unit(timeframe: str):
     """
     Map timeframe string to TopStepX API unit and unitNumber.
-    Examples: "30min" -> (3, 30), "1h" -> (2, 1), "4h" -> (2, 4), "1d" -> (1, 1)
-    
-    Unit codes (based on common API patterns):
-    1 = Days
-    2 = Hours  
-    3 = Minutes
+
+    Examples:
+        "30s"  -> (1, 30)
+        "5min" -> (2, 5)
+        "1h"   -> (3, 1)
+        "4h"   -> (3, 4)
+        "1d"   -> (4, 1)
+        "1w"   -> (5, 1)
+        "1M"   -> (6, 1)
     """
-    timeframe = timeframe.lower().strip()
+    tf = timeframe.lower().strip()
     
-    if 'd' in timeframe or 'day' in timeframe:
-        # Days
-        number = int(''.join(filter(str.isdigit, timeframe)) or 1)
-        return (1, number)
-    elif 'h' in timeframe or 'hour' in timeframe:
-        # Hours
-        number = int(''.join(filter(str.isdigit, timeframe)) or 1)
-        return (2, number)
-    elif 'min' in timeframe or 'm' in timeframe:
-        # Minutes
-        number = int(''.join(filter(str.isdigit, timeframe)) or 1)
-        return (3, number)
+    # Extract the numeric part
+    number_str = ''.join(filter(str.isdigit, tf))
+    number = int(number_str) if number_str else 1
+
+    # Determine the unit
+    if 's' in tf:
+        return (1, number)  # Seconds
+    elif 'min' in tf or tf.endswith('m'):
+        return (2, number)  # Minutes
+    elif 'h' in tf:
+        return (3, number)  # Hours
+    elif 'd' in tf:
+        return (4, number)  # Days
+    elif 'w' in tf:
+        return (5, number)  # Weeks
+    elif 'm' in tf or 'mo' in tf:  # Month
+        return (6, number)
     else:
         # Default to minutes
-        number = int(''.join(filter(str.isdigit, timeframe)) or 30)
-        return (3, number)
+        return (2, number)
+
 
 def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
 
@@ -135,17 +142,15 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
     end_time = datetime.utcnow()
     
     # Calculate start time based on timeframe and num_bars
-    if unit == 1:  # Days
-        start_time = end_time - timedelta(days=num_bars * unit_number)
-    elif unit == 2:  # Hours
-        start_time = end_time - timedelta(hours=num_bars * unit_number)
-    else:  # Minutes
-        start_time = end_time - timedelta(minutes=num_bars * unit_number)
+    if unit == num_bars > 49:  # Days
+        start_time = end_time - timedelta(days=10)
+    else:
+        start_time = end_time - timedelta(days=4)
     
     # Format times in ISO 8601 format
     start_time_str = start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
     end_time_str = end_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-    
+
     payload = {
         "contractId": asset,
         "live": live,
@@ -159,12 +164,9 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
     
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=30)
-        
         if response.status_code == 200:
             # Parse response - assuming it returns JSON array of bars
-            data = response.json()["bars"]
-            print(data)
-            
+            data = response.json()["bars"]            
             # Convert to DataFrame
             # Adjust column names based on actual API response structure
             if isinstance(data, list) and len(data) > 0:
@@ -185,7 +187,7 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
                 
                 # Optional: reorder columns
                 df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-                
+                df = df.iloc[::-1].reset_index(drop=True)
                 return df
             else:
                 return pd.DataFrame()  # Empty DataFrame if no data
