@@ -3,6 +3,10 @@ import os
 import time
 import requests
 from datetime import datetime, timedelta
+from signalrcore.hub_connection_builder import HubConnectionBuilder
+import logging
+
+
 
 def login_to_api(user_name, api_key):
     url = "https://api.topstepx.com/api/Auth/loginKey"
@@ -19,16 +23,12 @@ def login_to_api(user_name, api_key):
     
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=10)
+        #print(response.text, response.status_code)
         
         if response.status_code == 200:
             # Success - token is typically returned in response
             token = response.text if response.text else None
-            return {
-                'success': True,
-                'token': token,
-                'message': 'Connection successful',
-                'status_code': response.status_code
-            }
+            return response.json()
         else:
             # Authentication failed
             return {
@@ -51,7 +51,7 @@ def get_account_id(token):
 
     headers = {
         "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
+        "accept": "text/plain",
         "Content-Type": "application/json"
     }
 
@@ -102,7 +102,7 @@ def _map_timeframe_to_unit(timeframe):
         number = int(''.join(filter(str.isdigit, timeframe)) or 30)
         return (3, number)
 
-def fetch_data_(asset, timeframe, num_bars, auth_token=None, live=False):
+def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
 
     """
     Fetch historical bar data from TopStepX API.
@@ -159,18 +159,33 @@ def fetch_data_(asset, timeframe, num_bars, auth_token=None, live=False):
     
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=30)
-        print(response)
         
         if response.status_code == 200:
             # Parse response - assuming it returns JSON array of bars
-            data = response.json()
+            data = response.json()["bars"]
+            print(data)
             
             # Convert to DataFrame
             # Adjust column names based on actual API response structure
             if isinstance(data, list) and len(data) > 0:
                 df = pd.DataFrame(data)
-                # Rename columns to standard OHLCV format if needed
-                # Common mappings: time/timestamp, open, high, low, close, volume
+    
+                # Rename columns
+                df = df.rename(columns={
+                    't': 'timestamp',
+                    'o': 'open',
+                    'h': 'high',
+                    'l': 'low',
+                    'c': 'close',
+                    'v': 'volume'
+                })
+                
+                # Convert timestamp to datetime if needed
+                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+                
+                # Optional: reorder columns
+                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                
                 return df
             else:
                 return pd.DataFrame()  # Empty DataFrame if no data
@@ -185,7 +200,7 @@ def fetch_data_(asset, timeframe, num_bars, auth_token=None, live=False):
         print(f"Error parsing response: {str(e)}")
         return None
 
-def fetch_data(ugh, eeehm, lol, tok=None, l=False):
+def fetch_data_(ugh, eeehm, lol, tok=None, l=False):
     """Fetch 100 bars of 30m BTC-USDT perpetual futures data from Binance Futures."""
     url = "https://fapi.binance.com/fapi/v1/continuousKlines"
     params = {
@@ -233,3 +248,62 @@ def load_data(asset):
 
     else:
         return None
+
+
+def stream_market_data(token: str, contract_id: str, callback):
+    """
+    Connects to ProjectX market hub and streams last price updates for a specific contract.
+    
+    :param token: Bearer JWT token
+    :param contract_id: Contract ID string, e.g., 'CON.F.US.RTY.H25'
+    :param callback: Function to call on every payload. Signature: callback(payload)
+    """
+
+    market_hub_url = f"https://rtc.topstepx.com/hubs/market?access_token={token}"
+
+    # Build the hub connection
+    hub_connection = HubConnectionBuilder()\
+        .with_url(market_hub_url, options={"access_token_factory": lambda: token})\
+        .configure_logging(logging.INFO)\
+        .with_automatic_reconnect({
+            "type": "raw",
+            "keep_alive_interval": 10,
+            "reconnect_interval": 5
+        })\
+        .build()
+
+    # Handler for incoming GatewayQuote events
+    def handle_event(payload):
+        """
+        SignalR sends the payload as a dict or a list [contract_id, dict].
+        """
+        data = None
+        if isinstance(payload, list) and len(payload) >= 2 and isinstance(payload[1], dict):
+            data = payload[1]
+        elif isinstance(payload, dict):
+            data = payload
+
+        if data is not None:
+            callback(data)
+        else:
+            print("Warning: unexpected payload format:", payload)
+
+    hub_connection.on("GatewayQuote", handle_event)
+
+    # Start the connection
+    hub_connection.start()
+    time.sleep(1)  # Give it a moment to establish
+
+    # Subscribe to contract quotes
+    hub_connection.send("SubscribeContractQuotes", [contract_id])
+    print(f"Subscribed to {contract_id} market quotes.")
+
+    try:
+        # Keep running indefinitely
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        # Unsubscribe and close
+        hub_connection.send("UnsubscribeContractQuotes", [contract_id])
+        hub_connection.stop()
+        print("Connection closed.")
