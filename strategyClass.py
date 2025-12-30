@@ -19,10 +19,12 @@ TRAIL_OFFSET_MULT = 8.0            # Trailing Offset ATR Multiplier (Wide for Po
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 ORDER_SIZE = 1
-ASSETS = [("CON.F.US.BP6.H26","30min")]
-USERNAME = "yourTopstepXUsername"
-API_KEY = "yourApiKey"
-LIVE = True   #or False
+ASSETS = [("CON.F.US.CA6.H26","30min"),("new id", "1h")]
+USERNAME = os.getenv("USERNAME")
+API_KEY = os.getenv("API_KEY")
+LIVE = False  #or False
+
+UPDATE_CONTRACT_LIST = False
 
 TIMEFRAME_SECONDS = {
     "1s": 1,
@@ -207,6 +209,7 @@ class Strategy:
         self.timeframe = asset_pair[1]
         self.asset = asset_pair[0]
         self.data = self.gather_data()
+        print(self.data)
         self.cur_close = self.data["close"].iloc[-1]
         self.cur_volume = self.data["volume"].iloc[-1]
 
@@ -258,15 +261,13 @@ class Strategy:
         }
 
         payload = {
-            "live": False
+            "live": LIVE
         }
 
         response = requests.post(url, json=payload, headers=headers)
         response.raise_for_status()
-
-        data = response.text
         
-        print(data)
+        return response.json()["contracts"]
 
     def init_api(self):
         res = login_to_api(USERNAME, API_KEY)
@@ -296,9 +297,7 @@ class Strategy:
 
     def update_trend_indicators(self):
         bars = fetch_data(self.asset, f"{HTF_TF}min", 50, self.auth_token, LIVE)
-        print(bars)
         htfEMA = ema(bars, 50)
-        print(htfEMA)
 
         self.isBullishHTF = self.cur_close > htfEMA
         self.isBearishHTF = self.cur_close < htfEMA
@@ -527,6 +526,14 @@ class Strategy:
 
 
 if __name__ == "__main__":
-    for asset_pair in ASSETS:
-        strat = Strategy(asset_pair)
-        strat.run()
+    if UPDATE_CONTRACT_LIST:
+        strat = Strategy(ASSETS[0])
+        data = strat.get_assets()
+        data = pd.DataFrame(data)
+        data.to_csv("contracts.csv")
+        print("Contract list updated successfully!!")
+
+    else:
+        for asset_pair in ASSETS:
+            strat = Strategy(asset_pair)
+            strat.run()

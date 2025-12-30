@@ -77,37 +77,52 @@ def _map_timeframe_to_unit(timeframe: str):
     Map timeframe string to TopStepX API unit and unitNumber.
 
     Examples:
-        "30s"  -> (1, 30)
-        "5min" -> (2, 5)
-        "1h"   -> (3, 1)
-        "4h"   -> (3, 4)
-        "1d"   -> (4, 1)
-        "1w"   -> (5, 1)
-        "1M"   -> (6, 1)
+        "30s"    -> (1, 30)
+        "5min"   -> (2, 5)
+        "240min" -> (3, 4)
+        "1h"     -> (3, 1)
+        "4h"     -> (3, 4)
+        "1d"     -> (4, 1)
+        "1w"     -> (5, 1)
+        "1M"     -> (6, 1)
     """
-    tf = timeframe.lower().strip()
-    
-    # Extract the numeric part
+
+    tf = timeframe.strip()
+    tf_lower = tf.lower()
+
+    # Extract numeric part (default = 1)
     number_str = ''.join(filter(str.isdigit, tf))
     number = int(number_str) if number_str else 1
 
-    # Determine the unit
-    if 's' in tf:
-        return (1, number)  # Seconds
-    elif 'min' in tf or tf.endswith('m'):
-        return (2, number)  # Minutes
-    elif 'h' in tf:
-        return (3, number)  # Hours
-    elif 'd' in tf:
-        return (4, number)  # Days
-    elif 'w' in tf:
-        return (5, number)  # Weeks
-    elif 'm' in tf or 'mo' in tf:  # Month
-        return (6, number)
-    else:
-        # Default to minutes
-        return (2, number)
+    # Seconds
+    if tf_lower.endswith('s'):
+        return 1, number
 
+    # Minutes (explicit)
+    if 'min' in tf_lower or (tf_lower.endswith('m') and not tf.endswith('M')):
+        # Normalize minutes to hours if divisible by 60
+        if number % 60 == 0:
+            return 3, number // 60  # Hours
+        return 2, number  # Minutes
+
+    # Hours
+    if 'h' in tf_lower:
+        return 3, number
+
+    # Days
+    if 'd' in tf_lower:
+        return 4, number
+
+    # Weeks
+    if 'w' in tf_lower:
+        return 5, number
+
+    # Months (capital M or 'mo')
+    if tf.endswith('M') or 'mo' in tf_lower:
+        return 6, number
+
+    # Fallback (minutes)
+    return 2, number
 
 def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
 
@@ -137,17 +152,27 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
     
     # Map timeframe to unit and unitNumber
     unit, unit_number = _map_timeframe_to_unit(timeframe)
+    print(unit, unit_number)
     
-    # Calculate endTime (current time) and startTime (based on num_bars)
+
     end_time = datetime.utcnow()
-    
-    # Calculate start time based on timeframe and num_bars
-    if num_bars == 50:  # Days
-        start_time = end_time - timedelta(days=30)
-    elif num_bars == 1:
-        start_time = end_time - timedelta(days=4)
+
+    if unit == 1:  # Seconds
+        delta = timedelta(seconds=unit_number * num_bars*3)
+
+    elif unit == 2:  # Minutes
+        delta = timedelta(minutes=unit_number * num_bars*3)
+
+    elif unit == 3:  # Hours
+        delta = timedelta(hours=unit_number * num_bars*3)
+
+    elif unit == 4:  # Days
+        delta = timedelta(days=unit_number * num_bars*3)
+
     else:
-        start_time = end_time - timedelta(days=10)
+        raise ValueError("Unsupported unit")
+
+    start_time = end_time - delta
 
     
     # Format times in ISO 8601 format
