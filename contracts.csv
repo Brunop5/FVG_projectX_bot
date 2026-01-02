@@ -1,0 +1,52 @@
+,id,name,description,tickSize,tickValue,activeContract,symbolId
+0,CON.F.US.BP6.H26,6BH6,British Pound (Globex): March 2026,0.0001,6.25,True,F.US.BP6
+1,CON.F.US.CA6.H26,6CH6,Canadian Dollar (Globex): March 2026,5e-05,5.0,True,F.US.CA6
+2,CON.F.US.CLE.G26,CLG6,Crude Light (Globex): February 2026,0.01,10.0,True,F.US.CLE
+3,CON.F.US.CPE.H26,HGH6,Copper (Globex): March 2026,0.0005,12.5,True,F.US.CPE
+4,CON.F.US.DA6.H26,6AH6,Australian Dollar (Globex): March 2026,5e-05,5.0,True,F.US.DA6
+5,CON.F.US.EEU.H26,E7H6,E-mini Euro FX: March 2026,0.0001,6.25,True,F.US.EEU
+6,CON.F.US.ENQ.H26,NQH6,E-mini NASDAQ-100: March 2026,0.25,5.0,True,F.US.ENQ
+7,CON.F.US.EP.H26,ESH6,E-Mini S&P 500: March 2026,0.25,12.5,True,F.US.EP
+8,CON.F.US.EU6.H26,6EH6,Euro FX (Globex): March 2026,5e-05,6.25,True,F.US.EU6
+9,CON.F.US.FVA.H26,ZFH6,5 Year US Treasury Notes (Globex): March 2026,0.0078125,7.8125,True,F.US.FVA
+10,CON.F.US.GCE.G26,GCG6,Gold (Globex): February 2026,0.1,10.0,True,F.US.GCE
+11,CON.F.US.GLE.G26,LEG6,Live Cattle (Globex): February 2026,0.025,10.0,True,F.US.GLE
+12,CON.F.US.GMET.F26,METF6,Micro Ether: January 2026,0.5,0.05,True,F.US.GMET
+13,CON.F.US.HE.G26,HEG6,Lean Hogs (Globex): February 2026,0.025,10.0,True,F.US.HE
+14,CON.F.US.HOE.G26,HOG6,NY Harbor ULSD: February 2026,0.0001,4.2,True,F.US.HOE
+15,CON.F.US.JY6.H26,6JH6,Japanese Yen (Globex): March 2026,5e-07,6.25,True,F.US.JY6
+16,CON.F.US.M2K.H26,M2KH6,Micro E-mini Russell 2000: March 2026,0.1,0.5,True,F.US.M2K
+17,CON.F.US.M6A.H26,M6AH6,E-Micro AUD/USD: March 2026,0.0001,1.0,True,F.US.M6A
+18,CON.F.US.M6B.H26,M6BH6,E-Micro GBP/USD: March 2026,0.0001,0.625,True,F.US.M6B
+19,CON.F.US.M6E.H26,M6EH6,E-Micro EUR/USD: March 2026,0.0001,1.25,True,F.US.M6E
+20,CON.F.US.MBT.F26,MBTF6,Micro Bitcoin: January 2026,5.0,0.5,True,F.US.MBT
+21,CON.F.US.MCLE.G26,MCLG6,Micro WTI Crude Oil: February 2026,0.01,1.0,True,F.US.MCLE
+22,CON.F.US.MES.H26,MESH6,Micro E-mini S&P 500: March 2026,0.25,1.25,True,F.US.MES
+23,CON.F.US.MGC.G26,MGCG6,Micro Gold: February 2026,0.1,1.0,True,F.US.MGC
+24,CON.F.US.MHG.H26,MHGH6,Micro Copper: March 2026,0.0005,1.25,True,F.US.MHG
+25,CON.F.US.MNG.G26,MNGG6,Micro Henry Hub Natural Gas: February 2026,0.001,1.0,True,F.US.MNG
+26,CON.F.US.MNQ.H26,MNQH6,Micro E-mini Nasdaq-100: March 2026,0.25,0.5,True,F.US.MNQ
+27,CON.F.US.MX6.H26,6MH6,Mexican Peso (Globex): March 2026,1e-05,5.0,True,F.US.MX6
+28,CON.F.US.MYM.H26,MYMH6,Micro E-mini Dow $0.50: March 2026,1.0,0.5,True,F.US.MYM
+29,CON.F.US.NE6.H26,6NH6,New Zealand Dollar (Globex): March 2026,5e-05,5.0,True,F.US.NE6
+30,CON.F.US.NGE.G26,NGG6,Natural Gas (Globex): February 2026,0.001,10.0,True,F.US.NGE
+31,CON.F.US.NKD.H26,NKDH6,Nikkei 225 (Globex): March 2026,5.0,25.0,True,F.US.NKD
+32,CON.F.US.NQG.G26,QGG6,E-Mini Natural Gas: February 2026,0.005,12.5,True,F.US.NQG
+33,CON.F.US.NQM.G26,QMG6,E-Mini Crude Oil: February 2026,0.025,12.5,True,F.US.NQM
+34,CON.F.US.PLE.J26,PLJ6,Platinum (Globex): April 2026,0.1,5.0,True,F.US.PLE
+35,CON.F.US.RBE.G26,RBG6,RBOB Gasoline (Globex): February 2026,0.0001,4.2,True,F.US.RBE
+36,CON.F.US.RTY.H26,RTYH6,E-mini Russell 2000: March 2026,0.1,5.0,True,F.US.RTY
+37,CON.F.US.SF6.H26,6SH6,Swiss Franc (Globex): March 2026,5e-05,6.25,True,F.US.SF6
+38,CON.F.US.SIE.H26,SIH6,Silver (Globex): March 2026,0.005,25.0,True,F.US.SIE
+39,CON.F.US.SIL.H26,SILH6,Micro Silver: March 2026,0.005,5.0,True,F.US.SIL
+40,CON.F.US.TNA.H26,TNH6,Ultra 10yr Treasury Note (Globex): March 2026,0.015625,15.625,True,F.US.TNA
+41,CON.F.US.TUA.H26,ZTH6,2 Year US Treasury Note (Globex): March 2026,0.00390625,7.8125,True,F.US.TUA
+42,CON.F.US.TYA.H26,ZNH6,10yr US Treasury Notes (Globex): March 2026,0.015625,15.625,True,F.US.TYA
+43,CON.F.US.ULA.H26,UBH6,Ultra T-Bond (Globex): March 2026,0.03125,31.25,True,F.US.ULA
+44,CON.F.US.USA.H26,ZBH6,30yr US Treasury Bonds (Globex): March 2026,0.03125,31.25,True,F.US.USA
+45,CON.F.US.YM.H26,YMH6,E-mini Dow ($5): March 2026,1.0,5.0,True,F.US.YM
+46,CON.F.US.ZCE.H26,ZCH6,Corn (Globex): March 2026,0.25,12.5,True,F.US.ZCE
+47,CON.F.US.ZLE.H26,ZLH6,Soybean Oil (Globex): March 2026,0.01,6.0,True,F.US.ZLE
+48,CON.F.US.ZME.H26,ZMH6,Soybean Meal (Globex): March 2026,0.1,10.0,True,F.US.ZME
+49,CON.F.US.ZSE.H26,ZSH6,Soybeans (Globex): March 2026,0.25,12.5,True,F.US.ZSE
+50,CON.F.US.ZWA.H26,ZWH6,Wheat (Globex): March 2026,0.25,12.5,True,F.US.ZWA

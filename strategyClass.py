@@ -19,27 +19,16 @@ TRAIL_OFFSET_MULT = 8.0            # Trailing Offset ATR Multiplier (Wide for Po
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 ORDER_SIZE = 1
-ASSETS = [("CON.F.US.CA6.H26","30min"),("new id", "1h")]
+ACCOUNT_NAME = "50KTC-V2-252499-47109338"
+ACCOUNT_ID = None      # if you know the account id, paste it here, it is more effective
+
+ASSETS = [("CON.F.US.GCE.G26","1min")]
 USERNAME = os.getenv("USERNAME")
 API_KEY = os.getenv("API_KEY")
-LIVE = False  #or False
+LIVE = False
 
-UPDATE_CONTRACT_LIST = False
-
-TIMEFRAME_SECONDS = {
-    "1s": 1,
-    "5s": 5,
-    "30s": 30,
-    "1min": 60,
-    "5min": 300,
-    "15min": 900,
-    "30min": 1800,
-    "1h": 3600,
-    "4h": 14400,
-    "1d": 86400,
-}
-
-
+SHOW_ACCOUNTS = False           # setting this True will print availible accounts and their ids (it will not run the strategy)
+UPDATE_CONTRACT_LIST = False    # True will update the contracts.csv. (also will not run the strategy)
 
 # import smtplib
 # from email.mime.text import MIMEText
@@ -118,11 +107,11 @@ class Order:
             if response.status_code == 200:
                 result = response.json()
                 if result.get("success", False):
-                    self.order_id = result.get("orderId")
-                    print(f"Order placed successfully. Order ID: {self.order_id}")
+                    order_id = result.get("orderId")
+                    print(f"Order placed successfully. Order ID: {order_id}")
                     return {
                         'success': True,
-                        'order_id': self.order_id,
+                        'order_id': order_id,
                         'message': 'Order placed successfully'
                     }
                 else:
@@ -209,7 +198,6 @@ class Strategy:
         self.timeframe = asset_pair[1]
         self.asset = asset_pair[0]
         self.data = self.gather_data()
-        print(self.data)
         self.cur_close = self.data["close"].iloc[-1]
         self.cur_volume = self.data["volume"].iloc[-1]
 
@@ -237,7 +225,7 @@ class Strategy:
         self.add_fvg_zones()
 
     def load_metadata(self):
-        path = "metadata.json"
+        path = f"metadata-{self.asset}-{self.timeframe}.json"
         if not os.path.exists(path):
             return
 
@@ -276,19 +264,19 @@ class Strategy:
 
         self.auth_token = res["token"]
 
-        self.account_id = get_account_id(self.auth_token)
+        self.account_id = get_account_id(self.auth_token, ACCOUNT_NAME)
 
         #print(self.auth_token, self.account_id)
 
     def gather_data(self):
-        data = load_data(self.asset)
+        data = load_data(self.asset, self.timeframe)
         if data is not None:
             return data
         
         return fetch_data(self.asset, self.timeframe, 100, self.auth_token, LIVE)
 
     def fetch_new_data(self):
-        new_row = fetch_data(self.asset, self.timeframe, 1, LIVE)
+        new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token, LIVE)
         if new_row is None:
             return
         self.cur_close = new_row["close"].iloc[-1]
@@ -296,7 +284,7 @@ class Strategy:
         self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
 
     def update_trend_indicators(self):
-        bars = fetch_data(self.asset, f"{HTF_TF}min", 50, self.auth_token, LIVE)
+        bars = fetch_data(self.asset, f"{HTF_TF}min", 101, self.auth_token, LIVE)
         htfEMA = ema(bars, 50)
 
         self.isBullishHTF = self.cur_close > htfEMA
@@ -474,6 +462,7 @@ class Strategy:
         order_dict = None
         if self.active_order is not None:
             order_dict = self.active_order.__dict__
+            print(order_dict)
 
         res_dict = {
             "active_order" : order_dict,
@@ -482,22 +471,28 @@ class Strategy:
             "lastPositionWasLong" : self.lastPositionWasLong 
         }
 
-        with open("metadata.json", "w", encoding="utf-8") as f:
+        with open(f"metadata-{self.asset}-{self.timeframe}.json", "w", encoding="utf-8") as f:
             json.dump(res_dict, f, indent=2)
 
-        self.data.to_csv(f"{self.asset}.csv")
+        self.data.to_csv(f"{self.asset}-{self.timeframe}.csv")
 
 
     def first_iteration(self):
+        sleep_until_next_boundary(self.timeframe)
+
         self.data = self.gather_data()
         self.calculate_indicators()
         self.add_fvg_zones()
         self.entry_logic()
         self.update_stops()
+        self.save_data()
+
 
     def run_bar_iterations(self):
         while True:
-            sleep(TIMEFRAME_SECONDS[self.timeframe])
+            sleep_until_next_boundary(self.timeframe)
+
+
             self.fetch_new_data()
             self.calculate_indicators()
             self.add_fvg_zones()
@@ -532,6 +527,9 @@ if __name__ == "__main__":
         data = pd.DataFrame(data)
         data.to_csv("contracts.csv")
         print("Contract list updated successfully!!")
+    elif SHOW_ACCOUNTS:
+        strat = Strategy(ASSETS[0])
+        print(get_account_id(strat.auth_token, show=True))
 
     else:
         for asset_pair in ASSETS:

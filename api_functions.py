@@ -2,11 +2,22 @@ import pandas as pd
 import os
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 import logging
 
-
+TIMEFRAME_SECONDS = {
+    "1s": 1,
+    "5s": 5,
+    "30s": 30,
+    "1min": 60,
+    "5min": 300,
+    "15min": 900,
+    "30min": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
+}
 
 def login_to_api(user_name, api_key):
     url = "https://api.topstepx.com/api/Auth/loginKey"
@@ -46,7 +57,7 @@ def login_to_api(user_name, api_key):
             'status_code': None
         }
 
-def get_account_id(token):
+def get_account_id(token, account_name, show=False):
     url = "https://api.topstepx.com/api/Account/search"
 
     headers = {
@@ -68,9 +79,10 @@ def get_account_id(token):
     if not accounts:
         raise Exception("No active accounts found")
 
-    return accounts[0]["id"]
-
-
+    if show:
+        return accounts
+    
+    return [acc for acc in accounts if acc["name"] == account_name][0]["id"]
 
 def _map_timeframe_to_unit(timeframe: str):
     """
@@ -151,23 +163,21 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
         headers['Authorization'] = f'Bearer {auth_token}'
     
     # Map timeframe to unit and unitNumber
-    unit, unit_number = _map_timeframe_to_unit(timeframe)
-    print(unit, unit_number)
-    
+    unit, unit_number = _map_timeframe_to_unit(timeframe)    
 
     end_time = datetime.utcnow()
 
     if unit == 1:  # Seconds
-        delta = timedelta(seconds=unit_number * num_bars*3)
+        delta = timedelta(seconds=unit_number * num_bars*200)
 
     elif unit == 2:  # Minutes
-        delta = timedelta(minutes=unit_number * num_bars*3)
+        delta = timedelta(minutes=unit_number * max([num_bars, 4320]))
 
     elif unit == 3:  # Hours
-        delta = timedelta(hours=unit_number * num_bars*3)
+        delta = timedelta(hours=unit_number * max([num_bars, 72]))
 
     elif unit == 4:  # Days
-        delta = timedelta(days=unit_number * num_bars*3)
+        delta = timedelta(days=unit_number * max([num_bars, 3]))
 
     else:
         raise ValueError("Unsupported unit")
@@ -212,6 +222,7 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
                 
                 # Convert timestamp to datetime if needed
                 df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+                df['timestamp'] = df['timestamp'].astype('int64') // 1_000_000
                 
                 # Optional: reorder columns
                 df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
@@ -262,15 +273,14 @@ def fetch_data_(ugh, eeehm, lol, tok=None, l=False):
     #df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
     
-
-def load_data(asset):
+def load_data(asset, timeframe):
     """
     If asset data exist and are not older than 35 mins, it returns them as pandas df.
     otherwise returns None
     """
-    path = f"{asset}.csv"
+    path = f"{asset}-{timeframe}.csv"
     if os.path.exists(path):
-        df = pd.read_csv(f"{asset}.csv")
+        df = pd.read_csv(path)
         if int(time.time() * 1000) - df["timestamp"].iloc[-1] > 35 * 1000: # if "timestamp" column is in ms
             return None
         else:
@@ -278,7 +288,6 @@ def load_data(asset):
 
     else:
         return None
-
 
 def stream_market_data(token: str, contract_id: str, callback):
     """
@@ -337,3 +346,15 @@ def stream_market_data(token: str, contract_id: str, callback):
         hub_connection.send("UnsubscribeContractQuotes", [contract_id])
         hub_connection.stop()
         print("Connection closed.")
+
+def sleep_until_next_boundary(timeframe: str):
+    tf_seconds = TIMEFRAME_SECONDS[timeframe]
+
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
+
+    # Next exact multiple of timeframe seconds
+    next_boundary = ((now_ts // tf_seconds) + 1) * tf_seconds
+
+    sleep_seconds = next_boundary - now_ts
+    time.sleep(sleep_seconds)
