@@ -57,7 +57,7 @@ def login_to_api(user_name, api_key):
             'status_code': None
         }
 
-def get_account_id(token, account_name, show=False):
+def get_account_id(token, account_name=None, show=False):
     url = "https://api.topstepx.com/api/Account/search"
 
     headers = {
@@ -289,20 +289,20 @@ def load_data(asset, timeframe):
     else:
         return None
 
-def stream_market_data(token: str, contract_id: str, callback):
-    """
-    Connects to ProjectX market hub and streams last price updates for a specific contract.
-    
-    :param token: Bearer JWT token
-    :param contract_id: Contract ID string, e.g., 'CON.F.US.RTY.H25'
-    :param callback: Function to call on every payload. Signature: callback(payload)
-    """
-
+def stream_market_data(token: str, contract_id: str, callback, user_name, api_key):
+    response = login_to_api(user_name, api_key)
+    if response["success"]:
+        print("new_token")
+        token = response["token"]
     market_hub_url = f"https://rtc.topstepx.com/hubs/market?access_token={token}"
 
-    # Build the hub connection
     hub_connection = HubConnectionBuilder()\
-        .with_url(market_hub_url, options={"access_token_factory": lambda: token})\
+        .with_url(
+            market_hub_url,
+            options={
+                "access_token_factory": lambda: token
+            }
+        )\
         .configure_logging(logging.INFO)\
         .with_automatic_reconnect({
             "type": "raw",
@@ -311,43 +311,37 @@ def stream_market_data(token: str, contract_id: str, callback):
         })\
         .build()
 
-    # Handler for incoming GatewayQuote events
-    def handle_event(payload):
-        """
-        SignalR sends the payload as a dict or a list [contract_id, dict].
-        """
-        data = None
-        if isinstance(payload, list) and len(payload) >= 2 and isinstance(payload[1], dict):
-            data = payload[1]
-        elif isinstance(payload, dict):
-            data = payload
-
-        if data is not None:
+    # Event handler
+    def handle_event(args):
+        if isinstance(args, list) and len(args) >= 2:
+            _, data = args
             callback(data)
+        elif isinstance(args, dict):
+            callback(args)
         else:
-            print("Warning: unexpected payload format:", payload)
+            print("Warning: unexpected payload format:", args)
 
     hub_connection.on("GatewayQuote", handle_event)
 
-    # Start the connection
-    hub_connection.start()
-    time.sleep(1)  # Give it a moment to establish
+    # Subscribe when connection is open
+    def on_open():
+        print(f"Connected. Subscribing to {contract_id}")
+        hub_connection.invoke("SubscribeContractQuotes", [contract_id])
 
-    # Subscribe to contract quotes
-    hub_connection.send("SubscribeContractQuotes", [contract_id])
-    print(f"Subscribed to {contract_id} market quotes.")
+    hub_connection.on_open(on_open)
+    hub_connection.start()
 
     try:
-        # Keep running indefinitely
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        # Unsubscribe and close
-        hub_connection.send("UnsubscribeContractQuotes", [contract_id])
+        hub_connection.invoke("UnsubscribeContractQuotes", [contract_id])
         hub_connection.stop()
         print("Connection closed.")
 
+
 def sleep_until_next_boundary(timeframe: str):
+
     tf_seconds = TIMEFRAME_SECONDS[timeframe]
 
     now = datetime.now(timezone.utc)
@@ -358,3 +352,59 @@ def sleep_until_next_boundary(timeframe: str):
 
     sleep_seconds = next_boundary - now_ts
     time.sleep(sleep_seconds)
+
+def get_account_balance(account_id, auth_token):
+    url = "https://api.topstepx.com/api/Account/search"
+
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "accept": "text/plain",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "onlyActiveAccounts": True
+    }
+
+    response = requests.post(url, json=payload, headers=headers)
+    response.raise_for_status()
+
+    data = response.json()
+    # The API returns a list of accounts under "accounts"
+    accounts = data.get("accounts")
+    if not accounts:
+        raise Exception("No active accounts found")
+    
+    return float([acc for acc in accounts if acc["id"] == account_id][0]["balance"])
+
+def validate_token(auth_token: str):
+    url = "https://api.topstepx.com/api/Auth/validate"
+
+    headers = {
+        "accept": "text/plain",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {auth_token}"
+    }
+
+    try:
+        response = requests.post(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            return {
+                "success": False,
+                "new_token": None,
+                "status_code": response.status_code,
+                "message": response.text
+            }
+
+        data = response.json()
+
+        return data
+
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "new_token": None,
+            "status_code": None,
+            "message": str(e)
+        }
