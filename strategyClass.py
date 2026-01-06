@@ -5,64 +5,80 @@ import json
 from time import sleep
 import threading
 import os
+import requests
+metadata_lock = threading.Lock()
 
-IS_FVG_TO_SHOW = True              # Display FVG
-FVG_HISTORY_NBR = 5                # Number of FVGs to show (1-50)
-IS_MITIGATED_FVG_TO_REDUCE = True  # Reduce mitigated FVG
-MIN_FVG_POWER_PCT = 0.1            # Min FVG Power %
-HTF_TF = "240"                     # HTF Bias (4H)
+
+# ==================== CONFIGURATION PARAMETERS ====================
+# Display Settings
+FVG_HISTORY_NBR = 15               # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.03           # Min FVG Power % (formerly MinFVGPowerPct)
+
+# Timeframe and Trend Settings
+HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 50                    # EMA Period for trend detection
+
+# ATR and Risk Management
 ATR_PERIOD = 14                    # ATR Period (min 1)
-SL_MULTIPLIER = 4.0                # SL ATR Multiplier
-TP_MULTIPLIER = 25.0               # TP ATR Multiplier (Positional: Wider Targets)
-USE_TRAILING = True                # use trailing stop
-TRAIL_OFFSET_MULT = 8.0            # Trailing Offset ATR Multiplier (Wide for Positional)
+SL_MULTIPLIER = 3.0                # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 8.0                # TP ATR Multiplier (formerly TP_ATR_Mult)
+
+# Trailing Stop Settings
+USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
+TRAIL_OFFSET_MULT = 4.0            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+
+# Position Management
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
-ORDER_SIZE = 1
-ACCOUNT_NAME = "50KTC-V2-252499-47109338"
-ACCOUNT_ID = None      # if you know the account id, paste it here, it is more effective
+# Lot Size and Risk Settings
+USE_FIXED_LOT = False              # Use fixed lot size (formerly UseFixedLot)
+FIXED_LOT = 0.10                   # Fixed lot size (formerly FixedLot)
+RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
+ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
-ASSETS = [("CON.F.US.GCE.G26","1min")]
+# Daily Trading Limits
+MAX_DAILY_TRADES = 5               # Maximum trades per day (formerly MaxDailyTrades)
+
+# Assets and API Settings
+# list of asset, timeframe and account name combinations;
+# format: [(asset1, timeframe1, account_name1), (asset2, timeframe2, account1), (..., ..., account2), ...]
+ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-66765377"), ("CON.F.US.MNQ.H26", "5min", "50KTC-V2-252499-66765377")]
+
 USERNAME = os.getenv("USERNAME")
 API_KEY = os.getenv("API_KEY")
-LIVE = False
+LIVE = False  # or False
 
-SHOW_ACCOUNTS = False           # setting this True will print availible accounts and their ids (it will not run the strategy)
-UPDATE_CONTRACT_LIST = False    # True will update the contracts.csv. (also will not run the strategy)
 
-# import smtplib
-# from email.mime.text import MIMEText
-# from email.mime.multipart import MIMEMultipart
-# SENDER = os.getenv("SENDER")
-# PASSWORD = os.getenv("PASSWORD")
-# RECIPIENT = os.getenv("RECIPIENT")
+# ====================
+# if true, updates contracts.csv - this should be done at least monthly
+UPDATE_CONTRACT_LIST = False
 
-# def send_email(subject, body, sender=SENDER, password=PASSWORD, recipient=RECIPIENT):
-#     msg = MIMEMultipart()
-#     msg['From'] = sender
-#     msg['To'] = recipient
-#     msg['Subject'] = subject
-#     msg.attach(MIMEText(body, 'plain'))
+# if true it will print the list of valid accounts for this api key
+SHOW_ACCOUNTS = False
+# ======== if any of those two is true, it will run the option, but not the strategy
 
-#     try:
-#         with smtplib.SMTP('smtps.platon.sk', 587) as server:
-#             server.starttls()
-#             server.login(sender, password)
-#             server.send_message(msg)
-#         print("✅ Email sent successfully!")
-#     except Exception as e:
-#         print("❌ Failed to send email:", e)
+
+def init_api():
+    res = login_to_api(USERNAME, API_KEY)
+    if not res["success"]:
+        raise RuntimeError("❌ API login failed")
+
+    global_token = res["token"]
+    print(f"✅ API initialized.")
+    return global_token
 
 
 class Order:
     def __init__(self, side: str, entry_price: float,
                 take_profit: float, trailing_stop_loss, entry_atr,
-                account_id, asset_id, auth_token):
+                account_id, asset_id, auth_token, lot_size=None):
         self.side = side
         self.entry_price = entry_price
         self.take_profit = take_profit
         self.trailing_stop_loss = trailing_stop_loss
         self.entry_atr = entry_atr
+        self.lot_size = lot_size if lot_size else ORDER_SIZE
+
 
         self.account_id = account_id
         self.asset_id = asset_id
@@ -77,7 +93,7 @@ class Order:
             print("Error: auth_token is required to place order")
             return {'success': False, 'message': 'auth_token is required'}
         
-        url = " https://api.topstepx.com/api/Order/place"
+        url = "https://api.topstepx.com/api/Order/place"
         
         headers = {
             'accept': 'text/plain',
@@ -93,7 +109,7 @@ class Order:
             "contractId": self.asset_id,
             "type": 2,  # 2 = Market order
             "side": side_code,  # 0 = Bid (buy), 1 = Ask (sell)
-            "size": ORDER_SIZE,
+            "size": self.lot_size,
             "limitPrice": None,
             "stopPrice": None,
             "trailPrice": None,
@@ -101,14 +117,15 @@ class Order:
         }
         
         try:
-            import requests
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             
             if response.status_code == 200:
                 result = response.json()
                 if result.get("success", False):
                     order_id = result.get("orderId")
-                    print(f"Order placed successfully. Order ID: {order_id}")
+                    print(f"✅ Order placed successfully. Order ID: {order_id}")
+                    print(f"   Side: {self.side}, Size: {self.lot_size}, Entry: {self.entry_price:.5f}")
+                    print(f"   TP: {self.take_profit:.5f}, SL: {self.trailing_stop_loss:.5f}")
                     return {
                         'success': True,
                         'order_id': order_id,
@@ -116,7 +133,7 @@ class Order:
                     }
                 else:
                     error_msg = result.get("errorMessage", "Unknown error")
-                    print(f"Order placement failed: {error_msg}")
+                    print(f"❌ Order placement failed: {error_msg}")
                     return {
                         'success': False,
                         'order_id': None,
@@ -124,7 +141,7 @@ class Order:
                     }
             else:
                 error_msg = f"HTTP {response.status_code}: {response.text}"
-                print(f"Order placement failed: {error_msg}")
+                print(f"❌ Order placement failed: {error_msg}")
                 return {
                     'success': False,
                     'order_id': None,
@@ -160,44 +177,58 @@ class Order:
             "contractId": self.asset_id
         }
 
-        response = requests.post(url, json=payload, headers=headers)
-        
-        # Raise for HTTP errors
-        response.raise_for_status()
-
-        # Parse response as JSON
         try:
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
             return response.json()
-        except ValueError:
-            raise Exception(f"Unexpected response: {response.text}")
+        except Exception as e:
+            print(f"❌ Failed to close position: {e}")
+            raise Exception(f"Unexpected response: {e}")
 
     def check_stops(self, current_price):
+        """Check if stop loss or take profit has been hit"""
         if self.side == "BUY":
             if current_price <= self.trailing_stop_loss:
+                print(f"🛑 Stop Loss hit for LONG position at {current_price:.5f}")
                 self.close_order()
+                return True
 
             if current_price >= self.take_profit:
+                print(f"🎯 Take Profit hit for LONG position at {current_price:.5f}")
                 self.close_order()
+                return True
         
         elif self.side == "SELL":
             if current_price >= self.trailing_stop_loss:
+                print(f"🛑 Stop Loss hit for SHORT position at {current_price:.5f}")
                 self.close_order()
+                return True
 
             if current_price <= self.take_profit:
+                print(f"🎯 Take Profit hit for SHORT position at {current_price:.5f}")
                 self.close_order()
+                return True
+        
+        return False
 
 
 class Strategy:
-    def __init__(self, asset_pair):
+    def __init__(self, asset_tuple):
         self.auth_token = None
         self.account_id = None
-        
-        self.init_api()
+
+        self.timeframe = asset_tuple[1]
+        self.asset = asset_tuple[0]
+        self.account_name = asset_tuple[2]
+
+    def init_rest(self):
+        self.account_id = get_account_id(self.auth_token, account_name=self.account_name)
+        self.account_balance = get_account_balance(self.account_id, self.auth_token)
         self.active_order = None
 
-        self.timeframe = asset_pair[1]
-        self.asset = asset_pair[0]
         self.data = self.gather_data()
+        print(f"📊 Loaded {len(self.data)} bars for {self.asset}")
+
         self.cur_close = self.data["close"].iloc[-1]
         self.cur_volume = self.data["volume"].iloc[-1]
 
@@ -217,27 +248,41 @@ class Strategy:
         self.lastPositionWasLong = False
         self.lastPositionWasShort = False
 
-        self.load_metadata()
+        self.daily_trades_count = 0
+        self.last_trade_date = None
 
+        self.load_metadata()
         self.calculate_indicators()
 
         self.fvg_zones: list[dict] = []
         self.add_fvg_zones()
 
+    def set_token(self, token):
+        self.auth_token = token
+
     def load_metadata(self):
-        path = f"metadata-{self.asset}-{self.timeframe}.json"
-        if not os.path.exists(path):
+        with metadata_lock: 
+            path = f"metadata.json"
+            if not os.path.exists(path):
+                return
+
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            f.close()
+
+        data = data.get(f"{self.account_id}-{self.asset}-{self.timeframe}", None)
+        if data is None:
             return
-
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
 
         if data["active_order"] is not None:
             self.active_order = Order(**data["active_order"])
-        self.inPosition = bool(data["inPosition"])
-        self.lastPositionWasLong = bool(data["lastPositionWasLong"])
-        self.lastPositionWasShort = bool(data["lastPositionWasShort"])
+
+        self.inPosition = bool(data.get("inPosition", False))
+        self.lastPositionWasLong = bool(data.get("lastPositionWasLong", False))
+        self.lastPositionWasShort = bool(data.get("lastPositionWasShort", False))
+
+        self.daily_trades_count = int(data.get("daily_trades_count", 0))
+        self.last_trade_date = data.get("last_trade_date")
 
     def get_assets(self):
         url = "https://api.topstepx.com/api/Contract/available"
@@ -257,17 +302,6 @@ class Strategy:
         
         return response.json()["contracts"]
 
-    def init_api(self):
-        res = login_to_api(USERNAME, API_KEY)
-        if not res["success"]:
-            raise RuntimeError("API login failed")
-
-        self.auth_token = res["token"]
-
-        self.account_id = get_account_id(self.auth_token, ACCOUNT_NAME)
-
-        #print(self.auth_token, self.account_id)
-
     def gather_data(self):
         data = load_data(self.asset, self.timeframe)
         if data is not None:
@@ -279,13 +313,14 @@ class Strategy:
         new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token, LIVE)
         if new_row is None:
             return
-        self.cur_close = new_row["close"].iloc[-1]
-        self.cur_volume = new_row["volume"].iloc[-1]
-        self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
+        if new_row["timestamp"].iloc[-1] > self.data["timestamp"].iloc[-1]:
+            self.cur_close = new_row["close"].iloc[-1]
+            self.cur_volume = new_row["volume"].iloc[-1]
+            self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
 
     def update_trend_indicators(self):
-        bars = fetch_data(self.asset, f"{HTF_TF}min", 101, self.auth_token, LIVE)
-        htfEMA = ema(bars, 50)
+        bars = fetch_data(self.asset, f"{HTF_TF}min", EMA_PERIOD*2, self.auth_token, LIVE)
+        htfEMA = ema(bars, EMA_PERIOD)
 
         self.isBullishHTF = self.cur_close > htfEMA
         self.isBearishHTF = self.cur_close < htfEMA
@@ -296,7 +331,7 @@ class Strategy:
         self.marketOK = volOK and atrOK
 
 
-        self.lastBullFvg  = self.data["high"].iloc[-4] < self.data["low"].iloc[-2] and not self.lastBullFvg
+        self.lastBullFvg = self.data["high"].iloc[-4] < self.data["low"].iloc[-2] and not self.lastBullFvg
         self.lastBearFvg = self.data["low"].iloc[-4] > self.data["high"].iloc[-2] and not self.lastBearFvg
 
     def calc_BOS_and_CHOCH(self):
@@ -337,7 +372,7 @@ class Strategy:
 
     def add_fvg_zones(self):
         # === FVG ZONE CREATION (equivalent to the box.new blocks) ===
-        if self.bullishPowerOK and self.isBullishHTF and self.marketOK and IS_FVG_TO_SHOW:
+        if self.bullishPowerOK and self.isBullishHTF and self.marketOK:
             # Bullish FVG uses low[1] as top and high[3] as bottom in Pine
             self.fvg_zones.append(
                 {
@@ -347,8 +382,10 @@ class Strategy:
                     "mitigated": False,
                 }
             )
+            print(f"🟢 Bullish FVG detected: {self.data['high'].iloc[-4]:.5f} - {self.data['low'].iloc[-2]:.5f}")
 
-        if self.bearishPowerOK and self.isBearishHTF and self.marketOK and IS_FVG_TO_SHOW:
+
+        if self.bearishPowerOK and self.isBearishHTF and self.marketOK:
             # Bearish FVG uses low[3] as top and high[1] as bottom in Pine
             self.fvg_zones.append(
                 {
@@ -358,14 +395,50 @@ class Strategy:
                     "mitigated": False,
                 }
             )
+            print(f"🔴 Bearish FVG detected: {self.data['high'].iloc[-2]:.5f} - {self.data['low'].iloc[-4]:.5f}")
+
 
         # Limit number of stored FVGs, similar to fvgHistoryNbr trimming in Pine
         if len(self.fvg_zones) > FVG_HISTORY_NBR:
             self.fvg_zones = self.fvg_zones[-FVG_HISTORY_NBR:]
 
+    def check_daily_trade_limit(self):
+        """Check if maximum daily trades has been reached"""
+        today = datetime.now().date()
+        
+        if self.last_trade_date != str(today):
+            # Reset counter for new day
+            self.daily_trades_count = 0
+            self.last_trade_date = str(today)
+        
+        return self.daily_trades_count < MAX_DAILY_TRADES
+
+    def calculate_lot_size(self, atr, stop_distance_atr_mult):
+        """Calculate position size based on risk management"""
+        if USE_FIXED_LOT:
+            return FIXED_LOT
+        
+        # Calculate lot size based on risk percentage
+        # This is a simplified calculation - adjust based on your broker's requirements
+        risk_amount = self.account_balance * (RISK_PERCENT / 100)
+        stop_distance = atr * stop_distance_atr_mult
+        
+        if stop_distance > 0:
+            lot_size = risk_amount / stop_distance
+            # Round to appropriate precision
+            lot_size = round(lot_size, 2)
+            return max(0.01, min(lot_size, 100))  # Ensure reasonable bounds
+        
+        return ORDER_SIZE
+
     def entry_logic(self):
         if len(self.fvg_zones) == 0 or self.inPosition:
             return
+
+        if not self.check_daily_trade_limit():
+            print(f"⚠️ Daily trade limit reached ({MAX_DAILY_TRADES}). No new trades today.")
+            return
+
 
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
@@ -391,14 +464,23 @@ class Strategy:
                 trailStop = self.cur_close - atr * SL_MULTIPLIER
                 tp = self.cur_close + atr * TP_MULTIPLIER
                 entryAtr = atr
+                lot_size = self.calculate_lot_size(atr, SL_MULTIPLIER)
+
                 self.active_order = Order("BUY", self.cur_close, tp, trailStop, entryAtr,
-                                          self.account_id, self.asset, self.auth_token)
-                self.active_order.place_order()
-                zone["mitigated"] = True
-                self.lastPositionWasLong = True
-                self.lastPositionWasShort = False
-                self.inPosition = True
+                                          self.account_id, self.asset, self.auth_token, lot_size)
+                result = self.active_order.place_order()
+                
+                if result['success']:
+                    zone["mitigated"] = True
+                    self.lastPositionWasLong = True
+                    self.lastPositionWasShort = False
+                    self.inPosition = True
+                    self.daily_trades_count += 1
+                    self.last_trade_date = str(datetime.now().date())
+                    self.pending_signal = None
+                    print(f"📈 LONG position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
                 break
+
 
 
             elif (
@@ -412,11 +494,17 @@ class Strategy:
                 entryAtr = atr
                 self.active_order = Order("SELL", self.cur_close, tp, trailStop, entryAtr,
                                           self.account_id, self.asset, self.auth_token)
-                self.active_order.place_order()
-                zone["mitigated"] = True
-                self.lastPositionWasShort = True
-                self.lastPositionWasLong = False
-                self.inPosition = True
+                result = self.active_order.place_order()
+                
+                if result['success']:
+                    zone["mitigated"] = True
+                    self.lastPositionWasShort = True
+                    self.lastPositionWasLong = False
+                    self.inPosition = True
+                    self.daily_trades_count += 1
+                    self.last_trade_date = str(datetime.now().date())
+                    self.pending_signal = None
+                    print(f"📉 SHORT position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
                 break
 
     def update_stops(self):
@@ -432,7 +520,10 @@ class Strategy:
             if USE_TRAILING and pos.entry_atr is not None:
                 potentialStop = current_high - pos.entry_atr * TRAIL_OFFSET_MULT
                 if pos.trailing_stop_loss is not None:
-                    pos.trailing_stop_loss = max(pos.trailing_stop_loss, potentialStop)
+                    new_stop = max(pos.trailing_stop_loss, potentialStop)
+                    if new_stop > pos.trailing_stop_loss:
+                        print(f"📊 Trailing stop updated: {pos.trailing_stop_loss:.5f} → {new_stop:.5f}")
+                        pos.trailing_stop_loss = new_stop
                 else:
                     pos.trailing_stop_loss = potentialStop
 
@@ -440,19 +531,24 @@ class Strategy:
             if USE_TRAILING and pos.entry_atr is not None:
                 potentialStop = current_low + pos.entry_atr * TRAIL_OFFSET_MULT
                 if pos.trailing_stop_loss is not None:
-                    pos.trailing_stop_loss = min(pos.trailing_stop_loss, potentialStop)
+                    new_stop = min(pos.trailing_stop_loss, potentialStop)
+                    if new_stop < pos.trailing_stop_loss:
+                        print(f"📊 Trailing stop updated: {pos.trailing_stop_loss:.5f} → {new_stop:.5f}")
+                        pos.trailing_stop_loss = new_stop
                 else:
                     pos.trailing_stop_loss = potentialStop
 
         # === CLOSE ON OPPOSITE BOS/CHoCH ===
         if HOLD_UNTIL_OPPOSITE and self.inPosition:
             if self.lastPositionWasLong and self.isCHOCH:
+                print("🔄 CHoCH detected - Closing LONG position")
                 self.active_order.close_order()
                 self.active_order = None
                 self.inPosition = False
                 self.lastPositionWasLong = False
 
             if self.lastPositionWasShort and self.isBOS:
+                print("🔄 BOS detected - Closing SHORT position")
                 self.active_order.close_order()
                 self.active_order = None
                 self.inPosition = False
@@ -462,22 +558,44 @@ class Strategy:
         order_dict = None
         if self.active_order is not None:
             order_dict = self.active_order.__dict__
-            print(order_dict)
 
         res_dict = {
-            "active_order" : order_dict,
-            "inPosition" : self.inPosition,
-            "lastPositionWasShort" : self.lastPositionWasShort,
-            "lastPositionWasLong" : self.lastPositionWasLong 
+            "active_order": order_dict,
+            "inPosition": self.inPosition,
+            "lastPositionWasShort": self.lastPositionWasShort,
+            "lastPositionWasLong": self.lastPositionWasLong,
+            "daily_trades_count": self.daily_trades_count,
+            "last_trade_date": self.last_trade_date
         }
 
-        with open(f"metadata-{self.asset}-{self.timeframe}.json", "w", encoding="utf-8") as f:
-            json.dump(res_dict, f, indent=2)
+        key = f"{self.account_id}-{self.asset}-{self.timeframe}"
+        path = "metadata.json"
 
+        with metadata_lock:
+            # Load existing metadata (if any)
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    try:
+                        metadata = json.load(f)
+                    except json.JSONDecodeError:
+                        metadata = {}
+            else:
+                metadata = {}
+
+            # Update only this strategy's entry
+            metadata[key] = res_dict
+
+            # Write back atomically
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+
+        # CSV saving is independent
         self.data.to_csv(f"{self.asset}-{self.timeframe}.csv")
 
 
     def first_iteration(self):
+        print("🚀 Starting first iteration...")
+        print("Waiting for the first closing bar")
         sleep_until_next_boundary(self.timeframe)
 
         self.data = self.gather_data()
@@ -487,51 +605,133 @@ class Strategy:
         self.update_stops()
         self.save_data()
 
-
     def run_bar_iterations(self):
+        """Main loop for bar-based updates, runs aligned with timeframe"""
+        timeframe_sec = TIMEFRAME_SECONDS[self.timeframe]
+        
+        # next bar start time
+        next_bar = datetime.now() + timedelta(seconds=timeframe_sec)
+        
         while True:
-            sleep_until_next_boundary(self.timeframe)
+            try:
+                self.fetch_new_data()
+                self.calculate_indicators()
+                self.add_fvg_zones()
+                self.entry_logic()
+                self.update_stops()
+                self.save_data()
+                print(f"\n⏰ New bar - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} close: {self.cur_close}")
+                
+                # calculate exact sleep until next bar
+                now = datetime.now()
+                sleep_seconds = (next_bar - now).total_seconds()
+                if sleep_seconds < 0:
+                    # we are behind schedule, skip sleep
+                    sleep_seconds = 0
+                sleep(sleep_seconds)
+                
+                # schedule next bar
+                next_bar += timedelta(seconds=timeframe_sec)
+                
+            except Exception as e:
+                print(f"❌ Error in bar iteration: {e}")
+                sleep(60)
 
+    def update_price(self):
+        while True:
+            sleep(10)
+            new_row = fetch_data(self.asset, "10s", 1, self.auth_token, LIVE)
+            if new_row is None:
+                return
 
-            self.fetch_new_data()
-            self.calculate_indicators()
-            self.add_fvg_zones()
-            self.entry_logic()
-            self.update_stops()
-            self.save_data()
-            if self.active_order is None:
-                continue
-            self.active_order.check_stops()
+            self.cur_price = new_row["close"].iloc[-1]
+            print(f"updated price: {self.cur_price}")
 
-    def run_websocket_iteration(self):
-        print("new_data")
-        if self.active_order is None:
-            return
-        self.active_order.check_stops()
+            if self.active_order is not None:
+                closed = self.active_order.check_stops(self.cur_close)
+                if closed:
+                    self.active_order = None
+                    self.inPosition = False
+                    self.lastPositionWasLong = False
+                    self.lastPositionWasShort = False
+                    self.save_data()
 
     def run(self):
+        """Start the trading bot"""
+        print(f"\n{'='*60}")
+        print(f"🤖 Trading Bot Started for {self.asset}")
+        print(f"{'='*60}")
+        print(f"Timeframe: {self.timeframe}")
+        print(f"HTF Bias: {HTF_TF}min | EMA Period: {EMA_PERIOD}")
         self.first_iteration()
 
+
         t1 = threading.Thread(target=self.run_bar_iterations)
-        t2 = threading.Thread(
-            target=lambda: stream_market_data(self.auth_token, self.asset, self.run_websocket_iteration)
-        )
+        t2 = threading.Thread(target=self.update_price)
         t1.start()
         t2.start()
 
 
+def run_strat(strat: Strategy, token):
+    strat.set_token(token)
+    strat.init_rest()
+    strat.run()
+
+def validation_thread(auth_token, strategies: list[Strategy]):
+    print("starting validation thread...")
+    while True:
+        sleep(72000)
+        res = validate_token(auth_token)
+        if res["success"] == False:
+            print("token update failed, API connection might fail soon...")
+            print(res["message"])
+            return
+
+        new_token = res["newToken"]
+        print("Sucessfully updated connection token")
+        for strat in strategies:
+            strat.set_token(new_token)
+
+
 if __name__ == "__main__":
+    global_token = init_api()
     if UPDATE_CONTRACT_LIST:
         strat = Strategy(ASSETS[0])
+        strat.set_token(global_token)
+        strat.init_rest()
         data = strat.get_assets()
         data = pd.DataFrame(data)
         data.to_csv("contracts.csv")
         print("Contract list updated successfully!!")
     elif SHOW_ACCOUNTS:
         strat = Strategy(ASSETS[0])
+        strat.set_token(global_token)
         print(get_account_id(strat.auth_token, show=True))
 
     else:
+        threads = []
+        strats = []
         for asset_pair in ASSETS:
-            strat = Strategy(asset_pair)
-            strat.run()
+            strats.append(Strategy(asset_pair))
+        
+        v_thread = threading.Thread(
+            target = validation_thread,
+            args = (global_token, strats,),
+            daemon=True
+        )
+        v_thread.start()
+
+        for strat in strats:
+            t = threading.Thread(
+                target=run_strat,
+                args=(strat, global_token,),
+                daemon=True
+            )
+            t.start()
+            threads.append(t)
+
+
+
+    while True:
+        time.sleep(5)
+            
