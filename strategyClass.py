@@ -319,7 +319,7 @@ class Strategy:
             self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
 
     def update_trend_indicators(self):
-        bars = fetch_data(self.asset, f"{HTF_TF}min", EMA_PERIOD*2, self.auth_token, LIVE)
+        bars = fetch_data(self.asset, f"{HTF_TF}min", 101, self.auth_token, LIVE)
         htfEMA = ema(bars, EMA_PERIOD)
 
         self.isBullishHTF = self.cur_close > htfEMA
