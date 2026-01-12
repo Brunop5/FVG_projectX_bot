@@ -11,38 +11,38 @@ metadata_lock = threading.Lock()
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 15               # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.03           # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 10               # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.05           # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
 HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 50                    # EMA Period for trend detection
+EMA_PERIOD = 100                    # EMA Period for trend detection
 
 # ATR and Risk Management
 ATR_PERIOD = 14                    # ATR Period (min 1)
-SL_MULTIPLIER = 3.0                # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 8.0                # TP ATR Multiplier (formerly TP_ATR_Mult)
+SL_MULTIPLIER = 4.0                # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 2000000.0                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 4.0            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+TRAIL_OFFSET_MULT = 6.0            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
-USE_FIXED_LOT = False              # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 0.10                   # Fixed lot size (formerly FixedLot)
+USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
+FIXED_LOT = 2                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
 # Daily Trading Limits
-MAX_DAILY_TRADES = 5               # Maximum trades per day (formerly MaxDailyTrades)
+MAX_DAILY_TRADES = 3               # Maximum trades per day (formerly MaxDailyTrades)
 
 # Assets and API Settings
 # list of asset, timeframe and account name combinations;
 # format: [(asset1, timeframe1, account_name1), (asset2, timeframe2, account1), (..., ..., account2), ...]
-ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-66765377"), ("CON.F.US.MNQ.H26", "5min", "50KTC-V2-252499-66765377")]
+ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-38617147"), ("CON.F.US.MNQ.H26", "5min", "50KTC-V2-252499-66765377")]
 
 USERNAME = os.getenv("USERNAME")
 API_KEY = os.getenv("API_KEY")
@@ -694,44 +694,50 @@ def validation_thread(auth_token, strategies: list[Strategy]):
 
 
 if __name__ == "__main__":
-    global_token = init_api()
-    if UPDATE_CONTRACT_LIST:
-        strat = Strategy(ASSETS[0])
-        strat.set_token(global_token)
-        strat.init_rest()
-        data = strat.get_assets()
-        data = pd.DataFrame(data)
-        data.to_csv("contracts.csv")
-        print("Contract list updated successfully!!")
-    elif SHOW_ACCOUNTS:
-        strat = Strategy(ASSETS[0])
-        strat.set_token(global_token)
-        print(get_account_id(strat.auth_token, show=True))
+    #global_token = init_api()
+    # ("CON.F.US.CLE.G26", 3), 
+    assets = [("CON.F.US.MNQ.H26", 0.74), ("CON.F.US.MES.H26", 0.74), ("CON.F.US.MGC.G26", 0.5), 
+              ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5)]
 
-    else:
-        threads = []
-        strats = []
-        for asset_pair in ASSETS:
-            strats.append(Strategy(asset_pair))
+    gather_historical_data(assets)
+    
+    # if UPDATE_CONTRACT_LIST:
+    #     strat = Strategy(ASSETS[0])
+    #     strat.set_token(global_token)
+    #     strat.init_rest()
+    #     data = strat.get_assets()
+    #     data = pd.DataFrame(data)
+    #     data.to_csv("contracts.csv")
+    #     print("Contract list updated successfully!!")
+    # elif SHOW_ACCOUNTS:
+    #     strat = Strategy(ASSETS[0])
+    #     strat.set_token(global_token)
+    #     print(get_account_id(strat.auth_token, show=True))
+
+    # else:
+    #     threads = []
+    #     strats = []
+    #     for asset_pair in ASSETS:
+    #         strats.append(Strategy(asset_pair))
         
-        v_thread = threading.Thread(
-            target = validation_thread,
-            args = (global_token, strats,),
-            daemon=True
-        )
-        v_thread.start()
+    #     v_thread = threading.Thread(
+    #         target = validation_thread,
+    #         args = (global_token, strats,),
+    #         daemon=True
+    #     )
+    #     v_thread.start()
 
-        for strat in strats:
-            t = threading.Thread(
-                target=run_strat,
-                args=(strat, global_token,),
-                daemon=True
-            )
-            t.start()
-            threads.append(t)
+    #     for strat in strats:
+    #         t = threading.Thread(
+    #             target=run_strat,
+    #             args=(strat, global_token,),
+    #             daemon=True
+    #         )
+    #         t.start()
+    #         threads.append(t)
 
 
 
-    while True:
-        time.sleep(5)
+    # while True:
+    #     time.sleep(5)
             

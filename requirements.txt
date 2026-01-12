@@ -20,3 +20,5 @@ six==1.17.0
 tzdata==2025.3
 urllib3==2.6.2
 websocket-client==1.0.0
+yfinance>=0.2.0
+matplotlib>=3.5.0
