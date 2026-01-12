@@ -2,9 +2,12 @@ import pandas as pd
 import os
 import time
 import requests
+import shutil
 from datetime import datetime, timedelta, timezone
 from signalrcore.hub_connection_builder import HubConnectionBuilder
 import logging
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+# Massive API is accessed via direct HTTP requests
 
 TIMEFRAME_SECONDS = {
     "1s": 1,
@@ -408,3 +411,540 @@ def validate_token(auth_token: str):
             "status_code": None,
             "message": str(e)
         }
+
+# Mapping from futures contracts (base IDs from contracts.csv) to Polygon.io tickers
+# Format: 
+#   - Forex: C:XXXYYY (e.g., C:EURUSD, C:GBPUSD)
+#   - Commodities: C:XXXUSD (e.g., C:XAUUSD for gold, C:XAGUSD for silver)
+#   - Indices: I:XXX (e.g., I:SPX for S&P 500, I:NDX for NASDAQ)
+CONTRACTS_TO_POLYGON = {
+    # ========== FOREX ==========
+    # Euro
+    "CON.F.US.EEU": "C:EURUSD",   # E-mini Euro FX -> EUR/USD
+    "CON.F.US.EU6": "C:EURUSD",    # Euro FX (Globex) -> EUR/USD
+    "CON.F.US.M6E": "C:EURUSD",   # E-Micro EUR/USD -> EUR/USD
+    
+    # British Pound
+    "CON.F.US.BP6": "C:GBPUSD",   # British Pound -> GBP/USD
+    "CON.F.US.M6B": "C:GBPUSD",   # E-Micro GBP/USD -> GBP/USD
+    
+    # Japanese Yen
+    "CON.F.US.JY6": "C:USDJPY",   # Japanese Yen -> USD/JPY
+    
+    # Canadian Dollar
+    "CON.F.US.CA6": "C:USDCAD",   # Canadian Dollar -> USD/CAD
+    
+    # Australian Dollar
+    "CON.F.US.DA6": "C:AUDUSD",   # Australian Dollar -> AUD/USD
+    "CON.F.US.M6A": "C:AUDUSD",   # E-Micro AUD/USD -> AUD/USD
+    
+    # New Zealand Dollar
+    "CON.F.US.NE6": "C:NZDUSD",   # New Zealand Dollar -> NZD/USD
+    
+    # Swiss Franc
+    "CON.F.US.SF6": "C:USDCHF",   # Swiss Franc -> USD/CHF
+    
+    # Mexican Peso
+    "CON.F.US.MX6": "C:USDMXN",   # Mexican Peso -> USD/MXN
+    
+    # ========== COMMODITIES ==========
+    # Gold
+    "CON.F.US.MGC": "C:XAUUSD",   # Micro Gold -> Gold (XAU/USD)
+    "CON.F.US.GCE": "C:XAUUSD",   # Gold (Globex) -> Gold (XAU/USD)
+    
+    # Silver
+    "CON.F.US.SIL": "C:XAGUSD",   # Micro Silver -> Silver (XAG/USD)
+    "CON.F.US.SIE": "C:XAGUSD",   # Silver (Globex) -> Silver (XAG/USD)
+    
+    # Platinum
+    "CON.F.US.PLE": "C:XPTUSD",   # Platinum -> Platinum (XPT/USD)
+    
+    # ========== INDICES ==========
+    # S&P 500
+    "CON.F.US.MES": "I:SPX",      # Micro E-mini S&P 500 -> S&P 500 Index
+    "CON.F.US.EP": "I:SPX",       # E-Mini S&P 500 -> S&P 500 Index
+    
+    # NASDAQ-100
+    "CON.F.US.MNQ": "I:NDX",      # Micro E-mini Nasdaq-100 -> NASDAQ-100 Index
+    "CON.F.US.ENQ": "I:NDX",      # E-mini NASDAQ-100 -> NASDAQ-100 Index
+    
+    # Dow Jones
+    "CON.F.US.YM": "I:DJI",       # E-mini Dow -> Dow Jones Industrial Average
+    "CON.F.US.MYM": "I:DJI",      # Micro E-mini Dow -> Dow Jones Industrial Average
+    
+    # Russell 2000
+    "CON.F.US.M2K": "I:RUT",      # Micro E-mini Russell 2000 -> Russell 2000 Index
+    "CON.F.US.RTY": "I:RUT",      # E-mini Russell 2000 -> Russell 2000 Index
+    
+    # Nikkei 225
+    "CON.F.US.NKD": "I:N225",     # Nikkei 225 -> Nikkei 225 Index
+}
+
+def get_polygon_ticker(futures_contract_id):
+    """
+    Get Polygon.io ticker for a futures contract (forex, commodity, or index).
+    Returns None if no mapping exists.
+    
+    Returns:
+        tuple: (polygon_ticker, asset_type) where asset_type is "forex", "commodity", or "index"
+               Returns (None, None) if no mapping exists
+    """
+    # Extract base contract ID (remove month/year suffix like .H26, .G26)
+    # Format: CON.F.US.EU6.H26 -> CON.F.US.EU6
+    parts = futures_contract_id.split('.')
+    if len(parts) >= 4:
+        base_id = '.'.join(parts[:4])  # CON.F.US.EU6
+        polygon_ticker = CONTRACTS_TO_POLYGON.get(base_id)
+        if polygon_ticker:
+            # Determine asset type based on ticker prefix
+            if polygon_ticker.startswith("C:X"):
+                asset_type = "commodity"
+            elif polygon_ticker.startswith("C:"):
+                asset_type = "forex"
+            elif polygon_ticker.startswith("I:"):
+                asset_type = "index"
+            else:
+                asset_type = "unknown"
+            return (polygon_ticker, asset_type)
+    return (None, None)
+
+def get_polygon_forex_ticker(futures_contract_id):
+    """
+    Legacy helper kept for compatibility – simply forwards to get_polygon_ticker.
+    """
+    ticker, _ = get_polygon_ticker(futures_contract_id)
+    return ticker
+
+
+def _get_massive_api_key(explicit_key: str | None = None) -> str | None:
+    """
+    Resolve the Massive API key.
+    Prefer an explicit key, then MASSIVE_API_KEY env, then POLYGON_API_KEY env (for compatibility).
+    """
+    if explicit_key:
+        return explicit_key
+    key = os.getenv("MASSIVE_API_KEY")
+    if key:
+        return key
+    # Backwards compatibility – allow existing POLYGON_API_KEY env var
+    return os.getenv("POLYGON_API_KEY")
+
+
+def fetch_polygon_data(ticker, multiplier, timespan, from_date, to_date, api_key, sort="asc", limit=50000):
+    """
+    Fetch historical data from Massive API using direct HTTP requests (forex, commodities, or indices).
+    
+    Based on: https://massive.com/docs/rest/forex/aggregates/custom-bars
+    
+    Args:
+        ticker: Massive ticker (e.g., "C:EURUSD", "C:XAUUSD", "I:SPX")
+        multiplier: Size of the timespan multiplier (e.g., 15 for 15-minute bars)
+        timespan: Timespan (minute, hour, day, week, month, quarter, year)
+        from_date: Start date (YYYY-MM-DD)
+        to_date: End date (YYYY-MM-DD)
+        api_key: API key (if None, will try to get from env vars)
+        sort: Sort order ("asc" or "desc", default "asc")
+        limit: Maximum number of base aggregates per request (default 50000)
+    
+    Returns:
+        pandas.DataFrame with columns: timestamp, open, high, low, close, volume
+        Returns None if error
+    """
+    # Resolve API key
+    resolved_key = _get_massive_api_key(api_key)
+    if not resolved_key:
+        print("⚠️  Error: Massive API key required. Set MASSIVE_API_KEY or POLYGON_API_KEY environment variable.")
+        return None
+
+    base_url = "https://api.massive.com"
+    endpoint = f"/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
+    url = f"{base_url}{endpoint}"
+    
+    params = {
+        "adjusted": "true",
+        "sort": sort,
+        "limit": limit,
+        "apiKey": resolved_key
+    }
+    
+    all_results = []
+    max_pagination_requests = 1000  # Safety limit to prevent infinite loops
+    pagination_count = 0
+    max_retries = 4  # 4 retries = 5 total attempts
+    # Retry delays for 429 errors: 30s, 1min (60s), 2min (120s), 4min (240s)
+    retry_delays_429 = [30, 60, 120, 240]
+    request_delay = 10  # 10 seconds between each request
+    
+    def make_request_with_retry(request_url, request_params, is_first_request=False):
+        """Make a request with retry logic for rate limiting"""
+        # Wait 10 seconds before each request (except the very first one if specified)
+        if not is_first_request:
+            time.sleep(request_delay)
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(request_url, params=request_params, timeout=30)
+                
+                # Handle rate limiting (429)
+                if response.status_code == 429:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delays_429[attempt]
+                        wait_minutes = wait_time // 60
+                        wait_seconds = wait_time % 60
+                        if wait_minutes > 0:
+                            wait_str = f"{wait_minutes}m {wait_seconds}s"
+                        else:
+                            wait_str = f"{wait_seconds}s"
+                        print(f"\n   ⚠️  Rate limited (429). Waiting {wait_str} before retry {attempt + 1}/{max_retries}...", end=" ", flush=True)
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        response.raise_for_status()
+                
+                # Handle forbidden (403) - likely permission issue
+                if response.status_code == 403:
+                    error_msg = f"403 Forbidden - Your API key may not have access to {ticker}. Check your subscription plan."
+                    print(f"\n   ⚠️  {error_msg}")
+                    return None, None
+                
+                response.raise_for_status()
+                return response, None
+                
+            except requests.exceptions.RequestException as e:
+                # Check if it's a 429 error (rate limiting)
+                is_429 = "429" in str(e) or (hasattr(e, 'response') and e.response is not None and e.response.status_code == 429)
+                if attempt < max_retries - 1 and is_429:
+                    wait_time = retry_delays_429[attempt]
+                    wait_minutes = wait_time // 60
+                    wait_seconds = wait_time % 60
+                    if wait_minutes > 0:
+                        wait_str = f"{wait_minutes}m {wait_seconds}s"
+                    else:
+                        wait_str = f"{wait_seconds}s"
+                    print(f"\n   ⚠️  Rate limited. Waiting {wait_str} before retry {attempt + 1}/{max_retries}...", end=" ", flush=True)
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise
+        
+        return None, "Max retries exceeded"
+    
+    try:
+        # Make initial request
+        current_url = url
+        current_params = params
+        is_first_request = True
+        
+        while pagination_count < max_pagination_requests:
+            response, error = make_request_with_retry(current_url, current_params, is_first_request=is_first_request)
+            is_first_request = False  # After first request, always wait 10s
+            
+            if error:
+                print(f"⚠️  {error}")
+                return None
+            if response is None:
+                return None
+            
+            data = response.json()
+            
+            status = data.get("status")
+            
+            # Check for errors
+            if status not in ["OK", "DELAYED"]:
+                error_msg = data.get("error", f"Unknown status: {status}")
+                print(f"⚠️  Massive API error: {error_msg}")
+                return None
+            
+            # Collect results from this page
+            results = data.get("results", [])
+            if results:
+                all_results.extend(results)
+                print(f"   Got {len(results):,} bars (total: {len(all_results):,})...", end=" ", flush=True)
+            
+            # Check for next_url - continue pagination as long as there's a next_url
+            # Status "OK" just means this page is ready, not that all data is complete
+            next_url = data.get("next_url")
+            if not next_url:
+                # No more pages available - we're done
+                if status == "OK":
+                    print("Complete!")
+                break
+            
+            # Continue with next_url regardless of status (OK or DELAYED)
+            # Status "OK" with a next_url means there's more data to fetch
+            
+            # Ensure API key is included in next_url
+            # Parse the URL and add apiKey if not present
+            parsed = urlparse(next_url)
+            query_params = parse_qs(parsed.query)
+            
+            # Add API key if not already present
+            if 'apiKey' not in query_params:
+                query_params['apiKey'] = [resolved_key]
+            
+            # Reconstruct URL with API key
+            new_query = urlencode(query_params, doseq=True)
+            current_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                new_query,
+                parsed.fragment
+            ))
+            current_params = {}  # All params are now in the URL
+            pagination_count += 1
+            
+            # Note: 10 second delay is handled in make_request_with_retry before each request
+        
+        if pagination_count >= max_pagination_requests:
+            print(f"\n⚠️  Warning: Reached maximum pagination limit ({max_pagination_requests}). Data may be incomplete.")
+        
+        if not all_results:
+            print(f"⚠️  No data returned from Massive for {ticker}")
+            return None
+        
+        # Check if we got all the data by verifying date range
+        if all_results:
+            first_timestamp = all_results[0]['t']
+            last_timestamp = all_results[-1]['t']
+            first_date = pd.to_datetime(first_timestamp, unit='ms', utc=True)
+            last_date = pd.to_datetime(last_timestamp, unit='ms', utc=True)
+            requested_start = pd.to_datetime(from_date, utc=True)
+            requested_end = pd.to_datetime(to_date, utc=True)
+            
+            # Check if we got data from the full requested range
+            if first_date > requested_start or last_date < requested_end:
+                print(f"\n⚠️  Warning: Data range incomplete!")
+                print(f"   Requested: {requested_start.strftime('%Y-%m-%d')} to {requested_end.strftime('%Y-%m-%d')}")
+                print(f"   Received: {first_date.strftime('%Y-%m-%d')} to {last_date.strftime('%Y-%m-%d')}")
+                print(f"   Missing: {requested_start.strftime('%Y-%m-%d')} to {first_date.strftime('%Y-%m-%d')} and/or {last_date.strftime('%Y-%m-%d')} to {requested_end.strftime('%Y-%m-%d')}")
+        
+        # Convert to DataFrame
+        df_data = []
+        for bar in all_results:
+            df_data.append({
+                'timestamp': bar['t'],  # Already in milliseconds
+                'open': bar['o'],
+                'high': bar['h'],
+                'low': bar['l'],
+                'close': bar['c'],
+                'volume': bar.get('v', 0)  # Volume may not always be present
+            })
+        
+        df = pd.DataFrame(df_data)
+        
+        # Ensure columns are in correct order
+        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        
+        # Sort by timestamp: oldest first
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        
+        return df
+        
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️  Error fetching data from Massive for {ticker}: {e}")
+        return None
+    except Exception as e:
+        print(f"⚠️  Error processing Massive data for {ticker}: {e}")
+        return None
+
+
+def fetch_polygon_forex_data(forex_ticker, multiplier, timespan, from_date, to_date, api_key, sort="asc", limit=50000):
+    """
+    Legacy function for backward compatibility.
+    Fetch historical data from Massive API (works for forex, commodities, and indices).
+    """
+    return fetch_polygon_data(forex_ticker, multiplier, timespan, from_date, to_date, api_key, sort, limit)
+
+
+def _parse_timeframe_to_polygon(timeframe):
+    """
+    Parse timeframe string (e.g., "5min", "1h", "1d") to Polygon multiplier and timespan.
+    
+    Returns:
+        tuple: (multiplier, timespan) or (None, None) if invalid
+    """
+    timeframe_lower = timeframe.lower()
+    
+    if 'min' in timeframe_lower:
+        multiplier = int(''.join(filter(str.isdigit, timeframe)) or '1')
+        return (multiplier, "minute")
+    elif 'h' in timeframe_lower:
+        multiplier = int(''.join(filter(str.isdigit, timeframe)) or '1')
+        return (multiplier, "hour")
+    elif 'd' in timeframe_lower:
+        multiplier = int(''.join(filter(str.isdigit, timeframe)) or '1')
+        return (multiplier, "day")
+    elif 'w' in timeframe_lower or 'week' in timeframe_lower:
+        multiplier = int(''.join(filter(str.isdigit, timeframe)) or '1')
+        return (multiplier, "week")
+    elif 'mo' in timeframe_lower or 'month' in timeframe_lower:
+        multiplier = int(''.join(filter(str.isdigit, timeframe)) or '1')
+        return (multiplier, "month")
+    else:
+        return (None, None)
+
+
+def gather_historical_data(contracts_list, timeframes=None, years=5, auth_token=None):
+    """
+    Gather historical data for multiple contracts and timeframes using Massive API.
+    This function uses Massive API to fetch forex, commodity, and index data.
+    
+    Args:
+        contracts_list: List of tuples (contract_id, price) or list of contract_id strings
+                       e.g., [("CON.F.US.EU6.H26", 0.74), ...] or ["CON.F.US.EU6.H26", ...]
+        timeframes: List of timeframes to fetch (default: ["5min", "15min", "30min", "1h", "2h", "4h", "1d"])
+        years: Number of years of historical data to fetch (default: 5)
+        auth_token: Not used (kept for compatibility)
+    
+    Returns:
+        Dictionary with contract_id as key and nested dict of timeframes as values
+    
+    NOTE:
+        - Supported asset types: forex, commodities (gold, silver, platinum), and indices (S&P 500, NASDAQ, Dow, etc.)
+        - Unsupported futures contracts (e.g., agricultural, energy, bonds) are skipped
+        - Massive API key must be set in MASSIVE_API_KEY or POLYGON_API_KEY environment variable
+        - Massive API has pagination support via next_url, so large date ranges are handled automatically
+        - Data is fetched in chunks to handle large date ranges efficiently
+    """
+    # Get Massive API key from environment
+    massive_api_key = _get_massive_api_key()
+    if not massive_api_key:
+        raise ValueError("MASSIVE_API_KEY or POLYGON_API_KEY environment variable is required. Set it with: export MASSIVE_API_KEY=your_key")
+    
+    if timeframes is None:
+        timeframes = ["5min", "15min", "30min", "1h", "2h", "4h", "1d"]
+    
+    # Clear existing data folders
+    data_dir = "data"
+    if os.path.exists(data_dir):
+        print(f"🗑️  Clearing existing data in '{data_dir}'...")
+        for item in os.listdir(data_dir):
+            item_path = os.path.join(data_dir, item)
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+        print(f"🗑️  Cleared '{data_dir}'")
+    os.makedirs(data_dir, exist_ok=True)
+    
+    # Load contracts.csv to get asset names
+    contracts_df = pd.read_csv("contracts.csv")
+    contract_name_map = {}
+    for _, row in contracts_df.iterrows():
+        contract_name_map[row['id']] = row['name']
+    
+    # Extract contract IDs from tuples if needed
+    contract_ids = []
+    for item in contracts_list:
+        if isinstance(item, tuple):
+            contract_ids.append(item[0])
+        else:
+            contract_ids.append(item)
+    
+    results = {}
+    
+    for contract_id in contract_ids:
+        print(f"\n{'='*60}")
+        print(f"📊 Gathering data for {contract_id}")
+        print(f"{'='*60}")
+        
+        # Check if this contract is supported by Massive API
+        polygon_ticker, asset_type = get_polygon_ticker(contract_id)
+        if not polygon_ticker:
+            print(f"   ⚠️  Skipping {contract_id} - no Massive API mapping found")
+            print(f"   ⚠️  Supported: forex, commodities (gold/silver/platinum), and indices (S&P 500, NASDAQ, Dow, etc.)")
+            continue
+        
+        results[contract_id] = {}
+        
+        asset_type_display = {
+            "forex": "forex pair",
+            "commodity": "commodity",
+            "index": "index"
+        }.get(asset_type, "asset")
+        
+        print(f"   📈 Using Massive API: {polygon_ticker} ({asset_type_display})")
+        
+        # Get asset name from contracts.csv, fallback to contract_id if not found
+        asset_name = contract_name_map.get(contract_id, contract_id)
+        # Clean asset name for folder name (remove special characters, spaces)
+        safe_asset_name = "".join(c for c in asset_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        safe_asset_name = safe_asset_name.replace(' ', '_')
+        
+        # Create directory structure: data/asset_name/
+        contract_dir = os.path.join("data", safe_asset_name)
+        os.makedirs(contract_dir, exist_ok=True)
+        print(f"   📁 Saving to: {contract_dir}/ ({asset_name})")
+        
+        # Calculate date range
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=years * 365)
+        
+        for timeframe in timeframes:
+            print(f"\n⏱️  Fetching {timeframe} data...")
+            
+            # Parse timeframe to Polygon format
+            multiplier, timespan = _parse_timeframe_to_polygon(timeframe)
+            if multiplier is None or timespan is None:
+                print(f"   ⚠️  Invalid timeframe: {timeframe}. Skipping.")
+                continue
+            
+            # Format dates for Massive API (YYYY-MM-DD)
+            from_date_str = start_date.strftime("%Y-%m-%d")
+            to_date_str = end_date.strftime("%Y-%m-%d")
+            
+            print(f"   Date range: {from_date_str} to {to_date_str} ({years} years)")
+            print(f"   Fetching data...", end=" ", flush=True)
+            
+            # Make single request - API handles pagination automatically via next_url
+            combined_df = fetch_polygon_data(
+                polygon_ticker, 
+                multiplier, 
+                timespan, 
+                from_date_str, 
+                to_date_str,
+                massive_api_key
+            )
+            
+            if combined_df is None or combined_df.empty:
+                print(f"\n   ⚠️  No data fetched for {timeframe}")
+                continue
+            
+            # Remove duplicates (in case of any overlap from pagination)
+            combined_df = combined_df.drop_duplicates(subset=['timestamp'], keep='first')
+            combined_df = combined_df.sort_values('timestamp').reset_index(drop=True)
+            
+            print(f"   ✅ Got {len(combined_df):,} bars total from Massive API")
+            
+            # Ensure timestamp is int64
+            combined_df['timestamp'] = combined_df['timestamp'].astype('int64')
+            
+            # Ensure columns are in correct order
+            combined_df = combined_df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            
+            # Save to CSV
+            filename = f"{timeframe}.csv"
+            filepath = os.path.join(contract_dir, filename)
+            combined_df.to_csv(filepath, index=False)
+            
+            print(f"   ✅ Saved {len(combined_df):,} bars to {filepath}")
+            oldest_dt = pd.to_datetime(combined_df['timestamp'].iloc[0], unit='ms', utc=True)
+            newest_dt = pd.to_datetime(combined_df['timestamp'].iloc[-1], unit='ms', utc=True)
+            days_span = (newest_dt - oldest_dt).days
+            print(f"   📅 Date range: {oldest_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} to {newest_dt.strftime('%Y-%m-%d %H:%M:%S UTC')} ({days_span} days)")
+            
+            results[contract_id][timeframe] = combined_df
+            
+            # Delay between timeframes to avoid rate limiting
+            if timeframe != timeframes[-1]:  # Don't delay after the last timeframe
+                time.sleep(1.0)
+        
+        print(f"\n✅ Completed gathering data for {contract_id}")
+        
+        # Delay between contracts to avoid rate limiting
+        if contract_id != contract_ids[-1]:  # Don't delay after the last contract
+            time.sleep(2.0)
+    
+    return results
