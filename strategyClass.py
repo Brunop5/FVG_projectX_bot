@@ -11,8 +11,8 @@ metadata_lock = threading.Lock()
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 10              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.1           # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 3              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.06           # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
 HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
