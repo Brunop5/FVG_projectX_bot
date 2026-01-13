@@ -11,12 +11,15 @@ metadata_lock = threading.Lock()
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 10               # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.05           # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 10              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.1           # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
 HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 100                    # EMA Period for trend detection
+EMA_PERIOD = 50                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.2
+USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
+VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 
 # ATR and Risk Management
 ATR_PERIOD = 14                    # ATR Period (min 1)
@@ -32,7 +35,7 @@ HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 2                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 1                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -325,10 +328,15 @@ class Strategy:
         self.isBullishHTF = self.cur_close > htfEMA
         self.isBearishHTF = self.cur_close < htfEMA
 
-        volOK = self.cur_volume > sma(self.data["volume"], 20) * 1.2
         atrVal = get_atr(self.data, ATR_PERIOD)
         atrOK = atrVal.iloc[-1] > sma(atrVal, 20)
-        self.marketOK = volOK and atrOK
+        
+        if USE_VOLUME_CHECK:
+            volOK = self.cur_volume > sma(self.data["volume"], 20) * VOLUME_MULTIPLIER
+            self.marketOK = volOK and atrOK
+        else:
+            # Skip volume check, only use ATR
+            self.marketOK = atrOK
 
 
         self.lastBullFvg = self.data["high"].iloc[-4] < self.data["low"].iloc[-2] and not self.lastBullFvg
@@ -696,7 +704,7 @@ def validation_thread(auth_token, strategies: list[Strategy]):
 if __name__ == "__main__":
     #global_token = init_api()
     # ("CON.F.US.CLE.G26", 3), 
-    assets = [("CON.F.US.MNQ.H26", 0.74), ("CON.F.US.MES.H26", 0.74), ("CON.F.US.MGC.G26", 0.5), 
+    assets = [("CON.F.US.MGC.G26", 0.5), 
               ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5)]
 
     gather_historical_data(assets)
