@@ -98,6 +98,7 @@ CONTRACTS_DATA = {}
 CONTRACTS_BY_NAME = {}
 ROUND_TURN_FEES = {}
 RESULTS_CSV_LOCK = Lock()  # Lock for CSV writing
+SUMMARY_CSV_LOCK = Lock()  # Lock for summary CSV writing
 
 
 # ==================== INITIALIZATION FUNCTIONS ====================
@@ -301,7 +302,7 @@ class BacktestStrategy(Strategy):
     
     def __init__(self, asset_tuple, historical_data: pd.DataFrame, 
                  initial_balance: float = 10000.0, start_date=None, end_date=None,
-                 max_loss=None, asset_name=None):
+                 max_loss=None, asset_name=None, strategy_params=None):
         """
         Initialize backtest strategy.
         
@@ -314,9 +315,22 @@ class BacktestStrategy(Strategy):
             max_loss: Maximum loss threshold. If between 0 and 1, treated as percentage.
                      If >= 1, treated as absolute dollar amount. If None, no limit.
             asset_name: Asset name from contracts.csv - used to load HTF data
+            strategy_params: Dictionary of strategy parameters (captured at backtest start)
         """
         super().__init__(asset_tuple)
         self.asset_name = asset_name
+        
+        # Store strategy parameters at initialization (before they can be changed by other threads)
+        if strategy_params is None:
+            # If not provided, capture current parameters
+            strategy_params = {}
+            for param_name in OPTIMIZATION_CONFIG.keys():
+                if hasattr(strategyClass, param_name):
+                    strategy_params[param_name] = getattr(strategyClass, param_name)
+            for param_name in FIXED_PARAMS.keys():
+                if hasattr(strategyClass, param_name):
+                    strategy_params[param_name] = getattr(strategyClass, param_name)
+        self.strategy_params = strategy_params
         
         # Filter data by date range if provided
         if 'timestamp' in historical_data.columns:
@@ -1138,6 +1152,10 @@ class BacktestStrategy(Strategy):
         equity_df.to_csv(f"backtest_equity_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv", index=False)
         print(f"💾 Results saved to CSV files")
         
+        # Save summary to CSV (inputs + metrics)
+        summary_csv = self.save_summary_to_csv(results, asset_name=getattr(self, 'asset_name', None))
+        print(f"💾 Summary saved to {summary_csv}")
+        
         # Plot equity curve
         self._plot_equity_curve(equity_df)
     
@@ -1187,6 +1205,75 @@ class BacktestStrategy(Strategy):
         plot_filename = f"backtest_equity_curve_{self.asset}_{datetime.now().strftime('%Y%m%d')}.png"
         plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
         print(f"📈 Equity curve plot saved to {plot_filename}")
+    
+    def save_summary_to_csv(self, results=None, asset_name=None):
+        """Save backtest summary (inputs + metrics) to CSV file (thread-safe)"""
+        if results is None:
+            results = self._get_backtest_results()
+        
+        # Use stored strategy parameters (captured at initialization) instead of reading from strategyClass
+        # This prevents parameter state pollution in multithreaded environments
+        strategy_params = getattr(self, 'strategy_params', {})
+        
+        # Create result row with all inputs and metrics
+        result_row = {
+            # Input parameters
+            'asset_name': asset_name if asset_name is not None else getattr(self, 'asset_name', self.asset),
+            'asset_id': self.asset,
+            'timeframe': self.timeframe,
+            'initial_balance': self.initial_balance,
+            'max_loss': self.max_loss,
+            'max_loss_amount': self.max_loss_amount if hasattr(self, 'max_loss_amount') else None,
+            'max_loss_type': self.max_loss_type if hasattr(self, 'max_loss_type') else None,
+            'strategy_failed': self.strategy_failed if hasattr(self, 'strategy_failed') else False,
+            'failed_reason': self.failed_reason if hasattr(self, 'failed_reason') else None,
+            # Strategy parameters (from stored params, not current strategyClass state)
+            **strategy_params,
+            # Metrics
+            'total_pnl': results['total_pnl'],
+            'total_trades': results['total_trades'],
+            'win_rate': results['win_rate'],
+            'final_balance': results['final_balance'],
+            'max_drawdown': results['max_drawdown'],
+            'max_drawdown_pct': results['max_drawdown_pct'],
+            'total_fees': results['total_fees'],
+            'winning_trades': results['winning_trades'],
+            'losing_trades': results['losing_trades'],
+            'avg_win': results['avg_win'],
+            'avg_loss': results['avg_loss'],
+            'profit_factor': results['profit_factor'],
+            'total_return': results['total_return'],
+            'net_profit': results['net_profit'],
+            'largest_win': results['largest_win'],
+            'largest_loss': results['largest_loss'],
+            'trades_per_day': results['trades_per_day'],
+            'backtest_period_days': results['backtest_period_days'],
+            # Timestamp
+            'backtest_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # CSV filename
+        csv_filename = f"backtest_summary_{datetime.now().strftime('%Y%m%d')}.csv"
+        
+        # Thread-safe CSV writing
+        with SUMMARY_CSV_LOCK:
+            # Check if file exists
+            file_exists = os.path.exists(csv_filename)
+            
+            # Create DataFrame from single row
+            df_new = pd.DataFrame([result_row])
+            
+            if file_exists:
+                # Read existing CSV and append
+                df_existing = pd.read_csv(csv_filename)
+                # Combine
+                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                df_combined.to_csv(csv_filename, index=False)
+            else:
+                # Create new file
+                df_new.to_csv(csv_filename, index=False)
+        
+        return csv_filename
 
 
 # ==================== OPTIMIZATION FUNCTIONS ====================
@@ -1221,25 +1308,45 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
         sys.stdout = StringIO()
     
     try:
-        # Apply parameters
+        # Apply parameters to strategyClass
         _apply_strategy_params(params_dict)
+        
+        # Immediately capture a copy of all parameters (before they can be changed by other threads)
+        # This ensures we save the correct parameters that were used for this backtest
+        captured_params = {}
+        for param_name in OPTIMIZATION_CONFIG.keys():
+            if hasattr(strategyClass, param_name):
+                captured_params[param_name] = getattr(strategyClass, param_name)
+        for param_name in FIXED_PARAMS.keys():
+            if hasattr(strategyClass, param_name):
+                captured_params[param_name] = getattr(strategyClass, param_name)
         
         # Load data
         historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe)
         if historical_data is None:
             return None
         
-        # Create and run backtest
+        # Create and run backtest with captured parameters
         backtest = BacktestStrategy(
             asset_tuple=asset_tuple,
             historical_data=historical_data,
             initial_balance=initial_balance,
             max_loss=max_loss,
             asset_name=asset_name,
+            strategy_params=captured_params,  # Pass captured parameters
         )
         
         # Run with progress shown even when not verbose
         results = backtest.run_backtest(show_progress=True, progress_prefix=progress_prefix, suppress_header=not verbose)
+        
+        # Save summary to CSV after each backtest
+        if results is not None:
+            try:
+                backtest.save_summary_to_csv(results, asset_name=asset_name)
+            except Exception as e:
+                # Don't fail the backtest if CSV save fails
+                if verbose:
+                    print(f"⚠️  Warning: Failed to save summary CSV: {e}")
         
         # Clear progress line when done
         if not verbose and progress_prefix:
@@ -1550,6 +1657,16 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
     # Run final backtest with best parameters and generate full report
     print("📊 Running final backtest with optimal parameters...")
     _apply_strategy_params(best_params)
+    
+    # Capture parameters after applying them
+    captured_params = {}
+    for param_name in OPTIMIZATION_CONFIG.keys():
+        if hasattr(strategyClass, param_name):
+            captured_params[param_name] = getattr(strategyClass, param_name)
+    for param_name in FIXED_PARAMS.keys():
+        if hasattr(strategyClass, param_name):
+            captured_params[param_name] = getattr(strategyClass, param_name)
+    
     historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe)
     if historical_data is not None:
         backtest = BacktestStrategy(
@@ -1558,6 +1675,7 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
             initial_balance=initial_balance,
             max_loss=max_loss,
             asset_name=asset_name,
+            strategy_params=captured_params,
         )
         results = backtest.run_backtest()
         backtest.generate_report(results)
@@ -1580,12 +1698,22 @@ def run_backtest_example(asset_name="MGCG6", timeframe="15min",
     print(f"   Timeframe: {timeframe}")
     print(f"   Bars: {len(historical_data):,}")
     
+    # Capture current strategy parameters
+    captured_params = {}
+    for param_name in OPTIMIZATION_CONFIG.keys():
+        if hasattr(strategyClass, param_name):
+            captured_params[param_name] = getattr(strategyClass, param_name)
+    for param_name in FIXED_PARAMS.keys():
+        if hasattr(strategyClass, param_name):
+            captured_params[param_name] = getattr(strategyClass, param_name)
+    
     backtest = BacktestStrategy(
         asset_tuple=asset_tuple,
         historical_data=historical_data,
         initial_balance=initial_balance,
         max_loss=max_loss,
         asset_name=asset_name,
+        strategy_params=captured_params,
     )
     
     results = backtest.run_backtest()
