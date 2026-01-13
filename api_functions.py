@@ -722,17 +722,38 @@ def fetch_polygon_data(ticker, multiplier, timespan, from_date, to_date, api_key
         
         # Convert to DataFrame
         df_data = []
+        volume_values = []  # Track volume values for validation
         for bar in all_results:
+            vol = bar.get('v', 0)
+            volume_values.append(vol)
             df_data.append({
                 'timestamp': bar['t'],  # Already in milliseconds
                 'open': bar['o'],
                 'high': bar['h'],
                 'low': bar['l'],
                 'close': bar['c'],
-                'volume': bar.get('v', 0)  # Volume may not always be present
+                'volume': vol
             })
         
         df = pd.DataFrame(df_data)
+        
+        # Validate volume data quality
+        if volume_values:
+            import numpy as np
+            volumes = np.array(volume_values)
+            unique_volumes = np.unique(volumes)
+            max_vol = np.max(volumes)
+            min_vol = np.min(volumes)
+            mean_vol = np.mean(volumes)
+            
+            # Check for suspicious volume patterns (very low, low variety)
+            if max_vol < 100 and len(unique_volumes) < 20:
+                print(f"\n   ⚠️  WARNING: Suspicious volume data detected!")
+                print(f"      Volume range: {min_vol:.2f} - {max_vol:.2f}")
+                print(f"      Unique values: {len(unique_volumes)}")
+                print(f"      Mean volume: {mean_vol:.2f}")
+                print(f"      This may indicate synthetic/estimated volume data from the API.")
+                print(f"      For forex/commodities, volume data quality can vary, especially for older periods.")
         
         # Ensure columns are in correct order
         df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
@@ -816,17 +837,8 @@ def gather_historical_data(contracts_list, timeframes=None, years=5, auth_token=
     if timeframes is None:
         timeframes = ["5min", "15min", "30min", "1h", "2h", "4h", "1d"]
     
-    # Clear existing data folders
+    # Create data directory if it doesn't exist (don't clear existing data)
     data_dir = "data"
-    if os.path.exists(data_dir):
-        print(f"🗑️  Clearing existing data in '{data_dir}'...")
-        for item in os.listdir(data_dir):
-            item_path = os.path.join(data_dir, item)
-            if os.path.isdir(item_path):
-                shutil.rmtree(item_path)
-            else:
-                os.remove(item_path)
-        print(f"🗑️  Cleared '{data_dir}'")
     os.makedirs(data_dir, exist_ok=True)
     
     # Load contracts.csv to get asset names
@@ -924,11 +936,34 @@ def gather_historical_data(contracts_list, timeframes=None, years=5, auth_token=
             # Ensure columns are in correct order
             combined_df = combined_df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
             
-            # Save to CSV
+            # Save to CSV - merge with existing data if file exists
             filename = f"{timeframe}.csv"
             filepath = os.path.join(contract_dir, filename)
-            combined_df.to_csv(filepath, index=False)
             
+            if os.path.exists(filepath):
+                # Load existing data and merge
+                print(f"   📂 Found existing data file, merging...", end=" ", flush=True)
+                existing_df = pd.read_csv(filepath)
+                
+                # Ensure timestamp is int64 for comparison
+                if 'timestamp' in existing_df.columns:
+                    existing_df['timestamp'] = existing_df['timestamp'].astype('int64')
+                
+                # Combine new and existing data
+                merged_df = pd.concat([existing_df, combined_df], ignore_index=True)
+                
+                # Remove duplicates based on timestamp, keeping the last occurrence (newer data takes precedence)
+                merged_df = merged_df.drop_duplicates(subset=['timestamp'], keep='last')
+                
+                # Sort by timestamp
+                merged_df = merged_df.sort_values('timestamp').reset_index(drop=True)
+                
+                # Update combined_df to the merged version
+                combined_df = merged_df
+                print(f"Merged! Total bars: {len(combined_df):,}")
+            
+            # Save to CSV
+            combined_df.to_csv(filepath, index=False)
             print(f"   ✅ Saved {len(combined_df):,} bars to {filepath}")
             oldest_dt = pd.to_datetime(combined_df['timestamp'].iloc[0], unit='ms', utc=True)
             newest_dt = pd.to_datetime(combined_df['timestamp'].iloc[-1], unit='ms', utc=True)
