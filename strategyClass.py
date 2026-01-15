@@ -11,27 +11,28 @@ metadata_lock = threading.Lock()
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 3              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.06           # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 15              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.01           # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 50                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.2
+HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 25                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.25
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
+START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 14                    # ATR Period (min 1)
-SL_MULTIPLIER = 4.0                # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 2000000.0                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 18                    # ATR Period (min 1)
+SL_MULTIPLIER = 6                # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 19                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 6.0            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+TRAIL_OFFSET_MULT = 1            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
-HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
+HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
@@ -704,7 +705,7 @@ def validation_thread(auth_token, strategies: list[Strategy]):
 if __name__ == "__main__":
     #global_token = init_api()
     # ("CON.F.US.CLE.G26", 3), 
-    assets = [("CON.F.US.MGC.G26", 0.5), 
+    assets = [("CON.F.US.MGC.G26", 0.5), ("CON.F.US.GCE.G26", 3.1)
               ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5)]
 
     gather_historical_data(assets)

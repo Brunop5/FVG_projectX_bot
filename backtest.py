@@ -29,6 +29,7 @@ import threading
 from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import itertools
+import random
 
 
 # ==================== OPTIMIZATION CONFIGURATION ====================
@@ -84,13 +85,16 @@ OPTIMIZATION_CONFIG = {
 # Parameters that should NOT be optimized (keep current values)
 FIXED_PARAMS = {
     'USE_VOLUME_CHECK': True,
-    'VOLUME_DATA_START_TIMESTAMP': 1755464400000
+    'VOLUME_DATA_START_TIMESTAMP': 1755464400000,
+    'START_FROM_VOLUME_TIMESTAMP': False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Can be set to True/False to override
 }
 
 # ==================== OPTIMIZATION SETTINGS ====================
-RUN_OPTIMIZATION = True  # Set to True to run optimization, False for single backtest
-USE_EXHAUSTIVE_SEARCH = False  # If True: test ALL parameter combinations in parallel (exhaustive). If False: greedy optimization
-MAX_WORKERS = 4  # Number of parallel threads for multithreaded optimization
+RUN_OPTIMIZATION = False  # Set to True to run optimization, False for single backtest
+USE_EXHAUSTIVE_SEARCH = False  # If True: test ALL parameter combinations in parallel (exhaustive). If False: random search
+RANDOM_SEARCH_SAMPLES = 350  
+MAX_WORKERS = 4  
+USE_FIRST_TENTH_ONLY = False 
 
 # ==================== GLOBAL DATA STRUCTURES ====================
 # These are loaded once and reused across all backtests
@@ -185,13 +189,14 @@ def get_contract_id_by_name(asset_name):
     return CONTRACTS_BY_NAME.get(asset_name)
 
 
-def load_backtest_data(asset_name, timeframe):
+def load_backtest_data(asset_name, timeframe, direct_file_path=None):
     """
     Load historical data for backtesting using asset name and timeframe.
     
     Args:
         asset_name: Asset name from contracts.csv (e.g., "MESH6", "MNQH6")
         timeframe: Timeframe string (e.g., "5min", "15min", "30min", "1h")
+        direct_file_path: Optional direct path to CSV file (e.g., "GOLD.m_M15.csv")
     
     Returns:
         tuple: (historical_data DataFrame, asset_tuple, contract_id)
@@ -203,26 +208,79 @@ def load_backtest_data(asset_name, timeframe):
         print(f"   Available assets: {', '.join(sorted(CONTRACTS_BY_NAME.keys()))}")
         return None, None, None
     
-    # Clean asset name for folder name
-    safe_asset_name = "".join(c for c in asset_name if c.isalnum() or c in (' ', '-', '_')).strip()
-    safe_asset_name = safe_asset_name.replace(' ', '_')
+    # If direct file path is provided, use it
+    if direct_file_path:
+        data_path = direct_file_path
+        if not os.path.exists(data_path):
+            print(f"⚠️  Error: Data file not found: {data_path}")
+            return None, None, None
+    else:
+        # Clean asset name for folder name
+        safe_asset_name = "".join(c for c in asset_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        safe_asset_name = safe_asset_name.replace(' ', '_')
+        
+        # Load data from CSV
+        data_path = os.path.join("data", safe_asset_name, f"{timeframe}.csv")
+        if not os.path.exists(data_path):
+            print(f"⚠️  Error: Data file not found: {data_path}")
+            return None, None, None
     
-    # Load data from CSV
-    data_path = os.path.join("data", safe_asset_name, f"{timeframe}.csv")
-    if not os.path.exists(data_path):
-        print(f"⚠️  Error: Data file not found: {data_path}")
+    # Read CSV - check if it's tab-separated (MT5 format)
+    try:
+        # Try reading with tab separator first (for MT5 format like GOLD.m_M15.csv)
+        historical_data = pd.read_csv(data_path, sep='\t')
+        
+        # Check if this is MT5 format (has <DATE> and <TIME> columns)
+        if '<DATE>' in historical_data.columns and '<TIME>' in historical_data.columns:
+            # Combine DATE and TIME into timestamp
+            historical_data['timestamp'] = pd.to_datetime(
+                historical_data['<DATE>'].astype(str) + ' ' + historical_data['<TIME>'].astype(str),
+                format='%Y.%m.%d %H:%M:%S',
+                utc=True
+            )
+            
+            # Rename columns to lowercase standard names
+            column_mapping = {
+                '<OPEN>': 'open',
+                '<HIGH>': 'high',
+                '<LOW>': 'low',
+                '<CLOSE>': 'close',
+                '<TICKVOL>': 'volume',  # Use tick volume as volume
+                '<VOL>': 'vol',  # Keep original volume column as 'vol' if needed
+                '<SPREAD>': 'spread'
+            }
+            historical_data = historical_data.rename(columns=column_mapping)
+            
+            # Select only the columns we need
+            required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            historical_data = historical_data[required_columns]
+            
+            print(f"✅ Loaded MT5 format data from {data_path}")
+            print(f"   Using TICKVOL as volume column")
+        else:
+            # Not MT5 format - check if it's already in standard format
+            if 'timestamp' not in historical_data.columns:
+                # Try reading with comma separator
+                historical_data = pd.read_csv(data_path, sep=',')
+            
+            # Ensure timestamp column exists and is properly formatted
+            if 'timestamp' not in historical_data.columns and 'date' in historical_data.columns:
+                historical_data['timestamp'] = pd.to_datetime(historical_data['date'])
+            elif 'timestamp' in historical_data.columns:
+                if pd.api.types.is_numeric_dtype(historical_data['timestamp']):
+                    historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], unit='ms', utc=True)
+                else:
+                    historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
+    except Exception as e:
+        print(f"⚠️  Error reading CSV file {data_path}: {e}")
         return None, None, None
     
-    historical_data = pd.read_csv(data_path)
+    # Ensure timestamp is datetime
+    if not pd.api.types.is_datetime64_any_dtype(historical_data['timestamp']):
+        historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
     
-    # Ensure timestamp column exists and is properly formatted
-    if 'timestamp' not in historical_data.columns and 'date' in historical_data.columns:
-        historical_data['timestamp'] = pd.to_datetime(historical_data['date'])
-    elif 'timestamp' in historical_data.columns:
-        if pd.api.types.is_numeric_dtype(historical_data['timestamp']):
-            historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], unit='ms', utc=True)
-        else:
-            historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
+    # Sort by timestamp
+    historical_data = historical_data.sort_values('timestamp').reset_index(drop=True)
     
     asset_tuple = (contract_id, timeframe, "backtest_account")
     return historical_data, asset_tuple, contract_id
@@ -332,6 +390,13 @@ class BacktestStrategy(Strategy):
                     strategy_params[param_name] = getattr(strategyClass, param_name)
         self.strategy_params = strategy_params
         
+        # Helper method to get parameter value (from stored params or strategyClass as fallback)
+        def get_param(param_name, default=None):
+            if self.strategy_params and param_name in self.strategy_params:
+                return self.strategy_params[param_name]
+            return getattr(strategyClass, param_name, default)
+        self.get_param = get_param
+        
         # Filter data by date range if provided
         if 'timestamp' in historical_data.columns:
             if pd.api.types.is_numeric_dtype(historical_data['timestamp']):
@@ -344,22 +409,64 @@ class BacktestStrategy(Strategy):
             if end_date:
                 historical_data = historical_data[historical_data['timestamp'] <= pd.to_datetime(end_date)]
             
-            # Filter by volume data start timestamp if volume check is enabled
-            if strategyClass.USE_VOLUME_CHECK:
-                volume_start_datetime = pd.to_datetime(strategyClass.VOLUME_DATA_START_TIMESTAMP, unit='ms', utc=True)
-                before_count = len(historical_data)
-                historical_data = historical_data[historical_data['timestamp'] >= volume_start_datetime]
-                after_count = len(historical_data)
-                if before_count > after_count:
-                    print(f"📊 Filtered data: Removed {before_count - after_count:,} bars before {volume_start_datetime.strftime('%Y-%m-%d %H:%M:%S')} (unreliable volume data)")
-                    print(f"   Remaining bars: {after_count:,}")
+            # Find start index for volume data timestamp
+            # Determine if we should start from timestamp:
+            # - If START_FROM_VOLUME_TIMESTAMP is explicitly set (True/False), use that
+            # - If START_FROM_VOLUME_TIMESTAMP is None, auto: use USE_VOLUME_CHECK value (True = start from timestamp, False = start from beginning)
+            start_from_timestamp_param = self.get_param('START_FROM_VOLUME_TIMESTAMP')
+            if start_from_timestamp_param is None:
+                # Auto: use USE_VOLUME_CHECK value
+                start_from_timestamp = self.get_param('USE_VOLUME_CHECK', False)
+            else:
+                # Use explicit value (could be True or False)
+                start_from_timestamp = bool(start_from_timestamp_param)
+            
+            self.volume_start_index = 0
+            if start_from_timestamp:
+                volume_start_datetime = pd.to_datetime(self.get_param('VOLUME_DATA_START_TIMESTAMP', 1755464400000), unit='ms', utc=True)
+                # Find the first index where timestamp >= volume_start_datetime
+                mask = historical_data['timestamp'] >= volume_start_datetime
+                if mask.any():
+                    self.volume_start_index = historical_data[mask].index[0]
+                    before_count = self.volume_start_index
+                    after_count = len(historical_data) - self.volume_start_index
+                    if before_count > 0:
+                        reason = "volume check enabled" if self.get_param('USE_VOLUME_CHECK', False) else "explicitly requested"
+                        print(f"📊 Volume data starts at: {volume_start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+                        print(f"   Will start backtest from bar {self.volume_start_index} ({before_count:,} bars before, {after_count:,} bars after) - {reason}")
+                else:
+                    # If no data after timestamp, start from beginning but warn
+                    print(f"⚠️  Warning: No data found after volume start timestamp {volume_start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"   Starting from beginning of dataset")
+            else:
+                self.volume_start_index = 0
         
         self.historical_data = historical_data.sort_values('timestamp').reset_index(drop=True)
+        
+        # Limit to first 10% of data if USE_FIRST_TENTH_ONLY is enabled
+        if USE_FIRST_TENTH_ONLY:
+            original_length = len(self.historical_data)
+            tenth_length = max(1, original_length // 10)  # At least 1 bar
+            self.historical_data = self.historical_data.iloc[:tenth_length].reset_index(drop=True)
+            print(f"📊 Limited data to first 10%: {len(self.historical_data):,} bars (from {original_length:,} total)")
+        
         self.initial_balance = initial_balance
         self.current_balance = initial_balance
         self.current_bar_index = 0
         self.trades = []
         self.equity_curve = []
+        
+        # Check if volume column exists and has valid data
+        self.has_volume_data = 'volume' in self.historical_data.columns
+        if self.has_volume_data:
+            # Check if volume column has any non-null, non-zero values
+            volume_valid = self.historical_data['volume'].notna().any()
+            if volume_valid:
+                # Check if there are meaningful volume values (not all zeros or very low)
+                volume_mean = self.historical_data['volume'].mean()
+                self.has_volume_data = volume_mean > 0 and not pd.isna(volume_mean)
+            else:
+                self.has_volume_data = False
         
         # Get contract information
         asset_id = asset_tuple[0]
@@ -401,17 +508,38 @@ class BacktestStrategy(Strategy):
         self.active_order = None
         
         min_bars_needed = max(100, 50)
-        if len(self.historical_data) < min_bars_needed:
-            raise ValueError(f"Not enough historical data. Need at least {min_bars_needed} bars, got {len(self.historical_data)}")
         
-        self.data = self.historical_data.iloc[:min_bars_needed].copy()
-        self.current_bar_index = min_bars_needed
+        # Start from volume_start_index if USE_VOLUME_CHECK is enabled
+        start_index = max(0, self.volume_start_index) if hasattr(self, 'volume_start_index') else 0
+        
+        # Ensure we have enough bars after the start index
+        available_bars = len(self.historical_data) - start_index
+        if available_bars < min_bars_needed:
+            if start_index > 0:
+                print(f"⚠️  Warning: Only {available_bars} bars available after volume start timestamp (need {min_bars_needed})")
+                print(f"   Starting from beginning of dataset instead")
+                start_index = 0
+            else:
+                raise ValueError(f"Not enough historical data. Need at least {min_bars_needed} bars, got {len(self.historical_data)}")
+        
+        # Initialize data starting from start_index
+        end_index = start_index + min_bars_needed
+        self.data = self.historical_data.iloc[start_index:end_index].copy()
+        self.current_bar_index = end_index
         
         print(f"📊 Backtest initialized with {len(self.data)} initial bars")
         print(f"📅 Date range: {self.data['timestamp'].iloc[0]} to {self.historical_data['timestamp'].iloc[-1]}")
+        if start_index > 0:
+            print(f"   Started from bar {start_index} (after volume data start timestamp)")
+        else:
+            print(f"   Started from beginning of dataset (bar 0)")
         
         self.cur_close = self.data["close"].iloc[-1]
-        self.cur_volume = self.data["volume"].iloc[-1]
+        # Handle missing volume column gracefully
+        if 'volume' in self.data.columns:
+            self.cur_volume = self.data["volume"].iloc[-1] if pd.notna(self.data["volume"].iloc[-1]) else 0
+        else:
+            self.cur_volume = 0
         
         # Initialize indicators (same as live)
         self.isBullishHTF = None
@@ -449,7 +577,7 @@ class BacktestStrategy(Strategy):
         if not self.asset_name:
             return
         
-        htf_minutes = int(strategyClass.HTF_TF)
+        htf_minutes = int(self.get_param('HTF_TF', '240'))
         
         # Map HTF minutes to timeframe string for CSV file
         if htf_minutes == 240:
@@ -487,6 +615,25 @@ class BacktestStrategy(Strategy):
         self.htf_data = self.htf_data.sort_values('timestamp').reset_index(drop=True)
         self.htf_data_timestamps = self.htf_data['timestamp'].values
     
+    def calculate_indicators(self):
+        """Override to use self.get_param for MIN_FVG_POWER_PCT"""
+        self.update_trend_indicators()
+
+        gapClose = self.data["close"].iloc[-3]
+        min_power_pct = self.get_param('MIN_FVG_POWER_PCT', 0.08)
+
+        self.bullishPowerOK = (
+            self.lastBullFvg
+            and (self.data["low"].iloc[-2] - self.data["high"].iloc[-4]) / gapClose * 100 >= min_power_pct
+        )
+
+        self.bearishPowerOK = (
+            self.lastBearFvg
+            and (self.data["low"].iloc[-4] - self.data["high"].iloc[-2]) / gapClose * 100 >= min_power_pct
+        )
+
+        self.calc_BOS_and_CHOCH()
+    
     def add_fvg_zones(self):
         """Override to remove print statements for performance"""
         if self.bullishPowerOK and self.isBullishHTF and self.marketOK:
@@ -509,8 +656,8 @@ class BacktestStrategy(Strategy):
                 }
             )
 
-        if len(self.fvg_zones) > strategyClass.FVG_HISTORY_NBR:
-            self.fvg_zones = self.fvg_zones[-strategyClass.FVG_HISTORY_NBR:]
+        if len(self.fvg_zones) > self.get_param('FVG_HISTORY_NBR', 3):
+            self.fvg_zones = self.fvg_zones[-self.get_param('FVG_HISTORY_NBR', 3):]
     
     def gather_data(self):
         """Override to return initial data window"""
@@ -528,7 +675,11 @@ class BacktestStrategy(Strategy):
         self.current_bar_index += 1
         
         self.cur_close = self.data["close"].iloc[-1]
-        self.cur_volume = self.data["volume"].iloc[-1]
+        # Handle missing volume column gracefully
+        if 'volume' in self.data.columns:
+            self.cur_volume = self.data["volume"].iloc[-1] if pd.notna(self.data["volume"].iloc[-1]) else 0
+        else:
+            self.cur_volume = 0
         
         return self.data.iloc[-1:]
     
@@ -541,12 +692,12 @@ class BacktestStrategy(Strategy):
         current_timestamp = self.data['timestamp'].iloc[-1]
         idx = self.htf_data['timestamp'].searchsorted(current_timestamp, side='right')
         
-        if idx < strategyClass.EMA_PERIOD:
+        if idx < self.get_param('EMA_PERIOD', 50):
             self.isBullishHTF = None
             self.isBearishHTF = None
         else:
             htf_close = self.htf_data['close'].iloc[:idx]
-            htfEMA = ema(htf_close, strategyClass.EMA_PERIOD)
+            htfEMA = ema(htf_close, self.get_param('EMA_PERIOD', 50))
             
             if htfEMA is not None:
                 self.isBullishHTF = self.cur_close > htfEMA
@@ -556,15 +707,17 @@ class BacktestStrategy(Strategy):
                 self.isBearishHTF = None
         
         # Calculate marketOK, lastBullFvg, and lastBearFvg (same as live strategy)
-        vol_sma = sma(self.data["volume"], 20)
-        volOK = self.cur_volume > vol_sma * strategyClass.VOLUME_MULTIPLIER if vol_sma is not None else False
-        atrVal = get_atr(self.data, strategyClass.ATR_PERIOD)
+        atrVal = get_atr(self.data, self.get_param('ATR_PERIOD', 14))
         atr_sma = sma(atrVal, 20) if len(atrVal) > 0 else None
         atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
         
-        if strategyClass.USE_VOLUME_CHECK:
+        # Volume check: only if USE_VOLUME_CHECK is True AND volume data is available
+        if self.get_param('USE_VOLUME_CHECK', False) and self.has_volume_data and 'volume' in self.data.columns:
+            vol_sma = sma(self.data["volume"], 20)
+            volOK = self.cur_volume > vol_sma * self.get_param('VOLUME_MULTIPLIER', 1.2) if vol_sma is not None else False
             self.marketOK = volOK and atrOK
         else:
+            # Skip volume check if volume data is not available or USE_VOLUME_CHECK is False
             self.marketOK = atrOK
         
         # Update FVG detection flags
@@ -582,11 +735,11 @@ class BacktestStrategy(Strategy):
         
         htf_data = htf_data.set_index('timestamp')
         
-        htf_minutes = int(strategyClass.HTF_TF)
+        htf_minutes = int(self.get_param('HTF_TF', '240'))
         current_tf_minutes = self._get_timeframe_minutes(self.timeframe)
         bars_per_htf = htf_minutes // current_tf_minutes
         
-        if len(htf_data) < strategyClass.EMA_PERIOD * bars_per_htf:
+        if len(htf_data) < self.get_param('EMA_PERIOD', 50) * bars_per_htf:
             self.isBullishHTF = None
             self.isBearishHTF = None
         else:
@@ -601,17 +754,21 @@ class BacktestStrategy(Strategy):
             else:
                 resample_period = f'{bars_per_htf * current_tf_minutes}min'
             
-            htf_resampled = htf_data.resample(resample_period, label='right', closed='right').agg({
+            # Build aggregation dict conditionally based on available columns
+            agg_dict = {
                 'open': 'first',
                 'high': 'max',
                 'low': 'min',
-                'close': 'last',
-                'volume': 'sum'
-            }).dropna()
+                'close': 'last'
+            }
+            if 'volume' in htf_data.columns:
+                agg_dict['volume'] = 'sum'
             
-            if len(htf_resampled) >= strategyClass.EMA_PERIOD:
+            htf_resampled = htf_data.resample(resample_period, label='right', closed='right').agg(agg_dict).dropna()
+            
+            if len(htf_resampled) >= self.get_param('EMA_PERIOD', 50):
                 htf_close = htf_resampled['close']
-                htfEMA = ema(htf_close, strategyClass.EMA_PERIOD)
+                htfEMA = ema(htf_close, self.get_param('EMA_PERIOD', 50))
                 
                 if htfEMA is not None:
                     self.isBullishHTF = self.cur_close > htfEMA
@@ -624,15 +781,17 @@ class BacktestStrategy(Strategy):
                 self.isBearishHTF = None
         
         # Calculate marketOK
-        atrVal = get_atr(self.data, strategyClass.ATR_PERIOD)
+        atrVal = get_atr(self.data, self.get_param('ATR_PERIOD', 14))
         atr_sma = sma(atrVal, 20) if len(atrVal) > 0 else None
         atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
         
-        if strategyClass.USE_VOLUME_CHECK:
+        # Volume check: only if USE_VOLUME_CHECK is True AND volume data is available
+        if self.get_param('USE_VOLUME_CHECK', False) and self.has_volume_data and 'volume' in self.data.columns:
             vol_sma = sma(self.data["volume"], 20)
-            volOK = self.cur_volume > vol_sma * strategyClass.VOLUME_MULTIPLIER if vol_sma is not None else False
+            volOK = self.cur_volume > vol_sma * self.get_param('VOLUME_MULTIPLIER', 1.2) if vol_sma is not None else False
             self.marketOK = volOK and atrOK
         else:
+            # Skip volume check if volume data is not available or USE_VOLUME_CHECK is False
             self.marketOK = atrOK
         
         # Update FVG detection flags
@@ -660,7 +819,7 @@ class BacktestStrategy(Strategy):
             self.daily_trades_count = 0
             self.last_trade_date = str(current_date)
         
-        return self.daily_trades_count < strategyClass.MAX_DAILY_TRADES
+        return self.daily_trades_count < self.get_param('MAX_DAILY_TRADES', 3)
     
     def entry_logic(self):
         """Override to use BacktestOrder instead of Order"""
@@ -673,9 +832,9 @@ class BacktestStrategy(Strategy):
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
         
-        atr = get_atr(self.data, strategyClass.ATR_PERIOD).iloc[-1]
+        atr = get_atr(self.data, self.get_param('ATR_PERIOD', 14)).iloc[-1]
         
-        for zone in self.fvg_zones[-strategyClass.FVG_HISTORY_NBR:]:
+        for zone in self.fvg_zones[-self.get_param('FVG_HISTORY_NBR', 3):]:
             if zone["mitigated"]:
                 continue
             
@@ -685,10 +844,10 @@ class BacktestStrategy(Strategy):
             
             if (zone["direction"] == "bull" and touchesFVG and 
                 self.isBullishHTF and self.marketOK):
-                trailStop = self.cur_close - atr * strategyClass.SL_MULTIPLIER
-                tp = self.cur_close + atr * strategyClass.TP_MULTIPLIER
+                trailStop = self.cur_close - atr * self.get_param('SL_MULTIPLIER', 4.0)
+                tp = self.cur_close + atr * self.get_param('TP_MULTIPLIER', 2000000.0)
                 entryAtr = atr
-                lot_size = self.calculate_lot_size(atr, strategyClass.SL_MULTIPLIER)
+                lot_size = self.calculate_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0))
                 
                 current_time = self.data.iloc[-1].get('timestamp', datetime.now())
                 self.active_order = BacktestOrder("BUY", self.cur_close, tp, trailStop, 
@@ -709,10 +868,10 @@ class BacktestStrategy(Strategy):
             
             elif (zone["direction"] == "bear" and touchesFVG and 
                   self.isBearishHTF and self.marketOK):
-                trailStop = self.cur_close + atr * strategyClass.SL_MULTIPLIER
-                tp = self.cur_close - atr * strategyClass.TP_MULTIPLIER
+                trailStop = self.cur_close + atr * self.get_param('SL_MULTIPLIER', 4.0)
+                tp = self.cur_close - atr * self.get_param('TP_MULTIPLIER', 2000000.0)
                 entryAtr = atr
-                lot_size = self.calculate_lot_size(atr, strategyClass.SL_MULTIPLIER)
+                lot_size = self.calculate_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0))
                 
                 current_time = self.data.iloc[-1].get('timestamp', datetime.now())
                 self.active_order = BacktestOrder("SELL", self.cur_close, tp, trailStop, 
@@ -846,8 +1005,8 @@ class BacktestStrategy(Strategy):
         current_low = self.data["low"].iloc[-1]
         
         if self.inPosition and self.lastPositionWasLong:
-            if strategyClass.USE_TRAILING and pos.entry_atr is not None:
-                potentialStop = current_high - pos.entry_atr * strategyClass.TRAIL_OFFSET_MULT
+            if self.get_param('USE_TRAILING', True) and pos.entry_atr is not None:
+                potentialStop = current_high - pos.entry_atr * self.get_param('TRAIL_OFFSET_MULT', 6.0)
                 if pos.trailing_stop_loss is not None:
                     new_stop = max(pos.trailing_stop_loss, potentialStop)
                     if new_stop > pos.trailing_stop_loss:
@@ -856,8 +1015,8 @@ class BacktestStrategy(Strategy):
                     pos.trailing_stop_loss = potentialStop
         
         if self.inPosition and self.lastPositionWasShort:
-            if strategyClass.USE_TRAILING and pos.entry_atr is not None:
-                potentialStop = current_low + pos.entry_atr * strategyClass.TRAIL_OFFSET_MULT
+            if self.get_param('USE_TRAILING', True) and pos.entry_atr is not None:
+                potentialStop = current_low + pos.entry_atr * self.get_param('TRAIL_OFFSET_MULT', 6.0)
                 if pos.trailing_stop_loss is not None:
                     new_stop = min(pos.trailing_stop_loss, potentialStop)
                     if new_stop < pos.trailing_stop_loss:
@@ -866,7 +1025,7 @@ class BacktestStrategy(Strategy):
                     pos.trailing_stop_loss = potentialStop
         
         # Check BOS/CHoCH exits (same as live strategy)
-        if strategyClass.HOLD_UNTIL_OPPOSITE and self.inPosition:
+        if self.get_param('HOLD_UNTIL_OPPOSITE', True) and self.inPosition:
             if self.lastPositionWasLong and self.isCHOCH:
                 current_bar = self.data.iloc[-1]
                 pos.exit_price = current_bar['close']
@@ -908,7 +1067,7 @@ class BacktestStrategy(Strategy):
             'equity': self.current_balance + unrealized_pnl
         })
     
-    def run_backtest(self, show_progress=True, progress_prefix="", suppress_header=False):
+    def run_backtest(self, show_progress=True, progress_prefix="", progress_line=None, suppress_header=False):
         """Run the backtest on historical data"""
         if not suppress_header:
             print(f"\n{'='*60}")
@@ -927,7 +1086,7 @@ class BacktestStrategy(Strategy):
         self.init_rest()
         
         total_bars = len(self.historical_data)
-        progress_interval = max(1, total_bars // 20)
+        progress_interval = max(1, total_bars // 100)  # Update more frequently for smoother progress
         
         while self.current_bar_index < len(self.historical_data) and not self.strategy_failed:
             self.fetch_new_data()
@@ -936,10 +1095,18 @@ class BacktestStrategy(Strategy):
             self.entry_logic()
             self.update_stops()
             
-            if show_progress and self.current_bar_index % progress_interval == 0:
+            if show_progress:
                 progress = (self.current_bar_index / total_bars) * 100
                 progress_msg = f"{progress_prefix}Progress: {progress:.1f}% ({self.current_bar_index}/{total_bars} bars)"
-                print(progress_msg, end='\r', file=sys.stderr)
+                
+                # Use ANSI escape codes to position on specific line if provided
+                if progress_line is not None:
+                    # Move cursor to specific line and column 0, then print progress
+                    # \033[n;0H moves to line n, column 0
+                    print(f"\033[{progress_line + 1};0H{progress_msg}\033[K", end='', file=sys.stderr)
+                else:
+                    # Default behavior: overwrite same line
+                    print(progress_msg, end='\r', file=sys.stderr)
                 sys.stderr.flush()
             
             # Check max loss after each bar (in case of open position drawdown)
@@ -963,12 +1130,14 @@ class BacktestStrategy(Strategy):
                 current_equity = self.current_balance + unrealized_pnl
                 total_loss = self.initial_balance - current_equity
                 if self.max_loss_amount is not None and total_loss >= self.max_loss_amount:
+                    self.strategy_failed = True
                     self.active_order.exit_price = current_price
                     self.active_order.exit_time = current_bar.get('timestamp', datetime.now())
                     self.active_order.exit_reason = "Max Loss Reached"
                     self.active_order.close_order()
                     self._record_trade(self.active_order)
                     self._close_position()
+                    break
         
         # Close any open position at end
         if self.active_order and self.active_order.filled and not self.strategy_failed:
@@ -979,6 +1148,15 @@ class BacktestStrategy(Strategy):
             self.active_order.close_order()
             self._record_trade(self.active_order)
             self._close_position()
+        
+        # Show 100% when done and keep it there
+        if show_progress:
+            progress_msg = f"{progress_prefix}Progress: 100.0% ({total_bars}/{total_bars} bars)"
+            if progress_line is not None:
+                print(f"\033[{progress_line + 1};0H{progress_msg}\033[K", end='', file=sys.stderr)
+            else:
+                print(progress_msg, end='\r', file=sys.stderr)
+            sys.stderr.flush()
         
         return self._get_backtest_results()
     
@@ -1253,7 +1431,7 @@ class BacktestStrategy(Strategy):
         }
         
         # CSV filename
-        csv_filename = f"backtest_summary_{datetime.now().strftime('%Y%m%d')}.csv"
+        csv_filename = f"backtest_summary.csv"
         
         # Thread-safe CSV writing
         with SUMMARY_CSV_LOCK:
@@ -1300,7 +1478,7 @@ def _get_current_strategy_params():
     return current_params
 
 
-def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, params_dict, verbose=False, progress_prefix=""):
+def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, params_dict, verbose=False, progress_prefix="", progress_line=None, direct_file_path=None):
     """Run a single backtest with given parameters and return results"""
     # Suppress output if not verbose (but allow progress through stderr)
     if not verbose:
@@ -1322,7 +1500,7 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
                 captured_params[param_name] = getattr(strategyClass, param_name)
         
         # Load data
-        historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe)
+        historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe, direct_file_path=direct_file_path)
         if historical_data is None:
             return None
         
@@ -1337,7 +1515,7 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
         )
         
         # Run with progress shown even when not verbose
-        results = backtest.run_backtest(show_progress=True, progress_prefix=progress_prefix, suppress_header=not verbose)
+        results = backtest.run_backtest(show_progress=True, progress_prefix=progress_prefix, progress_line=progress_line, suppress_header=not verbose)
         
         # Save summary to CSV after each backtest
         if results is not None:
@@ -1407,7 +1585,31 @@ def _generate_all_combinations():
     return combinations
 
 
-def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000.0, max_loss=2000, max_workers=4):
+def _generate_random_combinations(num_samples):
+    """Generate random parameter combinations to test"""
+    # Get all parameter ranges
+    param_ranges = {}
+    for param_name, config in OPTIMIZATION_CONFIG.items():
+        param_ranges[param_name] = config['range']
+    
+    param_names = list(param_ranges.keys())
+    combinations = []
+    
+    # Generate random combinations
+    for _ in range(num_samples):
+        params_dict = {}
+        for param_name in param_names:
+            # Randomly select a value from the parameter's range
+            params_dict[param_name] = random.choice(param_ranges[param_name])
+        
+        # Add fixed params
+        params_dict.update(FIXED_PARAMS)
+        combinations.append(params_dict)
+    
+    return combinations
+
+
+def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000.0, max_loss=2000, max_workers=4, direct_file_path=None):
     """
     Multithreaded optimization: test all parameter combinations in parallel.
     Saves results to CSV after each combination completes.
@@ -1439,7 +1641,7 @@ def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000
         # Create progress prefix showing which combination
         progress_prefix = f"   [Combo {combo_index + 1}/{total_combinations}] "
         # Run backtest
-        results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix)
+        results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, direct_file_path=direct_file_path)
         
         if results is None:
             return None
@@ -1521,7 +1723,134 @@ def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000
     return best_result, csv_filename
 
 
-def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2000, max_workers=4):
+def optimize_strategy_random(asset_name, timeframe, initial_balance=50000.0, max_loss=2000, max_workers=4, num_samples=100, direct_file_path=None):
+    """
+    Random search optimization: test random parameter combinations in parallel.
+    Saves results to CSV after each combination completes.
+    """
+    print(f"\n{'='*60}")
+    print(f"🔍 Starting Random Search Optimization")
+    print(f"{'='*60}")
+    print(f"Asset: {asset_name} | Timeframe: {timeframe}")
+    print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
+    print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
+    
+    # Generate random combinations
+    print("📊 Generating random parameter combinations...")
+    combinations = _generate_random_combinations(num_samples)
+    total_combinations = len(combinations)
+    print(f"   Generated {total_combinations} random combinations to test\n")
+    
+    # CSV filename
+    csv_filename = f"optimization_results_{asset_name}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    
+    # Progress tracking
+    completed_count = 0
+    progress_lock = Lock()
+    # Track which line each worker is using for progress display
+    worker_lines = {}  # {combo_index: line_number}
+    next_line = 0
+    
+    def run_and_save(combo, combo_index):
+        """Run backtest and save result"""
+        nonlocal completed_count, next_line
+        
+        # Assign a unique line number for this backtest's progress
+        with progress_lock:
+            if combo_index not in worker_lines:
+                worker_lines[combo_index] = next_line
+                next_line += 1
+            line_number = worker_lines[combo_index]
+        
+        # Create progress prefix with line positioning
+        progress_prefix = f"   [Sample {combo_index + 1}/{total_combinations}] "
+        # Run backtest with line number for progress display
+        results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, progress_line=line_number, direct_file_path=direct_file_path)
+        
+        if results is None:
+            return None
+        
+        # Create result row with all parameters and results
+        result_row = combo.copy()
+        result_row.update({
+            'total_pnl': results['total_pnl'],
+            'total_trades': results['total_trades'],
+            'win_rate': results['win_rate'],
+            'final_balance': results['final_balance'],
+            'max_drawdown': results['max_drawdown'],
+            'max_drawdown_pct': results['max_drawdown_pct'],
+            'total_fees': results['total_fees'],
+            'winning_trades': results['winning_trades'],
+            'losing_trades': results['losing_trades'],
+            'avg_win': results['avg_win'],
+            'avg_loss': results['avg_loss'],
+            'profit_factor': results['profit_factor'],
+            'total_return': results['total_return'],
+            'net_profit': results['net_profit'],
+            'largest_win': results['largest_win'],
+            'largest_loss': results['largest_loss'],
+            'trades_per_day': results['trades_per_day'],
+            'backtest_period_days': results['backtest_period_days']
+        })
+        
+        # Save to CSV
+        _save_result_to_csv(result_row, csv_filename)
+        
+        # Update progress
+        with progress_lock:
+            completed_count += 1
+            progress_pct = (completed_count / total_combinations) * 100
+            print(f"   [{completed_count}/{total_combinations}] ({progress_pct:.1f}%) Completed | P&L: ${results['total_pnl']:,.2f} | Trades: {results['total_trades']}")
+        
+        return result_row
+    
+    # Run with thread pool
+    print("🚀 Starting multithreaded backtests...\n")
+    best_result = None
+    best_pnl = float('-inf')
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_combo = {
+            executor.submit(run_and_save, combo, idx): (combo, idx)
+            for idx, combo in enumerate(combinations)
+        }
+        
+        # Process completed tasks
+        for future in as_completed(future_to_combo):
+            combo, idx = future_to_combo[future]
+            try:
+                result = future.result()
+                if result is not None and result['total_pnl'] > best_pnl:
+                    best_pnl = result['total_pnl']
+                    best_result = result
+            except Exception as e:
+                print(f"   ⚠️  Error processing combination {idx + 1}: {e}")
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"✅ Random Search Optimization Complete")
+    print(f"{'='*60}")
+    if best_result:
+        print(f"🏆 Best Result:")
+        print(f"   Total P&L: ${best_result['total_pnl']:,.2f}")
+        print(f"   Total Trades: {best_result['total_trades']}")
+        print(f"   Win Rate: {best_result['win_rate']:.2f}%")
+        print(f"   Final Balance: ${best_result['final_balance']:,.2f}")
+        print(f"   Max Drawdown: ${best_result['max_drawdown']:,.2f} ({best_result['max_drawdown_pct']:.2f}%)")
+        print(f"\n   Best Parameters:")
+        for param_name in OPTIMIZATION_CONFIG.keys():
+            if param_name in best_result:
+                print(f"      {param_name}: {best_result[param_name]}")
+        print(f"\n   Results saved to: {csv_filename}")
+    else:
+        print("   ⚠️  No valid results found")
+    print(f"{'='*60}\n")
+    
+    return best_result, csv_filename
+
+
+def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2000, max_workers=4, direct_file_path=None):
     """
     Greedy optimization: optimize one parameter at a time using multithreading.
     For each parameter, tests all values in parallel, then moves to next parameter.
@@ -1556,7 +1885,7 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
     
     # Start with current configuration
     print("📊 Testing current configuration...")
-    current_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, best_params, verbose=True)
+    current_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, best_params, verbose=True, direct_file_path=direct_file_path)
     if current_results is not None:
         best_pnl = current_results['total_pnl']
         print(f"   Current P&L: ${best_pnl:,.2f}\n")
@@ -1601,7 +1930,7 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
             
             # Run backtest with progress prefix
             progress_prefix = f"   [{param_name}={test_value}] "
-            test_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, test_params, verbose=False, progress_prefix=progress_prefix)
+            test_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, test_params, verbose=False, progress_prefix=progress_prefix, direct_file_path=direct_file_path)
             
             # Store result
             results_dict[test_value] = test_results
@@ -1667,7 +1996,7 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
         if hasattr(strategyClass, param_name):
             captured_params[param_name] = getattr(strategyClass, param_name)
     
-    historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe)
+    historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe, direct_file_path=direct_file_path)
     if historical_data is not None:
         backtest = BacktestStrategy(
             asset_tuple=asset_tuple,
@@ -1686,9 +2015,9 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
 # ==================== MAIN EXECUTION ====================
 
 def run_backtest_example(asset_name="MGCG6", timeframe="15min", 
-                         initial_balance=50000.0, max_loss=2000):
+                         initial_balance=50000.0, max_loss=2000, direct_file_path=None):
     """Example of how to run a backtest"""
-    historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe)
+    historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe, direct_file_path=direct_file_path)
     
     if historical_data is None:
         print("❌ Failed to load data. Check asset name and timeframe.")
@@ -1724,16 +2053,18 @@ if __name__ == "__main__":
     # Initialize data structures once
     initialize_backtest_data()
     
-    asset_name = "MGCG6"
+    # Configuration for backtest
+    asset_name = "MGCG6"  # Gold contract from contracts.csv
     timeframe = "15min"
+    direct_file_path = "GOLD.m_M15.csv"  # Direct path to MT5 format CSV file
     initial_balance = 50000.0
     max_loss = 2000
     # =================================================
     
     if RUN_OPTIMIZATION:
         if USE_EXHAUSTIVE_SEARCH:
-            optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS)
+            optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS, direct_file_path=direct_file_path)
         else:
-            optimize_strategy(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS)
+            optimize_strategy_random(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS, RANDOM_SEARCH_SAMPLES, direct_file_path=direct_file_path)
     else:
-        run_backtest_example(asset_name, timeframe, initial_balance, max_loss)
+        run_backtest_example(asset_name, timeframe, initial_balance, max_loss, direct_file_path=direct_file_path)
