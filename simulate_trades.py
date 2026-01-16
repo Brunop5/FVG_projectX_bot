@@ -13,7 +13,7 @@ INITIAL_CAPITAL = 10000  # Starting capital in dollars
 TRADE_SIZE = 10000  # Dollar value of each trade order
 LEVERAGE = 20  # Leverage multiplier (1 = no leverage)
 SPREAD = 0.2 # Spread in price units (always exact)
-FEE_PERCENT = 0.018  # Fee percentage (0.02% = 0.0002 as decimal)
+FEE_PERCENT = 0.02  # Fee percentage (0.02% = 0.0002 as decimal)
 # =========================
 
 capital = INITIAL_CAPITAL
