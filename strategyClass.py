@@ -706,7 +706,7 @@ if __name__ == "__main__":
     #global_token = init_api()
     # ("CON.F.US.CLE.G26", 3), 
     assets = [("CON.F.US.MGC.G26", 0.5), ("CON.F.US.GCE.G26", 3.1)
-              ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5)]
+              ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5), ("CON.F.US.MNQ.H26", 0.74)]
 
     gather_historical_data(assets)
     
