@@ -4,9 +4,11 @@ Simple trade simulator that reads trades from CSV and simulates execution.
 """
 
 import csv
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 # ===== CONFIGURATION =====
-CSV_FILE = "backtest_trades.csv"
+CSV_FILE = "gold_results/3/backtest_trades_CON.F.US.MGC.G26_20260116.csv"
 INITIAL_CAPITAL = 10000  # Starting capital in dollars
 TRADE_SIZE = 10000  # Dollar value of each trade order
 LEVERAGE = 20  # Leverage multiplier (1 = no leverage)
@@ -20,6 +22,7 @@ winning_trades = 0
 losing_trades = 0
 total_pnl = 0.0
 total_fees_paid = 0.0
+equity_curve = []  # List to store equity curve data
 
 # Read and process trades
 with open(CSV_FILE, 'r') as f:
@@ -67,6 +70,13 @@ with open(CSV_FILE, 'r') as f:
             winning_trades += 1
         elif trade_pnl < 0:
             losing_trades += 1
+        
+        # Record equity curve point
+        equity_curve.append({
+            'trade_number': trades_executed,
+            'balance': capital,
+            'cumulative_pnl': total_pnl
+        })
 
 # Print results
 print("=" * 60)
@@ -88,4 +98,22 @@ if trades_executed > 0:
     print(f"Win Rate:            {(winning_trades / trades_executed) * 100:.2f}%")
 print(f"Total Fees Paid:     ${total_fees_paid:,.2f}")
 print("=" * 60)
+
+
+# Create and display equity curve graph
+if equity_curve:
+    trade_numbers = [point['trade_number'] for point in equity_curve]
+    balances = [point['balance'] for point in equity_curve]
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(trade_numbers, balances, linewidth=2, color='#2E86AB')
+    plt.axhline(y=INITIAL_CAPITAL, color='gray', linestyle='--', linewidth=1, label='Initial Capital')
+    plt.xlabel('Trade Number', fontsize=12)
+    plt.ylabel('Account Balance ($)', fontsize=12)
+    plt.title('Equity Curve', fontsize=14, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
 

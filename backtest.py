@@ -92,7 +92,7 @@ FIXED_PARAMS = {
 # ==================== OPTIMIZATION SETTINGS ====================
 RUN_OPTIMIZATION = False  # Set to True to run optimization, False for single backtest
 USE_EXHAUSTIVE_SEARCH = False  # If True: test ALL parameter combinations in parallel (exhaustive). If False: random search
-RANDOM_SEARCH_SAMPLES = 350  
+RANDOM_SEARCH_SAMPLES = 1000  
 MAX_WORKERS = 4  
 USE_FIRST_TENTH_ONLY = False 
 
@@ -103,6 +103,21 @@ CONTRACTS_BY_NAME = {}
 ROUND_TURN_FEES = {}
 RESULTS_CSV_LOCK = Lock()  # Lock for CSV writing
 SUMMARY_CSV_LOCK = Lock()  # Lock for summary CSV writing
+FINAL_RESULT_LOCK = Lock()  # Lock for final_result.csv writing
+
+# ==================== TIMEFRAME MAPPING ====================
+# Map timeframes to data file names in data/MGCG6/
+TIMEFRAME_FILE_MAP = {
+    "5min": "GOLD.m_M5.csv",
+    "30min": "GOLD.m_M30.csv",
+    "1h": "GOLD.m_H1.csv",
+    "15min": "GOLD.m_M15.csv"  # Added for date range calculation
+}
+
+# Global date range for USE_FIRST_TENTH_ONLY (calculated from 15min data)
+DATE_RANGE_START = None
+DATE_RANGE_END = None
+DAYS_FROM_15MIN_FIRST_TENTH = None  # Number of days in 15min first 10% (for 5min filtering)
 
 
 # ==================== INITIALIZATION FUNCTIONS ====================
@@ -187,6 +202,74 @@ def get_contract_info(asset_id):
 def get_contract_id_by_name(asset_name):
     """Get contract ID from asset name (e.g., 'MESH6' -> 'CON.F.US.MES.H26')"""
     return CONTRACTS_BY_NAME.get(asset_name)
+
+
+def _calculate_date_range_from_15min(asset_name="MGCG6"):
+    """
+    Calculate the date range from the first 10% of 15min data.
+    This date range will be used for all timeframes when USE_FIRST_TENTH_ONLY is True.
+    Also calculates the number of days for 5min filtering.
+    """
+    global DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_15MIN_FIRST_TENTH
+    
+    if DATE_RANGE_START is not None and DATE_RANGE_END is not None and DAYS_FROM_15MIN_FIRST_TENTH is not None:
+        # Already calculated, return cached values
+        return DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_15MIN_FIRST_TENTH
+    
+    # Load 15min data
+    timeframe_15min = "15min"
+    direct_file_path_15min = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[timeframe_15min])
+    
+    if not os.path.exists(direct_file_path_15min):
+        print(f"⚠️  Warning: 15min data file not found: {direct_file_path_15min}")
+        print(f"   Cannot calculate date range. USE_FIRST_TENTH_ONLY will use first 10% of bars instead.")
+        return None, None, None
+    
+    try:
+        # Read CSV - check if it's tab-separated (MT5 format)
+        historical_data = pd.read_csv(direct_file_path_15min, sep='\t')
+        
+        # Check if this is MT5 format
+        if '<DATE>' in historical_data.columns and '<TIME>' in historical_data.columns:
+            historical_data['timestamp'] = pd.to_datetime(
+                historical_data['<DATE>'].astype(str) + ' ' + historical_data['<TIME>'].astype(str),
+                format='%Y.%m.%d %H:%M:%S',
+                utc=True
+            )
+        elif 'timestamp' in historical_data.columns:
+            if pd.api.types.is_numeric_dtype(historical_data['timestamp']):
+                historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], unit='ms', utc=True)
+            else:
+                historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
+        else:
+            print(f"⚠️  Warning: No timestamp column found in 15min data")
+            return None, None, None
+        
+        # Sort by timestamp
+        historical_data = historical_data.sort_values('timestamp').reset_index(drop=True)
+        
+        # Calculate first 10%
+        original_length = len(historical_data)
+        tenth_length = max(1, original_length // 10)
+        first_tenth_data = historical_data.iloc[:tenth_length]
+        
+        # Get date range
+        DATE_RANGE_START = first_tenth_data['timestamp'].iloc[0]
+        DATE_RANGE_END = first_tenth_data['timestamp'].iloc[-1]
+        
+        # Calculate number of days (for 5min filtering)
+        DAYS_FROM_15MIN_FIRST_TENTH = (DATE_RANGE_END - DATE_RANGE_START).days + 1
+        
+        print(f"📅 Date range calculated from 15min data (first 10%):")
+        print(f"   Start: {DATE_RANGE_START.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   End: {DATE_RANGE_END.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   Days: {DAYS_FROM_15MIN_FIRST_TENTH} days")
+        print(f"   Bars in 15min: {tenth_length:,} out of {original_length:,}")
+        
+        return DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_15MIN_FIRST_TENTH
+    except Exception as e:
+        print(f"⚠️  Error calculating date range from 15min data: {e}")
+        return None, None, None
 
 
 def load_backtest_data(asset_name, timeframe, direct_file_path=None):
@@ -443,12 +526,59 @@ class BacktestStrategy(Strategy):
         
         self.historical_data = historical_data.sort_values('timestamp').reset_index(drop=True)
         
-        # Limit to first 10% of data if USE_FIRST_TENTH_ONLY is enabled
+        # Limit to date range from 15min first 10% if USE_FIRST_TENTH_ONLY is enabled
         if USE_FIRST_TENTH_ONLY:
-            original_length = len(self.historical_data)
-            tenth_length = max(1, original_length // 10)  # At least 1 bar
-            self.historical_data = self.historical_data.iloc[:tenth_length].reset_index(drop=True)
-            print(f"📊 Limited data to first 10%: {len(self.historical_data):,} bars (from {original_length:,} total)")
+            # Calculate date range from 15min data if not already calculated
+            date_start, date_end, num_days = _calculate_date_range_from_15min(asset_name)
+            
+            if date_start is not None and date_end is not None and num_days is not None:
+                original_length = len(self.historical_data)
+                
+                # Special handling for 5min: use same number of days from start (not date range)
+                if self.timeframe == "5min":
+                    # Get the start date of the current timeframe data
+                    start_date = self.historical_data['timestamp'].iloc[0]
+                    # Calculate end date as start_date + num_days
+                    end_date = start_date + pd.Timedelta(days=num_days)
+                    
+                    # Filter by number of days from start
+                    mask = (self.historical_data['timestamp'] >= start_date) & (self.historical_data['timestamp'] <= end_date)
+                    self.historical_data = self.historical_data[mask].reset_index(drop=True)
+                    print(f"📊 Limited 5min data to first {num_days} days (from 15min first 10%): {len(self.historical_data):,} bars (from {original_length:,} total)")
+                    print(f"   Date range: {start_date.strftime('%Y-%m-%d %H:%M:%S')} to {end_date.strftime('%Y-%m-%d %H:%M:%S')}")
+                else:
+                    # For other timeframes: filter by date range (same period across all timeframes)
+                    mask = (self.historical_data['timestamp'] >= date_start) & (self.historical_data['timestamp'] <= date_end)
+                    self.historical_data = self.historical_data[mask].reset_index(drop=True)
+                    print(f"📊 Limited data to date range from 15min first 10%: {len(self.historical_data):,} bars (from {original_length:,} total)")
+                    print(f"   Date range: {date_start.strftime('%Y-%m-%d %H:%M:%S')} to {date_end.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Check if filtering removed all data
+                if len(self.historical_data) == 0:
+                    print(f"⚠️  ERROR: Filtering removed ALL data for {self.asset} {self.timeframe}!")
+                    if self.timeframe == "5min":
+                        print(f"   No data found in first {num_days} days from start.")
+                    else:
+                        print(f"   This timeframe has no bars in the date range from 15min first 10%.")
+                        print(f"   Date range: {date_start.strftime('%Y-%m-%d %H:%M:%S')} to {date_end.strftime('%Y-%m-%d %H:%M:%S')}")
+                    if original_length > 0:
+                        # Get original data range before filtering
+                        original_data = historical_data.sort_values('timestamp').reset_index(drop=True)
+                        print(f"   Original data range: {original_data['timestamp'].iloc[0]} to {original_data['timestamp'].iloc[-1]}")
+                    else:
+                        print(f"   Original data was already empty")
+            else:
+                # Fallback: use first 10% of bars if date range calculation failed
+                original_length = len(self.historical_data)
+                tenth_length = max(1, original_length // 10)  # At least 1 bar
+                self.historical_data = self.historical_data.iloc[:tenth_length].reset_index(drop=True)
+                print(f"📊 Limited data to first 10% (fallback): {len(self.historical_data):,} bars (from {original_length:,} total)")
+        
+        # Final check: ensure we have data after all filtering
+        if len(self.historical_data) == 0:
+            error_msg = f"ERROR: No data available for {self.asset} {self.timeframe} after filtering. This will cause zero trades and zero days."
+            print(f"⚠️  {error_msg}")
+            raise ValueError(error_msg)
         
         self.initial_balance = initial_balance
         self.current_balance = initial_balance
@@ -512,6 +642,10 @@ class BacktestStrategy(Strategy):
         # Start from volume_start_index if USE_VOLUME_CHECK is enabled
         start_index = max(0, self.volume_start_index) if hasattr(self, 'volume_start_index') else 0
         
+        # Check if we have any data at all
+        if len(self.historical_data) == 0:
+            raise ValueError(f"ERROR: No historical data available for {self.asset} {self.timeframe} after filtering! This will result in zero trades and zero days.")
+        
         # Ensure we have enough bars after the start index
         available_bars = len(self.historical_data) - start_index
         if available_bars < min_bars_needed:
@@ -519,6 +653,10 @@ class BacktestStrategy(Strategy):
                 print(f"⚠️  Warning: Only {available_bars} bars available after volume start timestamp (need {min_bars_needed})")
                 print(f"   Starting from beginning of dataset instead")
                 start_index = 0
+                # Re-check after resetting start_index
+                available_bars = len(self.historical_data)
+                if available_bars < min_bars_needed:
+                    raise ValueError(f"Not enough historical data. Need at least {min_bars_needed} bars, got {len(self.historical_data)}")
             else:
                 raise ValueError(f"Not enough historical data. Need at least {min_bars_needed} bars, got {len(self.historical_data)}")
         
@@ -1324,20 +1462,40 @@ class BacktestStrategy(Strategy):
         print(f"Largest Loss:        ${results['largest_loss']:.2f}")
         print(f"{'='*60}\n")
         
-        # Save results
-        trades_df.to_csv(f"backtest_trades_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv", index=False)
-        equity_df = pd.DataFrame(self.equity_curve)
-        equity_df.to_csv(f"backtest_equity_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv", index=False)
-        print(f"💾 Results saved to CSV files")
-        
-        # Save summary to CSV (inputs + metrics)
-        summary_csv = self.save_summary_to_csv(results, asset_name=getattr(self, 'asset_name', None))
-        print(f"💾 Summary saved to {summary_csv}")
-        
-        # Plot equity curve
-        self._plot_equity_curve(equity_df)
+        # Save results - check if we're in single backtest mode (not optimization)
+        # If so, save to gold_results/{id}/ directory
+        result_id = getattr(self, 'result_id', None)
+        if result_id is not None:
+            # Single backtest mode - save to gold_results/{id}/
+            result_dir = os.path.join("gold_results", str(result_id))
+            os.makedirs(result_dir, exist_ok=True)
+            
+            trades_df.to_csv(os.path.join(result_dir, f"backtest_trades_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv"), index=False)
+            equity_df = pd.DataFrame(self.equity_curve)
+            equity_df.to_csv(os.path.join(result_dir, f"backtest_equity_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv"), index=False)
+            print(f"💾 Results saved to {result_dir}/")
+            
+            # Save summary to final_result.csv
+            self.save_to_final_result_csv(results, result_id, asset_name=getattr(self, 'asset_name', None))
+            print(f"💾 Added to final_result.csv with ID {result_id}")
+            
+            # Plot equity curve - save to result directory
+            self._plot_equity_curve(equity_df, result_dir=result_dir)
+        else:
+            # Optimization mode or old behavior - save to current directory
+            trades_df.to_csv(f"backtest_trades_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv", index=False)
+            equity_df = pd.DataFrame(self.equity_curve)
+            equity_df.to_csv(f"backtest_equity_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv", index=False)
+            print(f"💾 Results saved to CSV files")
+            
+            # Save summary to CSV (inputs + metrics)
+            summary_csv = self.save_summary_to_csv(results, asset_name=getattr(self, 'asset_name', None))
+            print(f"💾 Summary saved to {summary_csv}")
+            
+            # Plot equity curve
+            self._plot_equity_curve(equity_df)
     
-    def _plot_equity_curve(self, equity_df):
+    def _plot_equity_curve(self, equity_df, result_dir=None):
         """Plot the equity curve"""
         if len(equity_df) == 0:
             return
@@ -1380,7 +1538,10 @@ class BacktestStrategy(Strategy):
         
         plt.tight_layout()
         
-        plot_filename = f"backtest_equity_curve_{self.asset}_{datetime.now().strftime('%Y%m%d')}.png"
+        if result_dir:
+            plot_filename = os.path.join(result_dir, f"backtest_equity_curve_{self.asset}_{datetime.now().strftime('%Y%m%d')}.png")
+        else:
+            plot_filename = f"backtest_equity_curve_{self.asset}_{datetime.now().strftime('%Y%m%d')}.png"
         plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
         print(f"📈 Equity curve plot saved to {plot_filename}")
     
@@ -1452,6 +1613,92 @@ class BacktestStrategy(Strategy):
                 df_new.to_csv(csv_filename, index=False)
         
         return csv_filename
+    
+    def save_to_final_result_csv(self, results=None, result_id=None, asset_name=None):
+        """Save backtest summary to final_result.csv with ID and without certain columns"""
+        if results is None:
+            results = self._get_backtest_results()
+        
+        if result_id is None:
+            return
+        
+        # Use stored strategy parameters
+        strategy_params = getattr(self, 'strategy_params', {})
+        
+        # Create result row - EXCLUDE: asset_name, asset_id, initial_balance, max_loss, max_loss_amount, max_loss_type
+        result_row = {
+            # ID at the beginning
+            'id': result_id,
+            # Timeframe
+            'timeframe': self.timeframe,
+            # Strategy parameters
+            **strategy_params,
+            # Metrics
+            'total_pnl': results['total_pnl'],
+            'total_trades': results['total_trades'],
+            'win_rate': results['win_rate'],
+            'final_balance': results['final_balance'],
+            'max_drawdown': results['max_drawdown'],
+            'max_drawdown_pct': results['max_drawdown_pct'],
+            'total_fees': results['total_fees'],
+            'winning_trades': results['winning_trades'],
+            'losing_trades': results['losing_trades'],
+            'avg_win': results['avg_win'],
+            'avg_loss': results['avg_loss'],
+            'profit_factor': results['profit_factor'],
+            'total_return': results['total_return'],
+            'net_profit': results['net_profit'],
+            'largest_win': results['largest_win'],
+            'largest_loss': results['largest_loss'],
+            'trades_per_day': results['trades_per_day'],
+            'backtest_period_days': results['backtest_period_days'],
+            'strategy_failed': self.strategy_failed if hasattr(self, 'strategy_failed') else False,
+            'failed_reason': self.failed_reason if hasattr(self, 'failed_reason') else None,
+            # Timestamp
+            'backtest_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # CSV filename in gold_results directory
+        os.makedirs("gold_results", exist_ok=True)
+        csv_filename = os.path.join("gold_results", "final_result.csv")
+        
+        # Thread-safe CSV writing
+        with FINAL_RESULT_LOCK:
+            # Check if file exists
+            file_exists = os.path.exists(csv_filename)
+            
+            # Create DataFrame from single row
+            df_new = pd.DataFrame([result_row])
+            
+            if file_exists:
+                # Read existing CSV and append
+                df_existing = pd.read_csv(csv_filename)
+                # Combine
+                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                df_combined.to_csv(csv_filename, index=False)
+            else:
+                # Create new file
+                df_new.to_csv(csv_filename, index=False)
+        
+        return csv_filename
+
+
+def _get_next_result_id():
+    """Get the next available result ID by reading final_result.csv (thread-safe)"""
+    csv_filename = os.path.join("gold_results", "final_result.csv")
+    
+    with FINAL_RESULT_LOCK:
+        if not os.path.exists(csv_filename):
+            return 1
+        
+        try:
+            df = pd.read_csv(csv_filename)
+            if 'id' in df.columns and len(df) > 0:
+                return int(df['id'].max()) + 1
+            else:
+                return 1
+        except Exception:
+            return 1
 
 
 # ==================== OPTIMIZATION FUNCTIONS ====================
@@ -1502,17 +1749,31 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
         # Load data
         historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe, direct_file_path=direct_file_path)
         if historical_data is None:
+            if verbose:
+                print(f"❌ Failed to load data for {asset_name} {timeframe}")
+            return None
+        
+        # Check if data is empty after loading
+        if len(historical_data) == 0:
+            if verbose:
+                print(f"❌ No data available for {asset_name} {timeframe} after loading")
             return None
         
         # Create and run backtest with captured parameters
-        backtest = BacktestStrategy(
-            asset_tuple=asset_tuple,
-            historical_data=historical_data,
-            initial_balance=initial_balance,
-            max_loss=max_loss,
-            asset_name=asset_name,
-            strategy_params=captured_params,  # Pass captured parameters
-        )
+        try:
+            backtest = BacktestStrategy(
+                asset_tuple=asset_tuple,
+                historical_data=historical_data,
+                initial_balance=initial_balance,
+                max_loss=max_loss,
+                asset_name=asset_name,
+                strategy_params=captured_params,  # Pass captured parameters
+            )
+        except ValueError as e:
+            # This catches the "Not enough historical data" error from init_rest
+            if verbose:
+                print(f"❌ Error initializing backtest: {e}")
+            return None
         
         # Run with progress shown even when not verbose
         results = backtest.run_backtest(show_progress=True, progress_prefix=progress_prefix, progress_line=progress_line, suppress_header=not verbose)
@@ -1585,8 +1846,18 @@ def _generate_all_combinations():
     return combinations
 
 
-def _generate_random_combinations(num_samples):
-    """Generate random parameter combinations to test"""
+def _generate_random_combinations(num_samples, include_timeframe=False, available_timeframes=None):
+    """
+    Generate random parameter combinations to test.
+    
+    Args:
+        num_samples: Number of random combinations to generate
+        include_timeframe: If True, randomly select timeframe for each combination
+        available_timeframes: List of timeframes to choose from (e.g., ["5min", "30min", "1h"])
+    
+    Returns:
+        List of parameter dictionaries. If include_timeframe=True, each dict includes 'timeframe' key.
+    """
     # Get all parameter ranges
     param_ranges = {}
     for param_name, config in OPTIMIZATION_CONFIG.items():
@@ -1604,6 +1875,11 @@ def _generate_random_combinations(num_samples):
         
         # Add fixed params
         params_dict.update(FIXED_PARAMS)
+        
+        # Randomly select timeframe if requested
+        if include_timeframe and available_timeframes:
+            params_dict['timeframe'] = random.choice(available_timeframes)
+        
         combinations.append(params_dict)
     
     return combinations
@@ -1627,8 +1903,9 @@ def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000
     total_combinations = len(combinations)
     print(f"   Total combinations to test: {total_combinations:,}\n")
     
-    # CSV filename
-    csv_filename = f"optimization_results_{asset_name}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    # CSV filename - save to gold_results directory
+    os.makedirs("gold_results", exist_ok=True)
+    csv_filename = os.path.join("gold_results", f"optimization_results_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     
     # Progress tracking
     completed_count = 0
@@ -1723,26 +2000,51 @@ def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000
     return best_result, csv_filename
 
 
-def optimize_strategy_random(asset_name, timeframe, initial_balance=50000.0, max_loss=2000, max_workers=4, num_samples=100, direct_file_path=None):
+def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0, max_loss=2000, max_workers=4, num_samples=100, direct_file_path=None, timeframes_list=None):
     """
     Random search optimization: test random parameter combinations in parallel.
     Saves results to CSV after each combination completes.
-    """
-    print(f"\n{'='*60}")
-    print(f"🔍 Starting Random Search Optimization")
-    print(f"{'='*60}")
-    print(f"Asset: {asset_name} | Timeframe: {timeframe}")
-    print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
-    print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
     
-    # Generate random combinations
+    Args:
+        asset_name: Asset name
+        timeframe: Optional specific timeframe (if None and timeframes_list provided, timeframe will be random)
+        initial_balance: Starting balance
+        max_loss: Maximum loss threshold
+        max_workers: Number of parallel workers
+        num_samples: Number of random samples to test
+        direct_file_path: Optional direct file path (will be determined from timeframe if None)
+        timeframes_list: List of timeframes to randomly choose from (e.g., ["5min", "30min", "1h"])
+    """
+    # Determine if we're using random timeframes
+    use_random_timeframes = (timeframe is None and timeframes_list is not None)
+    
+    if use_random_timeframes:
+        print(f"\n{'='*60}")
+        print(f"🔍 Starting Random Search Optimization (with Random Timeframes)")
+        print(f"{'='*60}")
+        print(f"Asset: {asset_name} | Timeframes: {', '.join(timeframes_list)} (random)")
+        print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
+        print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
+    else:
+        print(f"\n{'='*60}")
+        print(f"🔍 Starting Random Search Optimization")
+        print(f"{'='*60}")
+        print(f"Asset: {asset_name} | Timeframe: {timeframe}")
+        print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
+        print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
+    
+    # Generate random combinations (with timeframe if using random timeframes)
     print("📊 Generating random parameter combinations...")
-    combinations = _generate_random_combinations(num_samples)
+    combinations = _generate_random_combinations(num_samples, include_timeframe=use_random_timeframes, available_timeframes=timeframes_list)
     total_combinations = len(combinations)
     print(f"   Generated {total_combinations} random combinations to test\n")
     
-    # CSV filename
-    csv_filename = f"optimization_results_{asset_name}_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    # CSV filename - use single file if random timeframes, otherwise per timeframe
+    os.makedirs("gold_results", exist_ok=True)
+    if use_random_timeframes:
+        csv_filename = os.path.join("gold_results", f"optimization_results_all_timeframes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    else:
+        csv_filename = os.path.join("gold_results", f"optimization_results_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     
     # Progress tracking
     completed_count = 0
@@ -1755,6 +2057,13 @@ def optimize_strategy_random(asset_name, timeframe, initial_balance=50000.0, max
         """Run backtest and save result"""
         nonlocal completed_count, next_line
         
+        # Extract timeframe from combo if present, otherwise use provided timeframe
+        combo_timeframe = combo.pop('timeframe', timeframe) if use_random_timeframes else timeframe
+        combo_direct_file_path = direct_file_path
+        if use_random_timeframes and combo_timeframe in TIMEFRAME_FILE_MAP:
+            # Get file path for the randomly selected timeframe
+            combo_direct_file_path = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[combo_timeframe])
+        
         # Assign a unique line number for this backtest's progress
         with progress_lock:
             if combo_index not in worker_lines:
@@ -1763,15 +2072,19 @@ def optimize_strategy_random(asset_name, timeframe, initial_balance=50000.0, max
             line_number = worker_lines[combo_index]
         
         # Create progress prefix with line positioning
-        progress_prefix = f"   [Sample {combo_index + 1}/{total_combinations}] "
+        tf_display = f" [{combo_timeframe}]" if use_random_timeframes else ""
+        progress_prefix = f"   [Sample {combo_index + 1}/{total_combinations}{tf_display}] "
         # Run backtest with line number for progress display
-        results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, progress_line=line_number, direct_file_path=direct_file_path)
+        results = _run_single_backtest(asset_name, combo_timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, progress_line=line_number, direct_file_path=combo_direct_file_path)
         
         if results is None:
             return None
         
         # Create result row with all parameters and results
         result_row = combo.copy()
+        # Add timeframe to result if using random timeframes
+        if use_random_timeframes:
+            result_row['timeframe'] = combo_timeframe
         result_row.update({
             'total_pnl': results['total_pnl'],
             'total_trades': results['total_trades'],
@@ -1800,7 +2113,8 @@ def optimize_strategy_random(asset_name, timeframe, initial_balance=50000.0, max
         with progress_lock:
             completed_count += 1
             progress_pct = (completed_count / total_combinations) * 100
-            print(f"   [{completed_count}/{total_combinations}] ({progress_pct:.1f}%) Completed | P&L: ${results['total_pnl']:,.2f} | Trades: {results['total_trades']}")
+            tf_info = f" | TF: {combo_timeframe}" if use_random_timeframes else ""
+            print(f"   [{completed_count}/{total_combinations}] ({progress_pct:.1f}%) Completed | P&L: ${results['total_pnl']:,.2f} | Trades: {results['total_trades']}{tf_info}")
         
         return result_row
     
@@ -1833,6 +2147,8 @@ def optimize_strategy_random(asset_name, timeframe, initial_balance=50000.0, max
     print(f"{'='*60}")
     if best_result:
         print(f"🏆 Best Result:")
+        if use_random_timeframes and 'timeframe' in best_result:
+            print(f"   Timeframe: {best_result['timeframe']}")
         print(f"   Total P&L: ${best_result['total_pnl']:,.2f}")
         print(f"   Total Trades: {best_result['total_trades']}")
         print(f"   Win Rate: {best_result['win_rate']:.2f}%")
@@ -2026,6 +2342,7 @@ def run_backtest_example(asset_name="MGCG6", timeframe="15min",
     print(f"✅ Loaded data for {asset_name} ({contract_id})")
     print(f"   Timeframe: {timeframe}")
     print(f"   Bars: {len(historical_data):,}")
+
     
     # Capture current strategy parameters
     captured_params = {}
@@ -2045,7 +2362,15 @@ def run_backtest_example(asset_name="MGCG6", timeframe="15min",
         strategy_params=captured_params,
     )
     
+    # Run the backtest first
     results = backtest.run_backtest()
+    
+    # Get next available result ID AFTER backtest completes (to avoid duplicate IDs)
+    result_id = _get_next_result_id()
+    print(f"📁 Result ID: {result_id}")
+    backtest.result_id = result_id
+    
+    # Generate report (which will save files using the result_id)
     backtest.generate_report(results)
 
 
@@ -2053,18 +2378,63 @@ if __name__ == "__main__":
     # Initialize data structures once
     initialize_backtest_data()
     
+    # Calculate date range from 15min data if USE_FIRST_TENTH_ONLY is enabled
+    # This ensures all timeframes use the same date period
+    if USE_FIRST_TENTH_ONLY:
+        print("📅 Calculating date range from 15min data (first 10%)...")
+        _calculate_date_range_from_15min("MGCG6")
+        print()
+    
     # Configuration for backtest
     asset_name = "MGCG6"  # Gold contract from contracts.csv
-    timeframe = "15min"
-    direct_file_path = "GOLD.m_M15.csv"  # Direct path to MT5 format CSV file
     initial_balance = 50000.0
     max_loss = 2000
+    
+    # Timeframe selection
+    # For single backtest: choose one timeframe ("5min", "30min", or "1h")
+    # For optimization: will iterate through all timeframes
+    SELECTED_TIMEFRAME = "15min"  # Change this to "5min", "30min", or "1h" for single backtest
+    
+    # Timeframes to test for optimization (skip 15min as already done)
+    timeframes_to_test = ["5min", "30min", "1h"]
+    
     # =================================================
     
     if RUN_OPTIMIZATION:
         if USE_EXHAUSTIVE_SEARCH:
-            optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS, direct_file_path=direct_file_path)
+            # Exhaustive search: run for each timeframe separately
+            for timeframe in timeframes_to_test:
+                # Get file path from mapping
+                if timeframe in TIMEFRAME_FILE_MAP:
+                    direct_file_path = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[timeframe])
+                    print(f"\n{'='*60}")
+                    print(f"🔄 Processing timeframe: {timeframe}")
+                    print(f"📂 Data file: {direct_file_path}")
+                    print(f"{'='*60}\n")
+                    
+                    optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS, direct_file_path=direct_file_path)
+                else:
+                    print(f"⚠️  Warning: No file mapping for timeframe {timeframe}, skipping...")
         else:
-            optimize_strategy_random(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS, RANDOM_SEARCH_SAMPLES, direct_file_path=direct_file_path)
+            # Random search: timeframe is randomly selected for each sample
+            print(f"\n{'='*60}")
+            print(f"🔄 Random Search with Random Timeframes")
+            print(f"📂 Timeframes: {', '.join(timeframes_to_test)}")
+            print(f"{'='*60}\n")
+            
+            optimize_strategy_random(asset_name, timeframe=None, initial_balance=initial_balance, max_loss=max_loss, 
+                                    max_workers=MAX_WORKERS, num_samples=RANDOM_SEARCH_SAMPLES, 
+                                    direct_file_path=None, timeframes_list=timeframes_to_test)
     else:
-        run_backtest_example(asset_name, timeframe, initial_balance, max_loss, direct_file_path=direct_file_path)
+        # Run single backtest for selected timeframe
+        if SELECTED_TIMEFRAME in TIMEFRAME_FILE_MAP:
+            direct_file_path = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[SELECTED_TIMEFRAME])
+            print(f"\n{'='*60}")
+            print(f"🔄 Processing timeframe: {SELECTED_TIMEFRAME}")
+            print(f"📂 Data file: {direct_file_path}")
+            print(f"{'='*60}\n")
+            
+            run_backtest_example(asset_name, SELECTED_TIMEFRAME, initial_balance, max_loss, direct_file_path=direct_file_path)
+        else:
+            print(f"❌ Error: Invalid timeframe '{SELECTED_TIMEFRAME}'")
+            print(f"   Available timeframes: {', '.join(TIMEFRAME_FILE_MAP.keys())}")

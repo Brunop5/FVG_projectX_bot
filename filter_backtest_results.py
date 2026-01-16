@@ -6,14 +6,14 @@ Filter backtest results based on specific criteria.
 import pandas as pd
 
 # ===== CONFIGURATION =====
-INPUT_CSV = "backtest_summary.csv"
+INPUT_CSV = "gold_results/optimization_results_all_timeframes_20260116_015849.csv"
 OUTPUT_CSV = "filtered_backtest_results.csv"
 
 # Filter criteria
-MIN_TOTAL_PNL = 5000
-MAX_DRAWDOWN = 3000
-MIN_TRADES_PER_DAY = 0.42
-MAX_BACKTEST_PERIOD_DAYS = 204
+MIN_TOTAL_PNL = 10000
+MAX_DRAWDOWN = 3500
+MIN_TRADES_PER_DAY = 0.1
+MAX_BACKTEST_PERIOD_DAYS = 205
 # =========================
 
 # Read the CSV file
@@ -22,21 +22,18 @@ df = pd.read_csv(INPUT_CSV)
 
 print(f"Total rows in original CSV: {len(df)}")
 
-# Apply filters
-# strategy_failed is False
-filtered_df = df[df['strategy_failed'] == False].copy()
 
 # total_pnl is at least 5000
-filtered_df = filtered_df[filtered_df['total_pnl'] >= MIN_TOTAL_PNL]
+filtered_df = df[df['total_pnl'] >= MIN_TOTAL_PNL]
 
 # max_drawdown is not more than 3000 (<= 3000)
-filtered_df = filtered_df[filtered_df['max_drawdown'] <= MAX_DRAWDOWN]
+#filtered_df = filtered_df[filtered_df['max_drawdown'] <= MAX_DRAWDOWN]
 
 # trades_per_day is more than 0.42 (> 0.42)
-filtered_df = filtered_df[filtered_df['trades_per_day'] > MIN_TRADES_PER_DAY]
+#filtered_df = filtered_df[filtered_df['trades_per_day'] > MIN_TRADES_PER_DAY]
 
 # backtest_period_days is not more than 204 (<= 204)
-filtered_df = filtered_df[filtered_df['backtest_period_days'] <= MAX_BACKTEST_PERIOD_DAYS]
+#filtered_df = filtered_df[filtered_df['backtest_period_days'] <= MAX_BACKTEST_PERIOD_DAYS]
 
 print(f"Rows after filtering: {len(filtered_df)}")
 

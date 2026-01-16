@@ -3,4 +3,5 @@ __pycache__/
 .env
 data/
 *.csv
-!backtest_summary.csv
+*.png
+!gold_results/final_result.csv

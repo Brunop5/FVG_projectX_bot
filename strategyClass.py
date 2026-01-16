@@ -12,7 +12,7 @@ metadata_lock = threading.Lock()
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
 FVG_HISTORY_NBR = 15              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.01           # Min FVG Power % (formerly MinFVGPowerPct)
+MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
 HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
@@ -36,7 +36,7 @@ HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 1                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 5                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
