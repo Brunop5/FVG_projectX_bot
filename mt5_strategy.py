@@ -258,6 +258,7 @@ class MT5Strategy(Strategy):
     def __init__(self, asset_tuple):
         super().__init__(asset_tuple)
         self.mt5_symbol = get_mt5_symbol(self.asset)
+        self.stop_flag = threading.Event()  # Flag to stop the strategy
     
     def init_rest(self):
         """Override to use MT5 for account info"""
@@ -426,10 +427,53 @@ class MT5Strategy(Strategy):
                     print(f"📉 SHORT position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
                 break
     
+    def run_bar_iterations(self):
+        """Override to add stop flag check"""
+        timeframe_sec = TIMEFRAME_SECONDS[self.timeframe]
+        next_bar = datetime.now() + timedelta(seconds=timeframe_sec)
+        
+        while not self.stop_flag.is_set():
+            try:
+                self.fetch_new_data()
+                self.calculate_indicators()
+                self.add_fvg_zones()
+                self.entry_logic()
+                self.update_stops()
+                self.save_data()
+                print(f"\n⏰ New bar - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} close: {self.cur_close}")
+                
+                now = datetime.now()
+                sleep_seconds = (next_bar - now).total_seconds()
+                if sleep_seconds < 0:
+                    sleep_seconds = 0
+                
+                # Sleep in small chunks to check stop flag
+                while sleep_seconds > 0 and not self.stop_flag.is_set():
+                    time.sleep(min(1, sleep_seconds))
+                    sleep_seconds -= 1
+                
+                if not self.stop_flag.is_set():
+                    next_bar += timedelta(seconds=timeframe_sec)
+                
+            except Exception as e:
+                print(f"❌ Error in bar iteration: {e}")
+                if not self.stop_flag.is_set():
+                    time.sleep(60)
+        
+        print(f"🛑 Bar iterations stopped for {self.asset}")
+    
     def update_price(self):
-        """Override to get price from MT5"""
-        while True:
-            time.sleep(10)
+        """Override to get price from MT5 and check stop flag"""
+        while not self.stop_flag.is_set():
+            # Sleep in chunks to check stop flag
+            for _ in range(10):
+                if self.stop_flag.is_set():
+                    break
+                time.sleep(1)
+            
+            if self.stop_flag.is_set():
+                break
+            
             tick = mt5.symbol_info_tick(self.mt5_symbol)
             if tick is None:
                 continue
@@ -447,12 +491,30 @@ class MT5Strategy(Strategy):
                     self.lastPositionWasLong = False
                     self.lastPositionWasShort = False
                     self.save_data()
+        
+        print(f"🛑 Price update stopped for {self.asset}")
+    
+    def stop(self):
+        """Stop the strategy gracefully"""
+        print(f"🛑 Stopping strategy for {self.asset}...")
+        self.stop_flag.set()
 
 
 def run_mt5_strat(strat: MT5Strategy):
     """Run MT5 strategy (no token needed)"""
-    strat.init_rest()
-    strat.run()
+    try:
+        strat.init_rest()
+        strat.run()
+        
+        # Wait for threads to finish (they will run until stop_flag is set)
+        # The run() method starts threads but doesn't wait, so we wait here
+        while not strat.stop_flag.is_set():
+            time.sleep(1)
+    except Exception as e:
+        print(f"❌ Error in strategy: {e}")
+        import traceback
+        traceback.print_exc()
+        strat.stop_flag.set()
 
 
 if __name__ == "__main__":
