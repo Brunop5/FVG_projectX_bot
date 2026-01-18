@@ -463,26 +463,22 @@ class MT5Strategy(Strategy):
         print(f"🛑 Bar iterations stopped for {self.asset}")
     
     def update_price(self):
-        """Override to get price from MT5 and check stop flag"""
+        """Override to get price from MT5 and check stop flag - checks on every tick (frequent polling)"""
         while not self.stop_flag.is_set():
-            # Sleep in chunks to check stop flag
-            for _ in range(10):
-                if self.stop_flag.is_set():
-                    break
-                time.sleep(1)
-            
+            # Check stop flag frequently
             if self.stop_flag.is_set():
                 break
             
             tick = mt5.symbol_info_tick(self.mt5_symbol)
             if tick is None:
+                time.sleep(0.1)  # Small delay if tick unavailable
                 continue
             
             # Use mid price (average of bid/ask)
             self.cur_price = (tick.bid + tick.ask) / 2
             self.cur_close = self.cur_price
-            print(f"updated price: {self.cur_price}")
             
+            # Check exits on every tick (MT5 doesn't have OnTick callback in Python, so we poll frequently)
             if self.active_order is not None:
                 closed = self.active_order.check_stops(self.cur_close)
                 if closed:
@@ -491,6 +487,9 @@ class MT5Strategy(Strategy):
                     self.lastPositionWasLong = False
                     self.lastPositionWasShort = False
                     self.save_data()
+            
+            # Small sleep to avoid excessive CPU usage, but check frequently (every ~100ms)
+            time.sleep(0.1)
         
         print(f"🛑 Price update stopped for {self.asset}")
     
