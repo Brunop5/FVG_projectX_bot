@@ -83,7 +83,7 @@ OPTIMIZATION_CONFIG = {
     }
 }
 
-OUT_PATH = "nasdaq_results"
+OUT_PATH = "gold_results"
 
 # Parameters that should NOT be optimized (keep current values)
 FIXED_PARAMS = {
@@ -93,14 +93,14 @@ FIXED_PARAMS = {
 }
 
 # ==================== OPTIMIZATION SETTINGS ====================
-RUN_OPTIMIZATION = True  # Set to True to run optimization, False for single backtest
+RUN_OPTIMIZATION = False  # Set to True to run optimization, False for single backtest
 USE_EXHAUSTIVE_SEARCH = False  # If True: test ALL parameter combinations in parallel (exhaustive). If False: random search
 RANDOM_SEARCH_SAMPLES = 1000  
 
 USE_AUTO_WORKERS = True  # If True: auto-detect CPU count and use that many workers
 MAX_WORKERS = None  # Manual override (ignored if USE_AUTO_WORKERS is True). Set to number like 8, 16, etc.
 
-USE_FIRST_TENTH_ONLY = True
+USE_FIRST_TENTH_ONLY = False
 
 # CSV Input Settings (alternative to random/exhaustive search)
 USE_CSV_INPUT = False  # If True: read parameter combinations from CSV file instead of generating them
@@ -121,10 +121,10 @@ FINAL_RESULT_LOCK = Lock()  # Lock for final_result.csv writing
 # ==================== TIMEFRAME MAPPING ====================
 # Map timeframes to data file names in data/MGCG6/
 TIMEFRAME_FILE_MAP = {
-    "5min": "NASDAQ100.x_M5.csv",
+    "5min": "GOLD.m_M5.csv",
     "30min": "NASDAQ100.x_M30.csv",
     "1h": "NASDAQ100.x_H1.csv",
-    "15min": "NASDAQ100.x_M15.csv"  # Added for date range calculation
+    "15min": "GOLD.m_M15.csv"  # Added for date range calculation
 }
 
 # Global date range for USE_FIRST_TENTH_ONLY (calculated from 5min data - first 205 days)
@@ -2744,7 +2744,7 @@ if __name__ == "__main__":
     # Initialize data structures once
     initialize_backtest_data()
         # Configuration for backtest
-    asset_name = "MNQH6"  # Gold contract from contracts.csv
+    asset_name = "MGCG6"  # Gold contract from contracts.csv
     initial_balance = 50000.0
     max_loss = 2000
     
