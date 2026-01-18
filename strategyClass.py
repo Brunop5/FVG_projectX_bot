@@ -36,7 +36,7 @@ HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 5                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 1                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -501,8 +501,9 @@ class Strategy:
                 trailStop = self.cur_close + atr * SL_MULTIPLIER
                 tp = self.cur_close - atr * TP_MULTIPLIER
                 entryAtr = atr
+                lot_size = self.calculate_lot_size(atr, SL_MULTIPLIER)
                 self.active_order = Order("SELL", self.cur_close, tp, trailStop, entryAtr,
-                                          self.account_id, self.asset, self.auth_token)
+                                          self.account_id, self.asset, self.auth_token, lot_size)
                 result = self.active_order.place_order()
                 
                 if result['success']:

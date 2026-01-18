@@ -30,6 +30,7 @@ from threading import Lock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import itertools
 import random
+import multiprocessing
 
 
 # ==================== OPTIMIZATION CONFIGURATION ====================
@@ -82,6 +83,8 @@ OPTIMIZATION_CONFIG = {
     }
 }
 
+OUT_PATH = "nasdaq_results"
+
 # Parameters that should NOT be optimized (keep current values)
 FIXED_PARAMS = {
     'USE_VOLUME_CHECK': True,
@@ -90,11 +93,21 @@ FIXED_PARAMS = {
 }
 
 # ==================== OPTIMIZATION SETTINGS ====================
-RUN_OPTIMIZATION = False  # Set to True to run optimization, False for single backtest
+RUN_OPTIMIZATION = True  # Set to True to run optimization, False for single backtest
 USE_EXHAUSTIVE_SEARCH = False  # If True: test ALL parameter combinations in parallel (exhaustive). If False: random search
 RANDOM_SEARCH_SAMPLES = 1000  
-MAX_WORKERS = 4  
-USE_FIRST_TENTH_ONLY = False 
+
+USE_AUTO_WORKERS = True  # If True: auto-detect CPU count and use that many workers
+MAX_WORKERS = None  # Manual override (ignored if USE_AUTO_WORKERS is True). Set to number like 8, 16, etc.
+
+USE_FIRST_TENTH_ONLY = True
+
+# CSV Input Settings (alternative to random/exhaustive search)
+USE_CSV_INPUT = False  # If True: read parameter combinations from CSV file instead of generating them
+CSV_INPUT_FILE = "filtered_backtest_results.csv"  # Path to CSV file with strategy parameters 
+
+# Result Saving Settings
+SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION = False  # If True: create gold_results/{id}/
 
 # ==================== GLOBAL DATA STRUCTURES ====================
 # These are loaded once and reused across all backtests
@@ -108,16 +121,16 @@ FINAL_RESULT_LOCK = Lock()  # Lock for final_result.csv writing
 # ==================== TIMEFRAME MAPPING ====================
 # Map timeframes to data file names in data/MGCG6/
 TIMEFRAME_FILE_MAP = {
-    "5min": "GOLD.m_M5.csv",
-    "30min": "GOLD.m_M30.csv",
-    "1h": "GOLD.m_H1.csv",
-    "15min": "GOLD.m_M15.csv"  # Added for date range calculation
+    "5min": "NASDAQ100.x_M5.csv",
+    "30min": "NASDAQ100.x_M30.csv",
+    "1h": "NASDAQ100.x_H1.csv",
+    "15min": "NASDAQ100.x_M15.csv"  # Added for date range calculation
 }
 
-# Global date range for USE_FIRST_TENTH_ONLY (calculated from 15min data)
+# Global date range for USE_FIRST_TENTH_ONLY (calculated from 5min data - first 205 days)
 DATE_RANGE_START = None
 DATE_RANGE_END = None
-DAYS_FROM_15MIN_FIRST_TENTH = None  # Number of days in 15min first 10% (for 5min filtering)
+DAYS_FROM_5MIN_FIRST_205 = 205  # Number of days to use from 5min data (first 205 days)
 
 
 # ==================== INITIALIZATION FUNCTIONS ====================
@@ -189,6 +202,32 @@ def initialize_backtest_data():
 
 # ==================== UTILITY FUNCTIONS ====================
 
+def get_optimal_worker_count():
+    """
+    Get optimal number of workers based on system configuration.
+    
+    Returns:
+        int: Optimal number of workers
+    """
+    if USE_AUTO_WORKERS:
+        cpu_count = multiprocessing.cpu_count()
+        # For I/O-bound tasks (reading CSV files, pandas operations), we can use more workers
+        # than CPU cores. A good multiplier is 1.5-2x for I/O-bound tasks.
+        # For CPU-bound tasks, use CPU count directly.
+        # Since backtesting involves both CPU (calculations) and I/O (file reading),
+        # we'll use a moderate multiplier.
+        optimal_workers = int(cpu_count * 1.5)  # 1.5x CPU cores for mixed workload
+        print(f"💻 Detected {cpu_count} CPU cores. Using {optimal_workers} workers (1.5x for I/O-bound tasks)")
+        return optimal_workers
+    else:
+        if MAX_WORKERS is None:
+            # Fallback to CPU count if manual override is None
+            cpu_count = multiprocessing.cpu_count()
+            print(f"⚠️  MAX_WORKERS is None but USE_AUTO_WORKERS is False. Using CPU count: {cpu_count}")
+            return cpu_count
+        return MAX_WORKERS
+
+
 def get_round_turn_fee(asset_id):
     """Get round turn fee per contract for a given asset ID"""
     return ROUND_TURN_FEES.get(asset_id, 0.0)
@@ -204,30 +243,29 @@ def get_contract_id_by_name(asset_name):
     return CONTRACTS_BY_NAME.get(asset_name)
 
 
-def _calculate_date_range_from_15min(asset_name="MGCG6"):
+def _calculate_date_range_from_5min(asset_name="MGCG6"):
     """
-    Calculate the date range from the first 10% of 15min data.
+    Calculate the date range from the first 205 days of 5min data.
     This date range will be used for all timeframes when USE_FIRST_TENTH_ONLY is True.
-    Also calculates the number of days for 5min filtering.
     """
-    global DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_15MIN_FIRST_TENTH
+    global DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_5MIN_FIRST_205
     
-    if DATE_RANGE_START is not None and DATE_RANGE_END is not None and DAYS_FROM_15MIN_FIRST_TENTH is not None:
+    if DATE_RANGE_START is not None and DATE_RANGE_END is not None:
         # Already calculated, return cached values
-        return DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_15MIN_FIRST_TENTH
+        return DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_5MIN_FIRST_205
     
-    # Load 15min data
-    timeframe_15min = "15min"
-    direct_file_path_15min = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[timeframe_15min])
+    # Load 5min data
+    timeframe_5min = "5min"
+    direct_file_path_5min = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[timeframe_5min])
     
-    if not os.path.exists(direct_file_path_15min):
-        print(f"⚠️  Warning: 15min data file not found: {direct_file_path_15min}")
+    if not os.path.exists(direct_file_path_5min):
+        print(f"⚠️  Warning: 5min data file not found: {direct_file_path_5min}")
         print(f"   Cannot calculate date range. USE_FIRST_TENTH_ONLY will use first 10% of bars instead.")
         return None, None, None
     
     try:
         # Read CSV - check if it's tab-separated (MT5 format)
-        historical_data = pd.read_csv(direct_file_path_15min, sep='\t')
+        historical_data = pd.read_csv(direct_file_path_5min, sep='\t')
         
         # Check if this is MT5 format
         if '<DATE>' in historical_data.columns and '<TIME>' in historical_data.columns:
@@ -242,33 +280,44 @@ def _calculate_date_range_from_15min(asset_name="MGCG6"):
             else:
                 historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
         else:
-            print(f"⚠️  Warning: No timestamp column found in 15min data")
+            print(f"⚠️  Warning: No timestamp column found in 5min data")
             return None, None, None
         
         # Sort by timestamp
         historical_data = historical_data.sort_values('timestamp').reset_index(drop=True)
         
-        # Calculate first 10%
-        original_length = len(historical_data)
-        tenth_length = max(1, original_length // 10)
-        first_tenth_data = historical_data.iloc[:tenth_length]
+        # Get start date (first bar)
+        start_date = historical_data['timestamp'].iloc[0]
         
-        # Get date range
-        DATE_RANGE_START = first_tenth_data['timestamp'].iloc[0]
-        DATE_RANGE_END = first_tenth_data['timestamp'].iloc[-1]
+        # Calculate end date as start_date + 205 days
+        end_date = start_date + pd.Timedelta(days=DAYS_FROM_5MIN_FIRST_205 - 1)  # -1 because we include the start day
         
-        # Calculate number of days (for 5min filtering)
-        DAYS_FROM_15MIN_FIRST_TENTH = (DATE_RANGE_END - DATE_RANGE_START).days + 1
+        # Filter to first 205 days
+        mask = (historical_data['timestamp'] >= start_date) & (historical_data['timestamp'] <= end_date)
+        first_205_days_data = historical_data[mask].reset_index(drop=True)
         
-        print(f"📅 Date range calculated from 15min data (first 10%):")
+        if len(first_205_days_data) == 0:
+            print(f"⚠️  Warning: No data found in first {DAYS_FROM_5MIN_FIRST_205} days of 5min data")
+            return None, None, None
+        
+        # Get actual date range from filtered data
+        DATE_RANGE_START = first_205_days_data['timestamp'].iloc[0]
+        DATE_RANGE_END = first_205_days_data['timestamp'].iloc[-1]
+        
+        # Calculate actual number of days
+        actual_days = (DATE_RANGE_END - DATE_RANGE_START).days + 1
+        
+        print(f"📅 Date range calculated from 5min data (first {DAYS_FROM_5MIN_FIRST_205} days):")
         print(f"   Start: {DATE_RANGE_START.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"   End: {DATE_RANGE_END.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"   Days: {DAYS_FROM_15MIN_FIRST_TENTH} days")
-        print(f"   Bars in 15min: {tenth_length:,} out of {original_length:,}")
+        print(f"   Days: {actual_days} days")
+        print(f"   Bars in 5min: {len(first_205_days_data):,} out of {len(historical_data):,} total")
         
-        return DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_15MIN_FIRST_TENTH
+        return DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_5MIN_FIRST_205
     except Exception as e:
-        print(f"⚠️  Error calculating date range from 15min data: {e}")
+        print(f"⚠️  Error calculating date range from 5min data: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None, None
 
 
@@ -526,41 +575,25 @@ class BacktestStrategy(Strategy):
         
         self.historical_data = historical_data.sort_values('timestamp').reset_index(drop=True)
         
-        # Limit to date range from 15min first 10% if USE_FIRST_TENTH_ONLY is enabled
+        # Limit to date range from 5min first 205 days if USE_FIRST_TENTH_ONLY is enabled
         if USE_FIRST_TENTH_ONLY:
-            # Calculate date range from 15min data if not already calculated
-            date_start, date_end, num_days = _calculate_date_range_from_15min(asset_name)
+            # Calculate date range from 5min data if not already calculated
+            date_start, date_end, num_days = _calculate_date_range_from_5min(asset_name)
             
-            if date_start is not None and date_end is not None and num_days is not None:
+            if date_start is not None and date_end is not None:
                 original_length = len(self.historical_data)
                 
-                # Special handling for 5min: use same number of days from start (not date range)
-                if self.timeframe == "5min":
-                    # Get the start date of the current timeframe data
-                    start_date = self.historical_data['timestamp'].iloc[0]
-                    # Calculate end date as start_date + num_days
-                    end_date = start_date + pd.Timedelta(days=num_days)
-                    
-                    # Filter by number of days from start
-                    mask = (self.historical_data['timestamp'] >= start_date) & (self.historical_data['timestamp'] <= end_date)
-                    self.historical_data = self.historical_data[mask].reset_index(drop=True)
-                    print(f"📊 Limited 5min data to first {num_days} days (from 15min first 10%): {len(self.historical_data):,} bars (from {original_length:,} total)")
-                    print(f"   Date range: {start_date.strftime('%Y-%m-%d %H:%M:%S')} to {end_date.strftime('%Y-%m-%d %H:%M:%S')}")
-                else:
-                    # For other timeframes: filter by date range (same period across all timeframes)
-                    mask = (self.historical_data['timestamp'] >= date_start) & (self.historical_data['timestamp'] <= date_end)
-                    self.historical_data = self.historical_data[mask].reset_index(drop=True)
-                    print(f"📊 Limited data to date range from 15min first 10%: {len(self.historical_data):,} bars (from {original_length:,} total)")
-                    print(f"   Date range: {date_start.strftime('%Y-%m-%d %H:%M:%S')} to {date_end.strftime('%Y-%m-%d %H:%M:%S')}")
+                # For all timeframes (including 5min): filter by the same date range
+                mask = (self.historical_data['timestamp'] >= date_start) & (self.historical_data['timestamp'] <= date_end)
+                self.historical_data = self.historical_data[mask].reset_index(drop=True)
+                print(f"📊 Limited {self.timeframe} data to date range from 5min first {num_days} days: {len(self.historical_data):,} bars (from {original_length:,} total)")
+                print(f"   Date range: {date_start.strftime('%Y-%m-%d %H:%M:%S')} to {date_end.strftime('%Y-%m-%d %H:%M:%S')}")
                 
                 # Check if filtering removed all data
                 if len(self.historical_data) == 0:
                     print(f"⚠️  ERROR: Filtering removed ALL data for {self.asset} {self.timeframe}!")
-                    if self.timeframe == "5min":
-                        print(f"   No data found in first {num_days} days from start.")
-                    else:
-                        print(f"   This timeframe has no bars in the date range from 15min first 10%.")
-                        print(f"   Date range: {date_start.strftime('%Y-%m-%d %H:%M:%S')} to {date_end.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"   This timeframe has no bars in the date range from 5min first {num_days} days.")
+                    print(f"   Date range: {date_start.strftime('%Y-%m-%d %H:%M:%S')} to {date_end.strftime('%Y-%m-%d %H:%M:%S')}")
                     if original_length > 0:
                         # Get original data range before filtering
                         original_data = historical_data.sort_values('timestamp').reset_index(drop=True)
@@ -1237,15 +1270,19 @@ class BacktestStrategy(Strategy):
                 progress = (self.current_bar_index / total_bars) * 100
                 progress_msg = f"{progress_prefix}Progress: {progress:.1f}% ({self.current_bar_index}/{total_bars} bars)"
                 
-                # Use ANSI escape codes to position on specific line if provided
+                # For multithreaded runs, use ANSI positioning on dedicated lines
                 if progress_line is not None:
-                    # Move cursor to specific line and column 0, then print progress
-                    # \033[n;0H moves to line n, column 0
-                    print(f"\033[{progress_line + 1};0H{progress_msg}\033[K", end='', file=sys.stderr)
+                    # Update more frequently - every 0.1% of progress or every 10 bars, whichever is smaller
+                    update_interval = max(1, min(total_bars // 1000, 10))
+                    if self.current_bar_index % update_interval == 0 or self.current_bar_index == total_bars - 1:
+                        # Use ANSI escape codes to position on specific line
+                        # \033[n;0H moves to line n, column 0
+                        # \033[K clears the rest of the line
+                        print(f"\033[{progress_line + 1};0H{progress_msg}\033[K", end='', file=sys.stderr, flush=True)
                 else:
-                    # Default behavior: overwrite same line
+                    # Default behavior: overwrite same line (single backtest mode)
                     print(progress_msg, end='\r', file=sys.stderr)
-                sys.stderr.flush()
+                    sys.stderr.flush()
             
             # Check max loss after each bar (in case of open position drawdown)
             if self.active_order and self.active_order.filled:
@@ -1287,14 +1324,15 @@ class BacktestStrategy(Strategy):
             self._record_trade(self.active_order)
             self._close_position()
         
-        # Show 100% when done and keep it there
+        # Show 100% when done
         if show_progress:
             progress_msg = f"{progress_prefix}Progress: 100.0% ({total_bars}/{total_bars} bars)"
             if progress_line is not None:
-                print(f"\033[{progress_line + 1};0H{progress_msg}\033[K", end='', file=sys.stderr)
+                # For multithreaded runs, print final progress on new line
+                print(progress_msg, file=sys.stderr, flush=True)
             else:
                 print(progress_msg, end='\r', file=sys.stderr)
-            sys.stderr.flush()
+                sys.stderr.flush()
         
         return self._get_backtest_results()
     
@@ -1467,7 +1505,7 @@ class BacktestStrategy(Strategy):
         result_id = getattr(self, 'result_id', None)
         if result_id is not None:
             # Single backtest mode - save to gold_results/{id}/
-            result_dir = os.path.join("gold_results", str(result_id))
+            result_dir = os.path.join(OUT_PATH, str(result_id))
             os.makedirs(result_dir, exist_ok=True)
             
             trades_df.to_csv(os.path.join(result_dir, f"backtest_trades_{self.asset}_{datetime.now().strftime('%Y%m%d')}.csv"), index=False)
@@ -1659,8 +1697,8 @@ class BacktestStrategy(Strategy):
         }
         
         # CSV filename in gold_results directory
-        os.makedirs("gold_results", exist_ok=True)
-        csv_filename = os.path.join("gold_results", "final_result.csv")
+        os.makedirs(OUT_PATH, exist_ok=True)
+        csv_filename = os.path.join(OUT_PATH, "final_result.csv")
         
         # Thread-safe CSV writing
         with FINAL_RESULT_LOCK:
@@ -1685,7 +1723,7 @@ class BacktestStrategy(Strategy):
 
 def _get_next_result_id():
     """Get the next available result ID by reading final_result.csv (thread-safe)"""
-    csv_filename = os.path.join("gold_results", "final_result.csv")
+    csv_filename = os.path.join(OUT_PATH, "final_result.csv")
     
     with FINAL_RESULT_LOCK:
         if not os.path.exists(csv_filename):
@@ -1725,8 +1763,13 @@ def _get_current_strategy_params():
     return current_params
 
 
-def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, params_dict, verbose=False, progress_prefix="", progress_line=None, direct_file_path=None):
-    """Run a single backtest with given parameters and return results"""
+def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, params_dict, verbose=False, progress_prefix="", progress_line=None, direct_file_path=None, save_individual_results=False):
+    """
+    Run a single backtest with given parameters and return results
+    
+    Args:
+        save_individual_results: If True, create gold_results/{id}/ folder with trades, equity, and plot (like single backtest mode)
+    """
     # Suppress output if not verbose (but allow progress through stderr)
     if not verbose:
         old_stdout = sys.stdout
@@ -1778,7 +1821,21 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
         # Run with progress shown even when not verbose
         results = backtest.run_backtest(show_progress=True, progress_prefix=progress_prefix, progress_line=progress_line, suppress_header=not verbose)
         
-        # Save summary to CSV after each backtest
+        # Save individual results if requested (create gold_results/{id}/ folder)
+        if save_individual_results and results is not None:
+            try:
+                # Get next available result ID
+                result_id = _get_next_result_id()
+                backtest.result_id = result_id
+                
+                # Generate report which will save to gold_results/{id}/ and final_result.csv
+                backtest.generate_report(results)
+            except Exception as e:
+                # Don't fail the backtest if individual result save fails
+                if verbose:
+                    print(f"⚠️  Warning: Failed to save individual results: {e}")
+        
+        # Save summary to CSV after each backtest (always save summary)
         if results is not None:
             try:
                 backtest.save_summary_to_csv(results, asset_name=asset_name)
@@ -1846,6 +1903,230 @@ def _generate_all_combinations():
     return combinations
 
 
+def _load_already_tested_strategies():
+    """
+    Load already-tested strategies from final_result.csv.
+    
+    Returns:
+        List of parameter dictionaries representing already-tested strategies.
+        Each dict contains all input parameters (strategy params + timeframe).
+    """
+    final_result_csv = os.path.join(OUT_PATH, "final_result.csv")
+    
+    if not os.path.exists(final_result_csv):
+        return []
+    
+    try:
+        df = pd.read_csv(final_result_csv)
+        
+        # Get all parameter column names (from OPTIMIZATION_CONFIG and FIXED_PARAMS)
+        param_columns = list(OPTIMIZATION_CONFIG.keys()) + list(FIXED_PARAMS.keys())
+        
+        tested_strategies = []
+        for idx, row in df.iterrows():
+            params_dict = {}
+            
+            # Extract strategy parameters
+            for param_name in param_columns:
+                if param_name in df.columns:
+                    value = row[param_name]
+                    if pd.notna(value):
+                        # Convert to appropriate type
+                        if param_name in OPTIMIZATION_CONFIG:
+                            if OPTIMIZATION_CONFIG[param_name]['range']:
+                                example_value = OPTIMIZATION_CONFIG[param_name]['range'][0]
+                                if isinstance(example_value, bool):
+                                    params_dict[param_name] = bool(value)
+                                elif isinstance(example_value, int):
+                                    params_dict[param_name] = int(value)
+                                elif isinstance(example_value, float):
+                                    params_dict[param_name] = float(value)
+                                elif isinstance(example_value, str):
+                                    params_dict[param_name] = str(value)
+                                else:
+                                    params_dict[param_name] = value
+                            else:
+                                params_dict[param_name] = value
+                        else:
+                            params_dict[param_name] = value
+            
+            # Add fixed params that might not be in CSV
+            for param_name, default_value in FIXED_PARAMS.items():
+                if param_name not in params_dict:
+                    params_dict[param_name] = default_value
+            
+            # Add timeframe if present
+            if 'timeframe' in df.columns and pd.notna(row['timeframe']):
+                params_dict['timeframe'] = str(row['timeframe'])
+            
+            tested_strategies.append(params_dict)
+        
+        return tested_strategies
+    
+    except Exception as e:
+        print(f"⚠️  Warning: Could not load already-tested strategies: {e}")
+        return []
+
+
+def _strategies_match(params1, params2):
+    """
+    Check if two parameter dictionaries represent the same strategy.
+    
+    Args:
+        params1: First parameter dictionary
+        params2: Second parameter dictionary
+    
+    Returns:
+        True if strategies match (all input parameters are the same), False otherwise
+    """
+    # Get all parameter names to compare (strategy params + timeframe)
+    param_names = list(OPTIMIZATION_CONFIG.keys()) + list(FIXED_PARAMS.keys()) + ['timeframe']
+    
+    for param_name in param_names:
+        val1 = params1.get(param_name)
+        val2 = params2.get(param_name)
+        
+        # Handle None/NaN comparisons
+        val1_is_nan = val1 is None or (isinstance(val1, float) and pd.isna(val1))
+        val2_is_nan = val2 is None or (isinstance(val2, float) and pd.isna(val2))
+        
+        if val1_is_nan and val2_is_nan:
+            continue
+        if val1_is_nan or val2_is_nan:
+            return False
+        
+        # Compare values (handle float precision for numeric comparisons)
+        # Also handle int vs float comparisons (e.g., 1.0 == 1)
+        if isinstance(val1, (int, float)) and isinstance(val2, (int, float)):
+            if abs(float(val1) - float(val2)) > 1e-10:
+                return False
+        elif isinstance(val1, bool) and isinstance(val2, bool):
+            if val1 != val2:
+                return False
+        elif isinstance(val1, str) and isinstance(val2, str):
+            if val1 != val2:
+                return False
+        else:
+            # Try direct comparison
+            if val1 != val2:
+                return False
+    
+    return True
+
+
+def _is_strategy_already_tested(params_dict, tested_strategies):
+    """
+    Check if a parameter combination has already been tested.
+    
+    Args:
+        params_dict: Parameter dictionary to check
+        tested_strategies: List of already-tested parameter dictionaries
+    
+    Returns:
+        True if already tested, False otherwise
+    """
+    for tested in tested_strategies:
+        if _strategies_match(params_dict, tested):
+            return True
+    return False
+
+
+def _load_parameter_combinations_from_csv(csv_file):
+    """
+    Load parameter combinations from a CSV file (e.g., filtered_backtest_results.csv).
+    Filters out strategies that have already been tested (exist in final_result.csv).
+    
+    Args:
+        csv_file: Path to CSV file containing strategy parameters
+    
+    Returns:
+        List of parameter dictionaries, each containing strategy parameters from one row.
+        If 'timeframe' column exists, it will be included in each dict.
+        Only returns strategies that haven't been tested yet.
+    """
+    if not os.path.exists(csv_file):
+        print(f"❌ Error: CSV file not found: {csv_file}")
+        return []
+    
+    try:
+        # Load already-tested strategies
+        print("🔍 Checking for already-tested strategies...")
+        tested_strategies = _load_already_tested_strategies()
+        if tested_strategies:
+            print(f"   Found {len(tested_strategies)} already-tested strategies in final_result.csv")
+        else:
+            print(f"   No existing results found (will test all strategies)")
+        
+        df = pd.read_csv(csv_file)
+        print(f"📊 Loaded {len(df)} parameter combinations from {csv_file}")
+        
+        # Get all parameter column names (from OPTIMIZATION_CONFIG and FIXED_PARAMS)
+        param_columns = list(OPTIMIZATION_CONFIG.keys()) + list(FIXED_PARAMS.keys())
+        
+        # Also check for timeframe column
+        has_timeframe = 'timeframe' in df.columns
+        
+        combinations = []
+        skipped_count = 0
+        
+        for idx, row in df.iterrows():
+            params_dict = {}
+            
+            # Extract strategy parameters
+            for param_name in param_columns:
+                if param_name in df.columns:
+                    value = row[param_name]
+                    # Handle NaN values - skip them (use default from strategyClass)
+                    if pd.notna(value):
+                        # Convert to appropriate type based on parameter
+                        if param_name in OPTIMIZATION_CONFIG:
+                            # Get the type from the first value in range
+                            if OPTIMIZATION_CONFIG[param_name]['range']:
+                                example_value = OPTIMIZATION_CONFIG[param_name]['range'][0]
+                                if isinstance(example_value, bool):
+                                    params_dict[param_name] = bool(value)
+                                elif isinstance(example_value, int):
+                                    params_dict[param_name] = int(value)
+                                elif isinstance(example_value, float):
+                                    params_dict[param_name] = float(value)
+                                elif isinstance(example_value, str):
+                                    params_dict[param_name] = str(value)
+                                else:
+                                    params_dict[param_name] = value
+                            else:
+                                params_dict[param_name] = value
+                        else:
+                            # Fixed param - keep as is
+                            params_dict[param_name] = value
+            
+            # Add fixed params that might not be in CSV
+            for param_name, default_value in FIXED_PARAMS.items():
+                if param_name not in params_dict:
+                    params_dict[param_name] = default_value
+            
+            # Add timeframe if present in CSV
+            if has_timeframe and 'timeframe' in df.columns and pd.notna(row['timeframe']):
+                params_dict['timeframe'] = str(row['timeframe'])
+            
+            # Check if this strategy has already been tested
+            if _is_strategy_already_tested(params_dict, tested_strategies):
+                skipped_count += 1
+                continue
+            
+            combinations.append(params_dict)
+        
+        print(f"✅ Extracted {len(combinations)} untested parameter combinations")
+        if skipped_count > 0:
+            print(f"⏭️  Skipped {skipped_count} already-tested strategies")
+        return combinations
+    
+    except Exception as e:
+        print(f"❌ Error reading CSV file {csv_file}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
 def _generate_random_combinations(num_samples, include_timeframe=False, available_timeframes=None):
     """
     Generate random parameter combinations to test.
@@ -1904,8 +2185,8 @@ def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000
     print(f"   Total combinations to test: {total_combinations:,}\n")
     
     # CSV filename - save to gold_results directory
-    os.makedirs("gold_results", exist_ok=True)
-    csv_filename = os.path.join("gold_results", f"optimization_results_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    os.makedirs(OUT_PATH, exist_ok=True)
+    csv_filename = os.path.join(OUT_PATH, f"optimization_results_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     
     # Progress tracking
     completed_count = 0
@@ -1917,8 +2198,8 @@ def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000
         
         # Create progress prefix showing which combination
         progress_prefix = f"   [Combo {combo_index + 1}/{total_combinations}] "
-        # Run backtest
-        results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, direct_file_path=direct_file_path)
+        # Run backtest (with individual results saving if enabled)
+        results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, direct_file_path=direct_file_path, save_individual_results=SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION)
         
         if results is None:
             return None
@@ -2000,9 +2281,10 @@ def optimize_strategy_multithreaded(asset_name, timeframe, initial_balance=50000
     return best_result, csv_filename
 
 
-def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0, max_loss=2000, max_workers=4, num_samples=100, direct_file_path=None, timeframes_list=None):
+def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0, max_loss=2000, max_workers=4, num_samples=100, direct_file_path=None, timeframes_list=None, csv_input_file=None):
     """
     Random search optimization: test random parameter combinations in parallel.
+    Can also read parameter combinations from CSV file if csv_input_file is provided.
     Saves results to CSV after each combination completes.
     
     Args:
@@ -2011,79 +2293,149 @@ def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0
         initial_balance: Starting balance
         max_loss: Maximum loss threshold
         max_workers: Number of parallel workers
-        num_samples: Number of random samples to test
+        num_samples: Number of random samples to test (ignored if csv_input_file is provided)
         direct_file_path: Optional direct file path (will be determined from timeframe if None)
         timeframes_list: List of timeframes to randomly choose from (e.g., ["5min", "30min", "1h"])
+        csv_input_file: Optional path to CSV file with parameter combinations (if provided, uses CSV instead of random)
     """
-    # Determine if we're using random timeframes
-    use_random_timeframes = (timeframe is None and timeframes_list is not None)
+    # Check if we should use CSV input
+    use_csv_input = csv_input_file is not None and os.path.exists(csv_input_file)
     
-    if use_random_timeframes:
+    # Initialize timeframe flags
+    use_random_timeframes = False
+    use_csv_timeframes = False
+    
+    if use_csv_input:
         print(f"\n{'='*60}")
-        print(f"🔍 Starting Random Search Optimization (with Random Timeframes)")
+        print(f"🔍 Starting Optimization from CSV Input")
         print(f"{'='*60}")
-        print(f"Asset: {asset_name} | Timeframes: {', '.join(timeframes_list)} (random)")
+        print(f"Asset: {asset_name}")
+        print(f"CSV File: {csv_input_file}")
         print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
-        print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
+        print(f"Max Workers: {max_workers}\n")
+        
+        # Load combinations from CSV
+        combinations = _load_parameter_combinations_from_csv(csv_input_file)
+        if not combinations:
+            print("❌ No valid parameter combinations found in CSV. Exiting.")
+            return None, None
+        
+        total_combinations = len(combinations)
+        print(f"   Loaded {total_combinations} parameter combinations from CSV\n")
+        
+        # Check if CSV has timeframe column
+        use_csv_timeframes = any('timeframe' in combo for combo in combinations)
     else:
-        print(f"\n{'='*60}")
-        print(f"🔍 Starting Random Search Optimization")
-        print(f"{'='*60}")
-        print(f"Asset: {asset_name} | Timeframe: {timeframe}")
-        print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
-        print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
+        # Determine if we're using random timeframes
+        use_random_timeframes = (timeframe is None and timeframes_list is not None)
+        
+        if use_random_timeframes:
+            print(f"\n{'='*60}")
+            print(f"🔍 Starting Random Search Optimization (with Random Timeframes)")
+            print(f"{'='*60}")
+            print(f"Asset: {asset_name} | Timeframes: {', '.join(timeframes_list)} (random)")
+            print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
+            print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
+        else:
+            print(f"\n{'='*60}")
+            print(f"🔍 Starting Random Search Optimization")
+            print(f"{'='*60}")
+            print(f"Asset: {asset_name} | Timeframe: {timeframe}")
+            print(f"Initial Balance: ${initial_balance:,.2f} | Max Loss: ${max_loss:,.2f}")
+            print(f"Max Workers: {max_workers} | Random Samples: {num_samples}\n")
+        
+        # Generate random combinations (with timeframe if using random timeframes)
+        print("📊 Generating random parameter combinations...")
+        combinations = _generate_random_combinations(num_samples, include_timeframe=use_random_timeframes, available_timeframes=timeframes_list)
+        total_combinations = len(combinations)
+        print(f"   Generated {total_combinations} random combinations to test\n")
     
-    # Generate random combinations (with timeframe if using random timeframes)
-    print("📊 Generating random parameter combinations...")
-    combinations = _generate_random_combinations(num_samples, include_timeframe=use_random_timeframes, available_timeframes=timeframes_list)
-    total_combinations = len(combinations)
-    print(f"   Generated {total_combinations} random combinations to test\n")
-    
-    # CSV filename - use single file if random timeframes, otherwise per timeframe
-    os.makedirs("gold_results", exist_ok=True)
-    if use_random_timeframes:
-        csv_filename = os.path.join("gold_results", f"optimization_results_all_timeframes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    # CSV filename - use single file if random timeframes or CSV input, otherwise per timeframe
+    os.makedirs(OUT_PATH, exist_ok=True)
+    if use_csv_input or use_csv_timeframes:
+        csv_filename = os.path.join(OUT_PATH, f"optimization_results_from_csv_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    elif use_random_timeframes:
+        csv_filename = os.path.join(OUT_PATH, f"optimization_results_all_timeframes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     else:
-        csv_filename = os.path.join("gold_results", f"optimization_results_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        csv_filename = os.path.join(OUT_PATH, f"optimization_results_{timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     
     # Progress tracking
     completed_count = 0
     progress_lock = Lock()
-    # Track which line each worker is using for progress display
-    worker_lines = {}  # {combo_index: line_number}
-    next_line = 0
+    # Track which line each sample is using for progress display
+    # Use a queue-based system to assign lines in order of execution start
+    available_lines = list(range(max_workers))  # Available line slots (0 to max_workers-1)
+    sample_to_line = {}  # {combo_index: line_number} - tracks which line each sample uses
+    line_to_sample = {}  # {line_number: combo_index} - reverse mapping to track which sample uses each line
     
     def run_and_save(combo, combo_index):
         """Run backtest and save result"""
-        nonlocal completed_count, next_line
+        nonlocal completed_count
         
-        # Extract timeframe from combo if present, otherwise use provided timeframe
-        combo_timeframe = combo.pop('timeframe', timeframe) if use_random_timeframes else timeframe
+        # Extract timeframe from combo if present (from CSV or random), otherwise use provided timeframe
+        if use_csv_timeframes and 'timeframe' in combo:
+            combo_timeframe = combo.pop('timeframe')
+        elif use_random_timeframes:
+            combo_timeframe = combo.pop('timeframe', timeframe)
+        else:
+            combo_timeframe = timeframe
+        
         combo_direct_file_path = direct_file_path
-        if use_random_timeframes and combo_timeframe in TIMEFRAME_FILE_MAP:
-            # Get file path for the randomly selected timeframe
-            combo_direct_file_path = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[combo_timeframe])
+        # Determine file path based on timeframe
+        if (use_csv_timeframes or use_random_timeframes) and combo_timeframe in TIMEFRAME_FILE_MAP:
+            # Get file path for the timeframe from CSV or random selection
+            combo_direct_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[combo_timeframe])
         
         # Assign a unique line number for this backtest's progress
+        # Use a queue-based system: assign next available line, reuse when sample completes
         with progress_lock:
-            if combo_index not in worker_lines:
-                worker_lines[combo_index] = next_line
-                next_line += 1
-            line_number = worker_lines[combo_index]
+            if combo_index not in sample_to_line:
+                # Get next available line (or reuse one if all are taken)
+                if available_lines:
+                    line_number = available_lines.pop(0)
+                else:
+                    # All lines in use, reuse the first one (oldest sample)
+                    # Find the oldest sample using a line
+                    oldest_line = min(line_to_sample.keys())
+                    old_sample = line_to_sample.pop(oldest_line)
+                    sample_to_line.pop(old_sample, None)
+                    line_number = oldest_line
+                
+                sample_to_line[combo_index] = line_number
+                line_to_sample[line_number] = combo_index
+            else:
+                line_number = sample_to_line[combo_index]
+        
+        # Calculate absolute line number: base offset + relative line number
+        # This ensures progress starts after "Starting multithreaded backtests..." message
+        absolute_line_number = progress_base_line_offset + line_number
         
         # Create progress prefix with line positioning
-        tf_display = f" [{combo_timeframe}]" if use_random_timeframes else ""
+        if use_csv_timeframes or use_random_timeframes:
+            tf_display = f" [{combo_timeframe}]"
+        else:
+            tf_display = ""
         progress_prefix = f"   [Sample {combo_index + 1}/{total_combinations}{tf_display}] "
-        # Run backtest with line number for progress display
-        results = _run_single_backtest(asset_name, combo_timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, progress_line=line_number, direct_file_path=combo_direct_file_path)
+        # Run backtest with absolute line number for progress display (with individual results saving if enabled)
+        results = _run_single_backtest(asset_name, combo_timeframe, initial_balance, max_loss, combo, verbose=False, progress_prefix=progress_prefix, progress_line=absolute_line_number, direct_file_path=combo_direct_file_path, save_individual_results=SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION)
+        
+        # Release the line when done
+        with progress_lock:
+            if combo_index in sample_to_line:
+                released_line = sample_to_line.pop(combo_index)
+                line_to_sample.pop(released_line, None)
+                # Add line back to available pool
+                if released_line not in available_lines:
+                    available_lines.append(released_line)
+                    available_lines.sort()  # Keep sorted for consistent assignment
         
         if results is None:
             return None
         
         # Create result row with all parameters and results
         result_row = combo.copy()
-        # Add timeframe to result if using random timeframes
-        if use_random_timeframes:
+        # Add timeframe to result if using CSV or random timeframes
+        if use_csv_timeframes or use_random_timeframes:
             result_row['timeframe'] = combo_timeframe
         result_row.update({
             'total_pnl': results['total_pnl'],
@@ -2113,13 +2465,24 @@ def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0
         with progress_lock:
             completed_count += 1
             progress_pct = (completed_count / total_combinations) * 100
-            tf_info = f" | TF: {combo_timeframe}" if use_random_timeframes else ""
+            tf_info = f" | TF: {combo_timeframe}" if (use_csv_timeframes or use_random_timeframes) else ""
             print(f"   [{completed_count}/{total_combinations}] ({progress_pct:.1f}%) Completed | P&L: ${results['total_pnl']:,.2f} | Trades: {results['total_trades']}{tf_info}")
         
         return result_row
     
     # Run with thread pool
-    print("🚀 Starting multithreaded backtests...\n")
+    print("🚀 Starting multithreaded backtests...")
+    # Reserve lines for progress display - each sample gets its own line
+    # Reserve enough lines for active workers (each worker can run one sample at a time)
+    # Add 10 extra lines to offset as requested
+    max_reserved_lines = max_workers
+    for _ in range(max_reserved_lines + 10):  # Reserve worker lines + 10 extra for spacing
+        print("", file=sys.stderr)  # Reserve lines for progress
+    sys.stderr.flush()
+    
+    # Update base line offset: lines start after "Starting..." message + 10 extra lines
+    progress_base_line_offset = 11  # Start after "Starting..." message (line 1) + 10 extra lines
+    
     best_result = None
     best_pnl = float('-inf')
     
@@ -2143,11 +2506,14 @@ def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0
     
     # Print summary
     print(f"\n{'='*60}")
-    print(f"✅ Random Search Optimization Complete")
+    if use_csv_input:
+        print(f"✅ CSV Input Optimization Complete")
+    else:
+        print(f"✅ Random Search Optimization Complete")
     print(f"{'='*60}")
     if best_result:
         print(f"🏆 Best Result:")
-        if use_random_timeframes and 'timeframe' in best_result:
+        if (use_csv_timeframes or use_random_timeframes) and 'timeframe' in best_result:
             print(f"   Timeframe: {best_result['timeframe']}")
         print(f"   Total P&L: ${best_result['total_pnl']:,.2f}")
         print(f"   Total Trades: {best_result['total_trades']}")
@@ -2201,7 +2567,7 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
     
     # Start with current configuration
     print("📊 Testing current configuration...")
-    current_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, best_params, verbose=True, direct_file_path=direct_file_path)
+    current_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, best_params, verbose=True, direct_file_path=direct_file_path, save_individual_results=SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION)
     if current_results is not None:
         best_pnl = current_results['total_pnl']
         print(f"   Current P&L: ${best_pnl:,.2f}\n")
@@ -2244,9 +2610,9 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
             test_params = best_params.copy()
             test_params[param_name] = test_value
             
-            # Run backtest with progress prefix
+            # Run backtest with progress prefix (with individual results saving if enabled)
             progress_prefix = f"   [{param_name}={test_value}] "
-            test_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, test_params, verbose=False, progress_prefix=progress_prefix, direct_file_path=direct_file_path)
+            test_results = _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, test_params, verbose=False, progress_prefix=progress_prefix, direct_file_path=direct_file_path, save_individual_results=SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION)
             
             # Store result
             results_dict[test_value] = test_results
@@ -2377,18 +2743,22 @@ def run_backtest_example(asset_name="MGCG6", timeframe="15min",
 if __name__ == "__main__":
     # Initialize data structures once
     initialize_backtest_data()
-    
-    # Calculate date range from 15min data if USE_FIRST_TENTH_ONLY is enabled
-    # This ensures all timeframes use the same date period
-    if USE_FIRST_TENTH_ONLY:
-        print("📅 Calculating date range from 15min data (first 10%)...")
-        _calculate_date_range_from_15min("MGCG6")
-        print()
-    
-    # Configuration for backtest
-    asset_name = "MGCG6"  # Gold contract from contracts.csv
+        # Configuration for backtest
+    asset_name = "MNQH6"  # Gold contract from contracts.csv
     initial_balance = 50000.0
     max_loss = 2000
+    
+    # Get optimal worker count (auto-detect or use manual setting)
+    optimal_workers = get_optimal_worker_count()
+    
+    # Calculate date range from 5min data if USE_FIRST_TENTH_ONLY is enabled
+    # This ensures all timeframes use the same date period (first 205 days from 5min data)
+    if USE_FIRST_TENTH_ONLY:
+        print("📅 Calculating date range from 5min data (first 205 days)...")
+        _calculate_date_range_from_5min(asset_name)
+        print()
+    
+
     
     # Timeframe selection
     # For single backtest: choose one timeframe ("5min", "30min", or "1h")
@@ -2396,23 +2766,34 @@ if __name__ == "__main__":
     SELECTED_TIMEFRAME = "15min"  # Change this to "5min", "30min", or "1h" for single backtest
     
     # Timeframes to test for optimization (skip 15min as already done)
-    timeframes_to_test = ["5min", "30min", "1h"]
+    timeframes_to_test = ["5min","15min", "30min", "1h"]
     
     # =================================================
     
     if RUN_OPTIMIZATION:
-        if USE_EXHAUSTIVE_SEARCH:
+        if USE_CSV_INPUT:
+            # CSV Input: read parameter combinations from CSV file
+            print(f"\n{'='*60}")
+            print(f"🔄 Optimization from CSV Input")
+            print(f"📂 CSV File: {CSV_INPUT_FILE}")
+            print(f"{'='*60}\n")
+            
+            optimize_strategy_random(asset_name, timeframe=None, initial_balance=initial_balance, max_loss=max_loss, 
+                                    max_workers=optimal_workers, num_samples=RANDOM_SEARCH_SAMPLES, 
+                                    direct_file_path=None, timeframes_list=timeframes_to_test, 
+                                    csv_input_file=CSV_INPUT_FILE)
+        elif USE_EXHAUSTIVE_SEARCH:
             # Exhaustive search: run for each timeframe separately
             for timeframe in timeframes_to_test:
                 # Get file path from mapping
                 if timeframe in TIMEFRAME_FILE_MAP:
-                    direct_file_path = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[timeframe])
+                    direct_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[timeframe])
                     print(f"\n{'='*60}")
                     print(f"🔄 Processing timeframe: {timeframe}")
                     print(f"📂 Data file: {direct_file_path}")
                     print(f"{'='*60}\n")
                     
-                    optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, MAX_WORKERS, direct_file_path=direct_file_path)
+                    optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, optimal_workers, direct_file_path=direct_file_path)
                 else:
                     print(f"⚠️  Warning: No file mapping for timeframe {timeframe}, skipping...")
         else:
@@ -2423,12 +2804,12 @@ if __name__ == "__main__":
             print(f"{'='*60}\n")
             
             optimize_strategy_random(asset_name, timeframe=None, initial_balance=initial_balance, max_loss=max_loss, 
-                                    max_workers=MAX_WORKERS, num_samples=RANDOM_SEARCH_SAMPLES, 
+                                    max_workers=optimal_workers, num_samples=RANDOM_SEARCH_SAMPLES, 
                                     direct_file_path=None, timeframes_list=timeframes_to_test)
     else:
         # Run single backtest for selected timeframe
         if SELECTED_TIMEFRAME in TIMEFRAME_FILE_MAP:
-            direct_file_path = os.path.join("data", "MGCG6", TIMEFRAME_FILE_MAP[SELECTED_TIMEFRAME])
+            direct_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[SELECTED_TIMEFRAME])
             print(f"\n{'='*60}")
             print(f"🔄 Processing timeframe: {SELECTED_TIMEFRAME}")
             print(f"📂 Data file: {direct_file_path}")
