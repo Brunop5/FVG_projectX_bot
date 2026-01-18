@@ -119,19 +119,20 @@ bool IsMarketOK()
    if(CopyBuffer(atrHandle, 0, 0, 20, atrBuf) < 20)
       return false;
 
-   double atrOK = atrBuf[1] > atrBuf[19];  // Current ATR > SMA of ATR (simplified)
+   bool atrOK = atrBuf[1] > atrBuf[19];  // Current ATR > SMA of ATR (simplified)
 
-   if(!UseVolumeCheck) return atrOK;
+   if(UseVolumeCheck == false) return atrOK;
 
    // Volume check
    long volBuf[];
    ArraySetAsSeries(volBuf, true);
-   if(CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, 20, volBuf) < 20)
+   int copied = (int)CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, 20, volBuf);
+   if(copied < 20)
       return atrOK;
 
-   double avgVol = 0;
+   double avgVol = 0.0;
    for(int i=1; i<20; i++)
-      avgVol += volBuf[i];
+      avgVol += (double)volBuf[i];
    avgVol /= 19.0;
 
    bool volOK = volBuf[1] > (avgVol * VolumeMultiplier);
