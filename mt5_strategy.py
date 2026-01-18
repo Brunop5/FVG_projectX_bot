@@ -28,15 +28,15 @@ metadata_lock = threading.Lock()
 
 # ==================== MT5 CONFIGURATION ====================
 # MT5 Account Settings
-MT5_LOGIN = None  # Set your MT5 account number
-MT5_PASSWORD = None  # Set your MT5 password
-MT5_SERVER = None  # Set your MT5 server name (e.g., "MetaQuotes-Demo" or broker-specific)
-MT5_PATH = None  # Path to MT5 terminal (optional, will use default if None)
+MT5_LOGIN = os.getenv("LOGIN")
+MT5_PASSWORD = os.getenv("PASSWORD")
+MT5_SERVER = os.getenv("SERVER")
+MT5_PATH = r"C:\Program Files\InstaForex MT5 Terminal\terminal64.exe"
 
 # Asset mapping: Map strategyClass asset IDs to MT5 symbols
 # Format: {"CON.F.US.GCE.G26": "GOLD", "CON.F.US.MNQ.H26": "MNQ", ...}
 MT5_SYMBOL_MAP = {
-    "CON.F.US.GCE.G26": "GOLD",
+    "CON.F.US.GCE.G26": "GOLD.m",
     "CON.F.US.MNQ.H26": "MNQ",
     # Add more mappings as needed
 }
@@ -341,9 +341,9 @@ class MT5Strategy(Strategy):
             self.isBearishHTF = None
         else:
             htfEMA = ema(bars, EMA_PERIOD)
-            if htfEMA is not None and len(htfEMA) > 0:
-                self.isBullishHTF = self.cur_close > htfEMA.iloc[-1]
-                self.isBearishHTF = self.cur_close < htfEMA.iloc[-1]
+            if htfEMA is not None:
+                self.isBullishHTF = self.cur_close > htfEMA
+                self.isBearishHTF = self.cur_close < htfEMA
             else:
                 self.isBullishHTF = None
                 self.isBearishHTF = None
