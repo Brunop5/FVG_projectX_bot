@@ -11,21 +11,21 @@ metadata_lock = threading.Lock()
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 15              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 1              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.02          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
+HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
 EMA_PERIOD = 25                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.25
+VOLUME_MULTIPLIER = 1.0
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 18                    # ATR Period (min 1)
-SL_MULTIPLIER = 6                # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 19                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 14                    # ATR Period (min 1)
+SL_MULTIPLIER = 4.5                # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 17                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
@@ -36,7 +36,7 @@ HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 1                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 1.8                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -46,7 +46,7 @@ MAX_DAILY_TRADES = 3               # Maximum trades per day (formerly MaxDailyTr
 # Assets and API Settings
 # list of asset, timeframe and account name combinations;
 # format: [(asset1, timeframe1, account_name1), (asset2, timeframe2, account1), (..., ..., account2), ...]
-ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-38617147"), ("CON.F.US.MNQ.H26", "5min", "50KTC-V2-252499-66765377")]
+ASSETS = [("CON.F.US.GCE.G26","1h", "50KTC-V2-252499-38617147")]
 
 USERNAME = os.getenv("USERNAME")
 API_KEY = os.getenv("API_KEY")
@@ -706,7 +706,7 @@ def validation_thread(auth_token, strategies: list[Strategy]):
 if __name__ == "__main__":
     #global_token = init_api()
     # ("CON.F.US.CLE.G26", 3), 
-    assets = [("CON.F.US.MGC.G26", 0.5), ("CON.F.US.GCE.G26", 3.1)
+    assets = [("CON.F.US.MGC.G26", 0.5), ("CON.F.US.GCE.G26", 3.1),
               ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5), ("CON.F.US.MNQ.H26", 0.74)]
 
     gather_historical_data(assets)
