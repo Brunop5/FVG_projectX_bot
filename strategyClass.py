@@ -36,7 +36,7 @@ HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 1                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 5                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -46,7 +46,7 @@ MAX_DAILY_TRADES = 3               # Maximum trades per day (formerly MaxDailyTr
 # Assets and API Settings
 # list of asset, timeframe and account name combinations;
 # format: [(asset1, timeframe1, account_name1), (asset2, timeframe2, account1), (..., ..., account2), ...]
-ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-38617147"), ("CON.F.US.MNQ.H26", "5min", "50KTC-V2-252499-66765377")]
+ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-38617147")]
 
 USERNAME = os.getenv("USERNAME")
 API_KEY = os.getenv("API_KEY")
@@ -58,7 +58,7 @@ LIVE = False  # or False
 UPDATE_CONTRACT_LIST = False
 
 # if true it will print the list of valid accounts for this api key
-SHOW_ACCOUNTS = False
+SHOW_ACCOUNTS = True
 # ======== if any of those two is true, it will run the option, but not the strategy
 
 
@@ -651,8 +651,13 @@ class Strategy:
         while True:
             sleep(10)
             new_row = fetch_data(self.asset, "10s", 1, self.auth_token, LIVE)
-            if new_row is None:
-                return
+            if new_row is None or len(new_row) == 0:
+                continue  # Skip this iteration if no data, but keep running
+            
+            # Check if 'close' column exists
+            if 'close' not in new_row.columns:
+                print(f"⚠️  Warning: 'close' column not found in data. Available columns: {new_row.columns.tolist()}")
+                continue
 
             self.cur_price = new_row["close"].iloc[-1]
             print(f"updated price: {self.cur_price}")
@@ -704,50 +709,46 @@ def validation_thread(auth_token, strategies: list[Strategy]):
 
 
 if __name__ == "__main__":
-    #global_token = init_api()
-    # ("CON.F.US.CLE.G26", 3), 
-    assets = [("CON.F.US.MGC.G26", 0.5), ("CON.F.US.GCE.G26", 3.1)
-              ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5), ("CON.F.US.MNQ.H26", 0.74)]
+    global_token = init_api()
 
-    gather_historical_data(assets)
     
-    # if UPDATE_CONTRACT_LIST:
-    #     strat = Strategy(ASSETS[0])
-    #     strat.set_token(global_token)
-    #     strat.init_rest()
-    #     data = strat.get_assets()
-    #     data = pd.DataFrame(data)
-    #     data.to_csv("contracts.csv")
-    #     print("Contract list updated successfully!!")
-    # elif SHOW_ACCOUNTS:
-    #     strat = Strategy(ASSETS[0])
-    #     strat.set_token(global_token)
-    #     print(get_account_id(strat.auth_token, show=True))
+    if UPDATE_CONTRACT_LIST:
+        strat = Strategy(ASSETS[0])
+        strat.set_token(global_token)
+        strat.init_rest()
+        data = strat.get_assets()
+        data = pd.DataFrame(data)
+        data.to_csv("contracts.csv")
+        print("Contract list updated successfully!!")
+    elif SHOW_ACCOUNTS:
+        strat = Strategy(ASSETS[0])
+        strat.set_token(global_token)
+        print(get_account_id(strat.auth_token, show=True))
 
-    # else:
-    #     threads = []
-    #     strats = []
-    #     for asset_pair in ASSETS:
-    #         strats.append(Strategy(asset_pair))
+    else:
+        threads = []
+        strats = []
+        for asset_pair in ASSETS:
+            strats.append(Strategy(asset_pair))
         
-    #     v_thread = threading.Thread(
-    #         target = validation_thread,
-    #         args = (global_token, strats,),
-    #         daemon=True
-    #     )
-    #     v_thread.start()
+        v_thread = threading.Thread(
+            target = validation_thread,
+            args = (global_token, strats,),
+            daemon=True
+        )
+        v_thread.start()
 
-    #     for strat in strats:
-    #         t = threading.Thread(
-    #             target=run_strat,
-    #             args=(strat, global_token,),
-    #             daemon=True
-    #         )
-    #         t.start()
-    #         threads.append(t)
+        for strat in strats:
+            t = threading.Thread(
+                target=run_strat,
+                args=(strat, global_token,),
+                daemon=True
+            )
+            t.start()
+            threads.append(t)
 
 
 
-    # while True:
-    #     time.sleep(5)
+    while True:
+        time.sleep(5)
             
