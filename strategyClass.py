@@ -11,21 +11,21 @@ metadata_lock = threading.Lock()
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 15              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 1              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.02          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
+HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
 EMA_PERIOD = 25                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.25
+VOLUME_MULTIPLIER = 1.0
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 18                    # ATR Period (min 1)
-SL_MULTIPLIER = 6                # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 19                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 14                    # ATR Period (min 1)
+SL_MULTIPLIER = 4.5                # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 17                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
@@ -709,46 +709,50 @@ def validation_thread(auth_token, strategies: list[Strategy]):
 
 
 if __name__ == "__main__":
-    global_token = init_api()
+    #global_token = init_api()
+    # ("CON.F.US.CLE.G26", 3), 
+    assets = [("CON.F.US.MGC.G26", 0.5), ("CON.F.US.GCE.G26", 3.1),
+              ("CON.F.US.YM.H26", 0.5), ("CON.F.US.SIL.H26", 0.5), ("CON.F.US.MNQ.H26", 0.74)]
 
+    gather_historical_data(assets)
     
-    if UPDATE_CONTRACT_LIST:
-        strat = Strategy(ASSETS[0])
-        strat.set_token(global_token)
-        strat.init_rest()
-        data = strat.get_assets()
-        data = pd.DataFrame(data)
-        data.to_csv("contracts.csv")
-        print("Contract list updated successfully!!")
-    elif SHOW_ACCOUNTS:
-        strat = Strategy(ASSETS[0])
-        strat.set_token(global_token)
-        print(get_account_id(strat.auth_token, show=True))
+    # if UPDATE_CONTRACT_LIST:
+    #     strat = Strategy(ASSETS[0])
+    #     strat.set_token(global_token)
+    #     strat.init_rest()
+    #     data = strat.get_assets()
+    #     data = pd.DataFrame(data)
+    #     data.to_csv("contracts.csv")
+    #     print("Contract list updated successfully!!")
+    # elif SHOW_ACCOUNTS:
+    #     strat = Strategy(ASSETS[0])
+    #     strat.set_token(global_token)
+    #     print(get_account_id(strat.auth_token, show=True))
 
-    else:
-        threads = []
-        strats = []
-        for asset_pair in ASSETS:
-            strats.append(Strategy(asset_pair))
+    # else:
+    #     threads = []
+    #     strats = []
+    #     for asset_pair in ASSETS:
+    #         strats.append(Strategy(asset_pair))
         
-        v_thread = threading.Thread(
-            target = validation_thread,
-            args = (global_token, strats,),
-            daemon=True
-        )
-        v_thread.start()
+    #     v_thread = threading.Thread(
+    #         target = validation_thread,
+    #         args = (global_token, strats,),
+    #         daemon=True
+    #     )
+    #     v_thread.start()
 
-        for strat in strats:
-            t = threading.Thread(
-                target=run_strat,
-                args=(strat, global_token,),
-                daemon=True
-            )
-            t.start()
-            threads.append(t)
+    #     for strat in strats:
+    #         t = threading.Thread(
+    #             target=run_strat,
+    #             args=(strat, global_token,),
+    #             daemon=True
+    #         )
+    #         t.start()
+    #         threads.append(t)
 
 
 
-    while True:
-        time.sleep(5)
+    # while True:
+    #     time.sleep(5)
             
