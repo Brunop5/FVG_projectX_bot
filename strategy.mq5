@@ -1,5 +1,5 @@
 #property copyright "Gildo REDACTED_USERNAME"
-#property link      "https://www.primetechmall.com"
+#property link      https://www.primetechmall.com
 #property version   "1.11"
 #property strict
 
@@ -7,33 +7,43 @@
 CTrade trade;
 
 // ================= INPUTS =================
-input ENUM_TIMEFRAMES HTF_TF = PERIOD_H4;
-input int EMA_Period = 50;
-input int ATR_Period = 14;
+input ENUM_TIMEFRAMES HTF_TF = PERIOD_W1;
+input int EMA_Period = 25;
+input int ATR_Period = 18;
 
-input double MinFVGPowerPct = 0.25;
+input double MinFVGPowerPct = 0.01;
 input int    FVGHistoryNbr  = 15;  // Number of FVGs to track (replaces hardcoded 10 and 50)
 
-input double SL_ATR_Mult = 4.0;
-input double TP_ATR_Mult = 20.0;
+input double SL_ATR_Mult = 1.0;
+input double TP_ATR_Mult = 19.0;
 
 input bool   UseTrailing   = true;
-input double TrailATRMult  = 6.0;
+input double TrailATRMult  = 2.0;
 
-input bool   UseFixedLot = true;
-input double FixedLot    = 0.10;
-input double RiskPercent = 1.0;
+input bool   UseBreakEvenMove = false;  // Move SL to entry at X ATR profit
+input double BreakEvenATRMult = 1.0;    // ATR multiple to trigger break-even move
+
+input bool   UsePartialTP = false;      // Close N trades at X ATR profit
+input double PartialTPATRMult = 1.0;    // ATR multiple to trigger partial close
+input int    PartialCloseTradesCount = 1; // Number of trades to close at partial TP
+
+bool   UseFixedLot = true;
+double FixedLot    = 0.10;
+double RiskPercent = 1.0;
+
+input double PerTradeLot = 0.01;  // Lot size per trade
+input int    TradeSplitCount = 1; // Number of trades to open at once
 
 input int LiquidityLookback = 20;
 
-input bool RequireLiquiditySweep = false;
 input bool RequireBiasAlignment  = true;
-input bool DebugMode              = true;
 
-input int    MaxDailyTrades = 3;  // Maximum trades per day
-input bool   UseVolumeCheck = true;  // Enable volume check
-input double VolumeMultiplier = 1.25;  // Volume multiplier for marketOK check
+input int    MaxDailyTrades = 10;  // Maximum trades per day
+input bool   UseVolumeCheck = false;  // Enable volume check
+input double VolumeMultiplier = 5;  // Volume multiplier for marketOK check
 input bool   HoldUntilOpposite = false;  // Close on opposite BOS/CHoCH
+input bool   AllowIntracandleChecks = false;  // If true: check price every tick for FVG touch
+int    MagicNumber = 20260120;  // Magic number to track EA positions
 
 // ================= STRUCTS =================
 struct FVG
@@ -50,7 +60,10 @@ struct TradeState
    bool hasPosition;
    bool isLong;
    double entryATR;
+   double entryPrice;
    double takeProfit;
+   bool breakEvenDone;
+   bool partialDone;
 };
 
 // ================= GLOBALS =================
@@ -63,6 +76,9 @@ datetime lastTradeDate = 0;
 bool isBOS = false;
 bool isCHOCH = false;
 
+bool lastBullFvg = false;
+bool lastBearFvg = false;
+
 TradeState tradeState;
 MqlRates rates[];
 
@@ -74,7 +90,9 @@ int atrHandle    = INVALID_HANDLE;
 // ================= INIT =================
 int OnInit()
 {
-   htfEmaHandle = iMA(_Symbol, HTF_TF, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   trade.SetExpertMagicNumber(MagicNumber);
+   htfEmaHandle = iMA(_Symbol, HTF_TF, EMA_Period, 0, MODE_EMA,
+PRICE_CLOSE);
    atrHandle    = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
 
    if(htfEmaHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE)
@@ -107,7 +125,98 @@ bool IsNewBar()
 
 bool HasPosition()
 {
-   return PositionSelect(_Symbol);
+   int total = PositionsTotal();
+   for(int i=0; i<total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      return true;
+   }
+   return false;
+}
+
+int GetPositionTickets(bool isLong, ulong &tickets[])
+{
+   ArrayResize(tickets, 0);
+   int total = PositionsTotal();
+   for(int i=0; i<total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      bool posLong = PositionGetInteger(POSITION_TYPE) ==
+POSITION_TYPE_BUY;
+      if(posLong != isLong) continue;
+      int newSize = ArraySize(tickets) + 1;
+      ArrayResize(tickets, newSize);
+      tickets[newSize - 1] = ticket;
+   }
+   return ArraySize(tickets);
+}
+
+double NormalizeLotToStep(double lots)
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(step <= 0) return lots;
+   double steps = lots / step;
+   double roundedSteps = MathFloor(steps + 0.5);
+   double normLots = roundedSteps * step;
+   if(normLots < minLot) normLots = minLot;
+   if(normLots > maxLot) normLots = maxLot;
+   return NormalizeDouble(normLots, 2);
+}
+
+double AdjustStopForStopLevel(double desiredSL, bool isLong)
+{
+   double stopLevel = SymbolInfoInteger(_Symbol,
+SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   if(stopLevel <= 0) return desiredSL;
+   MqlTick tick;
+   if(!SymbolInfoTick(_Symbol, tick) || tick.bid <= 0 || tick.ask <= 0)
+      return 0;
+   double bid = tick.bid;
+   double ask = tick.ask;
+   double curPrice = isLong ? bid : ask;
+   if(isLong)
+   {
+      if(curPrice - desiredSL < stopLevel)
+         desiredSL = curPrice - stopLevel;
+   }
+   else
+   {
+      if(desiredSL - curPrice < stopLevel)
+         desiredSL = curPrice + stopLevel;
+   }
+   return desiredSL;
+}
+
+void UpdateStopsForPositions(bool isLong, double newSL)
+{
+   ulong tickets[];
+   int count = GetPositionTickets(isLong, tickets);
+   if(count == 0) return;
+   for(int i=0; i<count; i++)
+   {
+      if(!PositionSelectByTicket(tickets[i])) continue;
+      double curSL = PositionGetDouble(POSITION_SL);
+      double curTP = PositionGetDouble(POSITION_TP);
+      if(curSL != 0)
+      {
+         if(isLong && newSL <= curSL) continue;
+         if(!isLong && newSL >= curSL) continue;
+      }
+      if(!trade.PositionModify(tickets[i], newSL, curTP))
+      {
+         Print("? Failed to modify SL. Ticket: ", tickets[i],
+               " | Retcode: ", trade.ResultRetcode(),
+               " | ", trade.ResultRetcodeDescription());
+      }
+   }
 }
 
 // ================= MARKET REGIME =================
@@ -126,7 +235,8 @@ bool IsMarketOK()
    // Volume check
    long volBuf[];
    ArraySetAsSeries(volBuf, true);
-   int copied = (int)CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, 20, volBuf);
+   int copied = (int)CopyTickVolume(_Symbol, PERIOD_CURRENT, 0, 20,
+volBuf);
    if(copied < 20)
       return atrOK;
 
@@ -167,16 +277,26 @@ void DetectFVG()
    bool bullFVG = rates[3].high < rates[1].low;
    bool bearFVG = rates[3].low  > rates[1].high;
 
+   // Match Python: use lastBullFvg/lastBearFvg toggles
+   lastBullFvg = bullFVG && !lastBullFvg;
+   lastBearFvg = bearFVG && !lastBearFvg;
+
    double gapClose = rates[2].close;
    if(gapClose <= 0) return;
 
-   if(bullFVG)
+   if(lastBullFvg)
    {
       double gap = rates[1].low - rates[3].high;
       double power = (gap / gapClose) * 100.0;
 
       if(power >= MinFVGPowerPct)
       {
+         if(fvgCount >= FVGHistoryNbr)
+         {
+            for(int i=1;i<fvgCount;i++)
+               fvgList[i-1] = fvgList[i];
+            fvgCount--;
+         }
          fvgList[fvgCount].top     = rates[1].low;
          fvgList[fvgCount].bottom = rates[3].high;
          fvgList[fvgCount].bullish= true;
@@ -186,13 +306,19 @@ void DetectFVG()
       }
    }
 
-   if(bearFVG)
+   if(lastBearFvg)
    {
       double gap = rates[3].low - rates[1].high;
       double power = (gap / gapClose) * 100.0;
 
       if(power >= MinFVGPowerPct)
       {
+         if(fvgCount >= FVGHistoryNbr)
+         {
+            for(int i=1;i<fvgCount;i++)
+               fvgList[i-1] = fvgList[i];
+            fvgCount--;
+         }
          fvgList[fvgCount].top     = rates[3].low;
          fvgList[fvgCount].bottom = rates[1].high;
          fvgList[fvgCount].bullish= false;
@@ -200,14 +326,6 @@ void DetectFVG()
          fvgList[fvgCount].time   = rates[2].time;
          fvgCount++;
       }
-   }
-
-   // Limit to FVGHistoryNbr (remove oldest if exceeded)
-   if(fvgCount > FVGHistoryNbr)
-   {
-      for(int i=1;i<fvgCount;i++)
-         fvgList[i-1] = fvgList[i];
-      fvgCount--;
    }
 }
 
@@ -230,13 +348,13 @@ double GetLot(double slDist)
 bool CheckDailyTradeLimit()
 {
    datetime today = iTime(_Symbol, PERIOD_D1, 0);
-   
+
    if(lastTradeDate != today)
    {
       dailyTradesCount = 0;
       lastTradeDate = today;
    }
-   
+
    return dailyTradesCount < MaxDailyTrades;
 }
 
@@ -244,24 +362,27 @@ bool CheckDailyTradeLimit()
 void CalcBOSandCHOCH()
 {
    if(ArraySize(rates) < 21) return;
-   
+
    double prevStructureHigh = rates[20].high;
    double prevStructureLow = rates[20].low;
-   
+
    for(int i=19; i>=1; i--)
    {
-      if(rates[i].high > prevStructureHigh) prevStructureHigh = rates[i].high;
+      if(rates[i].high > prevStructureHigh) prevStructureHigh =
+rates[i].high;
       if(rates[i].low < prevStructureLow) prevStructureLow = rates[i].low;
    }
-   
+
    double prevClose = rates[2].close;
    double curClose = rates[1].close;
-   
+
    // BOS: crossover(close, prevStructureHigh)
-   isBOS = (prevClose <= prevStructureHigh) && (curClose > prevStructureHigh);
-   
+   isBOS = (prevClose <= prevStructureHigh) && (curClose >
+prevStructureHigh);
+
    // CHoCH: crossunder(close, prevStructureLow)
-   isCHOCH = (prevClose >= prevStructureLow) && (curClose < prevStructureLow);
+   isCHOCH = (prevClose >= prevStructureLow) && (curClose <
+prevStructureLow);
 }
 
 // ================= ENTRY =================
@@ -295,31 +416,67 @@ void TryEntry()
          if(!isLong && bias > 0) continue;
       }
 
-      bool touch = rates[1].low <= fvgList[i].top &&
-                   rates[1].high >= fvgList[i].bottom;
+      bool touch = false;
+      double entry = 0.0;
+      if(AllowIntracandleChecks)
+      {
+         // Intrabar: check current price inside FVG zone
+         double currentPrice = isLong ? ask : bid;
+         touch = currentPrice <= fvgList[i].top && currentPrice >=
+fvgList[i].bottom;
+         // Enter at FVG boundary (same as backtest intrabar option)
+         entry = isLong ? fvgList[i].top : fvgList[i].bottom;
+      }
+      else
+      {
+         // Bar-close: use last closed bar overlap
+         touch = rates[1].low <= fvgList[i].top &&
+               rates[1].high >= fvgList[i].bottom;
+         entry = isLong ? ask : bid;
+      }
       if(!touch) continue;
 
-      double entry = isLong ? ask : bid;
       double slDist = atrNorm * SL_ATR_Mult * _Point;
       double tpDist = atrNorm * TP_ATR_Mult * _Point;
 
       double sl = isLong ? entry - slDist : entry + slDist;
       double tp = isLong ? entry + tpDist : entry - tpDist;
 
-      double lot = GetLot(slDist);
-      if(lot <= 0) continue;
+      double perTradeLot = NormalizeLotToStep(PerTradeLot);
+      int tradesToOpen = TradeSplitCount;
+      if(perTradeLot <= 0 || tradesToOpen <= 0)
+      {
+         double lot = GetLot(slDist);
+         perTradeLot = NormalizeLotToStep(lot);
+         tradesToOpen = 1;
+      }
+      if(perTradeLot <= 0) continue;
 
-      bool ok = isLong
-         ? trade.Buy(lot,_Symbol,entry,sl,tp)
-         : trade.Sell(lot,_Symbol,entry,sl,tp);
+      int opened = 0;
+      for(int t=0; t<tradesToOpen; t++)
+      {
+         double orderPrice = 0.0; // market price
+         bool ok = isLong
+            ? trade.Buy(perTradeLot,_Symbol,orderPrice,sl,tp)
+            : trade.Sell(perTradeLot,_Symbol,orderPrice,sl,tp);
+         if(ok) opened++;
+         else
+         {
+            Print("? Order failed. Retcode: ", trade.ResultRetcode(),
+                  " | ", trade.ResultRetcodeDescription());
+         }
+      }
 
-      if(ok)
+      if(opened > 0)
       {
          fvgList[i].traded = true;
          tradeState.hasPosition = true;
          tradeState.isLong = isLong;
          tradeState.entryATR = atr;
+         tradeState.entryPrice = entry;
          tradeState.takeProfit = tp;
+         tradeState.breakEvenDone = false;
+         tradeState.partialDone = false;
          dailyTradesCount++;
          lastTradeDate = iTime(_Symbol, PERIOD_D1, 0);
          return;
@@ -331,7 +488,7 @@ void TryEntry()
 void ManageTrade()
 {
    if(!HasPosition()) return;
-   
+
    // Check BOS/CHoCH exits first
    if(HoldUntilOpposite)
    {
@@ -341,7 +498,7 @@ void ManageTrade()
          tradeState.hasPosition = false;
          return;
       }
-      
+
       if(!tradeState.isLong && isBOS)
       {
          trade.PositionClose(_Symbol);
@@ -349,48 +506,102 @@ void ManageTrade()
          return;
       }
    }
-   
+
+   bool isLong = tradeState.isLong;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double curPrice = isLong ? bid : ask;
+
+   // Break-even move
+   if(UseBreakEvenMove && !tradeState.breakEvenDone &&
+tradeState.entryATR > 0)
+   {
+      double beTrigger = isLong
+         ? tradeState.entryPrice + tradeState.entryATR * BreakEvenATRMult
+         : tradeState.entryPrice - tradeState.entryATR * BreakEvenATRMult;
+      bool hit = isLong ? (curPrice >= beTrigger) : (curPrice <=
+beTrigger);
+      if(hit)
+      {
+         double beSL = AdjustStopForStopLevel(tradeState.entryPrice,
+isLong);
+         beSL = NormalizeDouble(beSL, _Digits);
+         UpdateStopsForPositions(isLong, beSL);
+         tradeState.breakEvenDone = true;
+      }
+   }
+
+   // Partial close by number of trades
+   if(UsePartialTP && !tradeState.partialDone && tradeState.entryATR > 0)
+   {
+      double partialTrigger = isLong
+         ? tradeState.entryPrice + tradeState.entryATR * PartialTPATRMult
+         : tradeState.entryPrice - tradeState.entryATR * PartialTPATRMult;
+      bool hit = isLong ? (curPrice >= partialTrigger) : (curPrice <=
+partialTrigger);
+      if(hit)
+      {
+         ulong tickets[];
+         int count = GetPositionTickets(isLong, tickets);
+         int toClose = MathMin(PartialCloseTradesCount, count);
+         int closed = 0;
+         for(int i=0; i<toClose; i++)
+         {
+            if(trade.PositionClose(tickets[i]))
+               closed++;
+         }
+         if(closed > 0)
+            tradeState.partialDone = true;
+      }
+   }
+
    if(!UseTrailing) return;
 
-   double price = tradeState.isLong ? rates[0].high : rates[0].low;
-   double newSL = tradeState.isLong
+   double price = isLong ? rates[0].high : rates[0].low;
+   double newSL = isLong
       ? price - tradeState.entryATR * TrailATRMult
       : price + tradeState.entryATR * TrailATRMult;
 
+   newSL = AdjustStopForStopLevel(newSL, isLong);
+
    newSL = NormalizeDouble(newSL,_Digits);
-
-   double curSL = PositionGetDouble(POSITION_SL);
-   if(curSL == 0) return;
-
-   if(tradeState.isLong && newSL <= curSL) return;
-   if(!tradeState.isLong && newSL >= curSL) return;
-
-   trade.PositionModify(_Symbol,newSL,tradeState.takeProfit);
+   UpdateStopsForPositions(isLong, newSL);
 }
 
 // ================= ON TICK =================
 void OnTick()
 {
-   if(CopyRates(_Symbol,PERIOD_CURRENT,0,LiquidityLookback+25,rates) < LiquidityLookback+25)
+if(CopyRates(_Symbol,PERIOD_CURRENT,0,LiquidityLookback+25,rates) <
+LiquidityLookback+25)
       return;
 
    if(IsNewBar())
    {
       DetectFVG();
       CalcBOSandCHOCH();
-      TryEntry();
+      if(!AllowIntracandleChecks)
+         TryEntry();
    }
-   
+
+   if(AllowIntracandleChecks)
+      TryEntry();
+
    // Update position state (check if position still exists)
    if(!HasPosition())
    {
       tradeState.hasPosition = false;
+      tradeState.breakEvenDone = false;
+      tradeState.partialDone = false;
    }
-   else if(tradeState.hasPosition)
+   else
    {
+      tradeState.hasPosition = true;
       // Update isLong if position exists
-      tradeState.isLong = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
-   }
-
+      ulong tickets[];
+      int countLong = GetPositionTickets(true, tickets);
+      int countShort = GetPositionTickets(false, tickets);
+      if(countLong > 0) tradeState.isLong = true;
+      else if(countShort > 0) tradeState.isLong = false;
+   } 
    ManageTrade();
 }

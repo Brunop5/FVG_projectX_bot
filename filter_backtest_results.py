@@ -26,6 +26,9 @@ print(f"Total rows in original CSV: {len(df)}")
 # total_pnl is at least 5000
 filtered_df = df[df['total_pnl'] >= MIN_TOTAL_PNL]
 
+filtered_df = filtered_df[filtered_df['SL_MULTIPLIER'] > 1]
+filtered_df = filtered_df[filtered_df['TP_MULTIPLIER'] > 1]
+filtered_df = filtered_df[filtered_df['TRAIL_OFFSET_MULT'] > 1]
 # max_drawdown is not more than 3000 (<= 3000)
 #filtered_df = filtered_df[filtered_df['max_drawdown'] <= MAX_DRAWDOWN]
 
