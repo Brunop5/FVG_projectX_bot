@@ -107,7 +107,10 @@ USE_CSV_INPUT = False  # If True: read parameter combinations from CSV file inst
 CSV_INPUT_FILE = "filtered_backtest_results.csv"  # Path to CSV file with strategy parameters 
 
 # Result Saving Settings
-SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION = False  # If True: create gold_results/{id}/
+SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION = True  # If True: create gold_results/{id}/
+
+# Intra-candle entry settings
+ALLOW_INTRACANDLE_CHECKS = True  # If True: enter at FVG boundary when first touched during bar, not at bar close
 
 # ==================== GLOBAL DATA STRUCTURES ====================
 # These are loaded once and reused across all backtests
@@ -124,7 +127,7 @@ TIMEFRAME_FILE_MAP = {
     "5min": "GOLD.m_M5.csv",
     "30min": "NASDAQ100.x_M30.csv",
     "1h": "NASDAQ100.x_H1.csv",
-    "15min": "GOLD.m_M15.csv"  # Added for date range calculation
+    "15min": "GOLD.m_M15_last.csv"  # Added for date range calculation
 }
 
 # Global date range for USE_FIRST_TENTH_ONLY (calculated from 5min data - first 205 days)
@@ -537,9 +540,11 @@ class BacktestStrategy(Strategy):
                 historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
             
             if start_date:
-                historical_data = historical_data[historical_data['timestamp'] >= pd.to_datetime(start_date)]
+                start_ts = pd.to_datetime(start_date, utc=True)
+                historical_data = historical_data[historical_data['timestamp'] >= start_ts]
             if end_date:
-                historical_data = historical_data[historical_data['timestamp'] <= pd.to_datetime(end_date)]
+                end_ts = pd.to_datetime(end_date, utc=True)
+                historical_data = historical_data[historical_data['timestamp'] <= end_ts]
             
             # Find start index for volume data timestamp
             # Determine if we should start from timestamp:
@@ -855,20 +860,30 @@ class BacktestStrategy(Strategy):
         return self.data.iloc[-1:]
     
     def update_trend_indicators(self):
-        """Override to use cached HTF data for performance"""
+        """Override to match live strategy: use last max(101, EMA_PERIOD+51) HTF bars up to current timestamp"""
         if self.htf_data is None:
             self._update_trend_indicators_resample()
             return
         
         current_timestamp = self.data['timestamp'].iloc[-1]
+        # Find all HTF bars that closed <= current bar's timestamp (no look-ahead)
         idx = self.htf_data['timestamp'].searchsorted(current_timestamp, side='right')
         
-        if idx < self.get_param('EMA_PERIOD', 50):
+        # Get EMA_PERIOD parameter
+        ema_period = self.get_param('EMA_PERIOD', 50)
+        
+        # Match live strategy: use last max(101, EMA_PERIOD+51) bars (same as live fetch_data call)
+        bars_needed = max(101, ema_period + 51)
+        
+        if idx < ema_period:
             self.isBullishHTF = None
             self.isBearishHTF = None
         else:
-            htf_close = self.htf_data['close'].iloc[:idx]
-            htfEMA = ema(htf_close, self.get_param('EMA_PERIOD', 50))
+            # Take the last bars_needed bars from available HTF bars (up to current timestamp)
+            # This matches live strategy behavior: fetch_data gets most recent bars_needed bars
+            start_idx = max(0, idx - bars_needed)
+            htf_close = self.htf_data['close'].iloc[start_idx:idx]
+            htfEMA = ema(htf_close, ema_period)
             
             if htfEMA is not None:
                 self.isBullishHTF = self.cur_close > htfEMA
@@ -937,9 +952,14 @@ class BacktestStrategy(Strategy):
             
             htf_resampled = htf_data.resample(resample_period, label='right', closed='right').agg(agg_dict).dropna()
             
-            if len(htf_resampled) >= self.get_param('EMA_PERIOD', 50):
-                htf_close = htf_resampled['close']
-                htfEMA = ema(htf_close, self.get_param('EMA_PERIOD', 50))
+            ema_period = self.get_param('EMA_PERIOD', 50)
+            bars_needed = max(101, ema_period + 51)  # Match live strategy: max(101, EMA_PERIOD+51)
+            
+            if len(htf_resampled) >= ema_period:
+                # Take the last bars_needed resampled bars (match live strategy behavior)
+                start_idx = max(0, len(htf_resampled) - bars_needed)
+                htf_close = htf_resampled['close'].iloc[start_idx:]
+                htfEMA = ema(htf_close, ema_period)
                 
                 if htfEMA is not None:
                     self.isBullishHTF = self.cur_close > htfEMA
@@ -1015,13 +1035,21 @@ class BacktestStrategy(Strategy):
             
             if (zone["direction"] == "bull" and touchesFVG and 
                 self.isBullishHTF and self.marketOK):
-                trailStop = self.cur_close - atr * self.get_param('SL_MULTIPLIER', 4.0)
-                tp = self.cur_close + atr * self.get_param('TP_MULTIPLIER', 2000000.0)
+                # Determine entry price based on ALLOW_INTRACANDLE_CHECKS
+                if ALLOW_INTRACANDLE_CHECKS:
+                    # Enter at FVG top (lower boundary of bullish gap) when first touched
+                    entry_price = fvg_top
+                else:
+                    # Enter at bar close (original behavior)
+                    entry_price = self.cur_close
+                
+                trailStop = entry_price - atr * self.get_param('SL_MULTIPLIER', 4.0)
+                tp = entry_price + atr * self.get_param('TP_MULTIPLIER', 2000000.0)
                 entryAtr = atr
                 lot_size = self.calculate_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0))
                 
                 current_time = self.data.iloc[-1].get('timestamp', datetime.now())
-                self.active_order = BacktestOrder("BUY", self.cur_close, tp, trailStop, 
+                self.active_order = BacktestOrder("BUY", entry_price, tp, trailStop, 
                                                   entryAtr, self.account_id, self.asset, 
                                                   self.auth_token, lot_size, 
                                                   tick_size=self.tick_size, tick_value=self.tick_value,
@@ -1039,13 +1067,21 @@ class BacktestStrategy(Strategy):
             
             elif (zone["direction"] == "bear" and touchesFVG and 
                   self.isBearishHTF and self.marketOK):
-                trailStop = self.cur_close + atr * self.get_param('SL_MULTIPLIER', 4.0)
-                tp = self.cur_close - atr * self.get_param('TP_MULTIPLIER', 2000000.0)
+                # Determine entry price based on ALLOW_INTRACANDLE_CHECKS
+                if ALLOW_INTRACANDLE_CHECKS:
+                    # Enter at FVG bottom (upper boundary of bearish gap) when first touched
+                    entry_price = fvg_bottom
+                else:
+                    # Enter at bar close (original behavior)
+                    entry_price = self.cur_close
+                
+                trailStop = entry_price + atr * self.get_param('SL_MULTIPLIER', 4.0)
+                tp = entry_price - atr * self.get_param('TP_MULTIPLIER', 2000000.0)
                 entryAtr = atr
                 lot_size = self.calculate_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0))
                 
                 current_time = self.data.iloc[-1].get('timestamp', datetime.now())
-                self.active_order = BacktestOrder("SELL", self.cur_close, tp, trailStop, 
+                self.active_order = BacktestOrder("SELL", entry_price, tp, trailStop, 
                                                   entryAtr, self.account_id, self.asset, 
                                                   self.auth_token, lot_size,
                                                   tick_size=self.tick_size, tick_value=self.tick_value,
@@ -2697,7 +2733,8 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
 # ==================== MAIN EXECUTION ====================
 
 def run_backtest_example(asset_name="MGCG6", timeframe="15min", 
-                         initial_balance=50000.0, max_loss=2000, direct_file_path=None):
+                         initial_balance=50000.0, max_loss=2000, direct_file_path=None,
+                         start_date=None, end_date=None):
     """Example of how to run a backtest"""
     historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe, direct_file_path=direct_file_path)
     
@@ -2723,6 +2760,8 @@ def run_backtest_example(asset_name="MGCG6", timeframe="15min",
         asset_tuple=asset_tuple,
         historical_data=historical_data,
         initial_balance=initial_balance,
+        start_date=start_date,
+        end_date=end_date,
         max_loss=max_loss,
         asset_name=asset_name,
         strategy_params=captured_params,
@@ -2763,7 +2802,7 @@ if __name__ == "__main__":
     # Timeframe selection
     # For single backtest: choose one timeframe ("5min", "30min", or "1h")
     # For optimization: will iterate through all timeframes
-    SELECTED_TIMEFRAME = "15min"  # Change this to "5min", "30min", or "1h" for single backtest
+    SELECTED_TIMEFRAME = "5min"  # Change this to "5min", "30min", or "1h" for single backtest
     
     # Timeframes to test for optimization (skip 15min as already done)
     timeframes_to_test = ["5min","15min", "30min", "1h"]
@@ -2815,7 +2854,14 @@ if __name__ == "__main__":
             print(f"📂 Data file: {direct_file_path}")
             print(f"{'='*60}\n")
             
-            run_backtest_example(asset_name, SELECTED_TIMEFRAME, initial_balance, max_loss, direct_file_path=direct_file_path)
+            run_backtest_example(
+                asset_name,
+                SELECTED_TIMEFRAME,
+                initial_balance,
+                max_loss,
+                direct_file_path=direct_file_path,
+                start_date="2025-03-03"
+            )
         else:
             print(f"❌ Error: Invalid timeframe '{SELECTED_TIMEFRAME}'")
             print(f"   Available timeframes: {', '.join(TIMEFRAME_FILE_MAP.keys())}")

@@ -19,8 +19,8 @@ FINAL_RESULT_CSV = os.path.join(GOLD_RESULTS_DIR, "final_result.csv")
 OUTPUT_DIR = "simulation_results"  # Directory to save output CSVs
 
 # Simulation parameters (can be overridden per backtest if needed)
-INITIAL_CAPITAL = 1000  # Starting capital in dollars
-TRADE_SIZE = 1000  # Dollar value of each trade order (used if USE_CUMULATIVE is False)
+INITIAL_CAPITAL = 10000  # Starting capital in dollars
+TRADE_SIZE = 2000  # Dollar value of each trade order (used if USE_CUMULATIVE is False)
 USE_CUMULATIVE = False  # If True: trade size is percentage of current equity. If False: fixed dollar amount
 TRADE_SIZE_PCT = 100.0  # Percentage of current equity to use for each trade (only if USE_CUMULATIVE is True)
 LEVERAGE = 20  # Leverage multiplier (1 = no leverage)
@@ -29,7 +29,7 @@ FEE_PERCENT = 0.02  # Fee percentage (0.02% = 0.0002 as decimal)
 
 # Single file test mode
 SINGLE_FILE_MODE = True  # If True: test only one file. If False: process all backtests
-SINGLE_FILE_PATH = "gold_results/3/backtest_trades_CON.F.US.MGC.G26_20260116.csv"  # Path to trades CSV file for single file mode
+SINGLE_FILE_PATH = "gold_results/27/backtest_trades_CON.F.US.MGC.G26_20260119.csv"  # Path to trades CSV file for single file mode
 # =========================
 
 # Create output directory
@@ -411,6 +411,39 @@ def process_all_backtests():
         print(f"   Win Rate: {sim_results['win_rate']:.2f}%")
         print(f"   Max Drawdown: ${sim_results['max_drawdown']:,.2f} ({sim_results['max_drawdown_pct']:.2f}%)")
         
+        # Save individual CSV files for this simulation
+        try:
+            # Create ID-specific directory
+            sim_id_dir = os.path.join(OUTPUT_DIR, str(result_id))
+            os.makedirs(sim_id_dir, exist_ok=True)
+            
+            # Get asset name from trades file path or use default
+            asset_name = os.path.basename(trades_csv_file).split('_')[2] if '_' in os.path.basename(trades_csv_file) else 'UNKNOWN'
+            date_str = datetime.now().strftime('%Y%m%d')
+            
+            # Save trades CSV
+            if sim_results['simulated_trades']:
+                trades_df = pd.DataFrame(sim_results['simulated_trades'])
+                trades_file = os.path.join(sim_id_dir, f"simulation_trades_{asset_name}_{date_str}.csv")
+                trades_df.to_csv(trades_file, index=False)
+                print(f"💾 Saved trades CSV: {trades_file}")
+            
+            # Save equity curve CSV
+            if sim_results['equity_curve']:
+                equity_df = pd.DataFrame(sim_results['equity_curve'])
+                equity_file = os.path.join(sim_id_dir, f"simulation_equity_{asset_name}_{date_str}.csv")
+                equity_df.to_csv(equity_file, index=False)
+                print(f"💾 Saved equity curve CSV: {equity_file}")
+            
+            # Save individual summary CSV
+            summary_file = os.path.join(sim_id_dir, f"simulation_summary_{asset_name}_{date_str}.csv")
+            summary_df_single = pd.DataFrame([summary_row])
+            summary_df_single.to_csv(summary_file, index=False)
+            print(f"💾 Saved summary CSV: {summary_file}")
+            
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to save individual CSV files for ID {result_id}: {e}")
+        
         # Create summary row with parameters from final_result.csv and simulation results
         summary_row = {
             # ID and parameters from final_result.csv
@@ -541,6 +574,82 @@ def process_single_file(trades_csv_file):
     
     # Calculate yearly return
     yearly_return = (sim_results['total_return'] / backtest_period_days * 365) if backtest_period_days > 0 else 0
+    
+    # Save CSV files for single file mode
+    try:
+        # Extract ID from path if possible, otherwise use timestamp
+        try:
+            result_id = int(os.path.basename(os.path.dirname(trades_csv_file)))
+        except (ValueError, AttributeError):
+            result_id = int(datetime.now().timestamp())
+        
+        # Create ID-specific directory
+        sim_id_dir = os.path.join(OUTPUT_DIR, str(result_id))
+        os.makedirs(sim_id_dir, exist_ok=True)
+        
+        # Get asset name from trades file path or use default
+        asset_name = os.path.basename(trades_csv_file).split('_')[2] if '_' in os.path.basename(trades_csv_file) else 'UNKNOWN'
+        date_str = datetime.now().strftime('%Y%m%d')
+        
+        # Save trades CSV
+        if sim_results['simulated_trades']:
+            trades_df = pd.DataFrame(sim_results['simulated_trades'])
+            trades_file = os.path.join(sim_id_dir, f"simulation_trades_{asset_name}_{date_str}.csv")
+            trades_df.to_csv(trades_file, index=False)
+            print(f"💾 Saved trades CSV: {trades_file}")
+        
+        # Save equity curve CSV
+        if sim_results['equity_curve']:
+            equity_df = pd.DataFrame(sim_results['equity_curve'])
+            equity_file = os.path.join(sim_id_dir, f"simulation_equity_{asset_name}_{date_str}.csv")
+            equity_df.to_csv(equity_file, index=False)
+            print(f"💾 Saved equity curve CSV: {equity_file}")
+        
+        # Create and save summary row
+        summary_row = {
+            'id': result_id,
+            'timeframe': '',
+            'sim_initial_capital': INITIAL_CAPITAL,
+            'sim_trade_size': TRADE_SIZE,
+            'sim_use_cumulative': USE_CUMULATIVE,
+            'sim_trade_size_pct': TRADE_SIZE_PCT if USE_CUMULATIVE else None,
+            'sim_leverage': LEVERAGE,
+            'sim_spread': SPREAD,
+            'sim_fee_percent': FEE_PERCENT,
+            'total_pnl': sim_results['total_pnl'],
+            'total_trades': sim_results['trades_executed'],
+            'win_rate': sim_results['win_rate'],
+            'final_balance': sim_results['capital'],
+            'max_drawdown': sim_results['max_drawdown'],
+            'max_drawdown_pct': sim_results['max_drawdown_pct'],
+            'total_fees': sim_results['total_fees_paid'],
+            'winning_trades': sim_results['winning_trades'],
+            'losing_trades': sim_results['losing_trades'],
+            'avg_win': sim_results['avg_win'],
+            'avg_loss': sim_results['avg_loss'],
+            'profit_factor': sim_results['profit_factor'],
+            'total_return': sim_results['total_return'],
+            'net_profit': sim_results['total_pnl'],
+            'largest_win': sim_results['largest_win'],
+            'largest_loss': sim_results['largest_loss'],
+            'trades_per_day': trades_per_day,
+            'backtest_period_days': backtest_period_days,
+            'yearly_return': yearly_return,
+            'most_losing_trades_in_row': most_losing_trades_in_row,
+            'avg_most_losing_trades_per_month': round(avg_most_losing_trades_per_month, 2),
+            'dollar_value_most_losses_in_row': round(dollar_value_most_losses_in_row, 2),
+            'dollar_value_avg_most_losses_per_month': round(dollar_value_avg_most_losses_per_month, 2),
+            'avg_max_monthly_drawdown': round(avg_max_monthly_drawdown, 2),
+            'simulation_timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        summary_file = os.path.join(sim_id_dir, f"simulation_summary_{asset_name}_{date_str}.csv")
+        summary_df_single = pd.DataFrame([summary_row])
+        summary_df_single.to_csv(summary_file, index=False)
+        print(f"💾 Saved summary CSV: {summary_file}")
+        
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to save CSV files: {e}")
     
     # Print detailed results
     print(f"\n{'='*60}")
