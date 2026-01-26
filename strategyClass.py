@@ -12,20 +12,20 @@ metadata_lock = threading.Lock()
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
 FVG_HISTORY_NBR = 11              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.12          # Min FVG Power % (formerly MinFVGPowerPct)
+MIN_FVG_POWER_PCT = 0.08          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "90"                     # HTF Bias (4H) - PERIOD_H4
+HTF_TF = "30"                     # HTF Bias (4H) - PERIOD_H4
 EMA_PERIOD = 50                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1
+VOLUME_MULTIPLIER = 1.5
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 17                    # ATR Period (min 1)
-SL_MULTIPLIER = 5.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 5                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 7                    # ATR Period (min 1)
+SL_MULTIPLIER = 10               # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 13                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = False                # use trailing stop (formerly UseTrailing)
@@ -81,9 +81,9 @@ class Order:
         self.take_profit = take_profit
         self.trailing_stop_loss = trailing_stop_loss
         self.entry_atr = entry_atr
+
+
         self.lot_size = lot_size if lot_size else ORDER_SIZE
-
-
         self.account_id = account_id
         self.asset_id = asset_id
         self.auth_token = auth_token

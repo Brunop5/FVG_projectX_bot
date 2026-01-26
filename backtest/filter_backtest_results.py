@@ -6,14 +6,14 @@ Filter backtest results based on specific criteria.
 import pandas as pd
 
 # ===== CONFIGURATION =====
-INPUT_CSV = "backtest_summary.csv"
+INPUT_CSV = "gold_results/optimization_results_15min_20260125_135551.csv"
 OUTPUT_CSV = "filtered_backtest_results.csv"
 
 # Filter criteria
-MIN_TOTAL_PNL = 100
+MIN_TOTAL_PNL = 10
 MAX_DRAWDOWN = 3500
 MIN_TRADES_PER_DAY = 0.1
-MAX_BACKTEST_PERIOD_DAYS = 205
+MAX_BACKTEST_PERIOD_DAYS = 240
 # =========================
 
 # Read the CSV file
@@ -26,9 +26,6 @@ print(f"Total rows in original CSV: {len(df)}")
 # total_pnl is at least 5000
 filtered_df = df[df['total_pnl'] >= MIN_TOTAL_PNL]
 
-filtered_df = filtered_df[filtered_df['SL_MULTIPLIER'] > 1]
-filtered_df = filtered_df[filtered_df['TP_MULTIPLIER'] > 1]
-filtered_df = filtered_df[filtered_df['TRAIL_OFFSET_MULT'] > 1]
 # max_drawdown is not more than 3000 (<= 3000)
 #filtered_df = filtered_df[filtered_df['max_drawdown'] <= MAX_DRAWDOWN]
 

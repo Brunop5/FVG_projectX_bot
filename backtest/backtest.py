@@ -10,28 +10,67 @@ It works by:
 """
 
 # ==================== IMPORTS ====================
+import os
+import sys
+from datetime import datetime, timedelta
+from io import StringIO
+from threading import Lock, Thread
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import itertools
+import random
+import multiprocessing
+import inspect
+import re
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
 import strategyClass
 from strategyClass import Strategy, Order, ASSETS
 from api_functions import fetch_data, load_data
 from indicators import ema, sma, get_atr
-import json
-import os
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import inspect
-import re
-import sys
-from io import StringIO
-import threading
-from threading import Lock
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import itertools
-import random
-import multiprocessing
 
+
+# ==================== USER INPUTS / CONSTANTS ====================
+# Backtest run configuration
+BACKTEST_ASSET_NAME = "MGCG6"
+BACKTEST_INITIAL_BALANCE = 50000.0
+BACKTEST_MAX_LOSS = 2000
+BACKTEST_SELECTED_TIMEFRAME = "15min"
+BACKTEST_TIMEFRAMES_TO_TEST = ["5min", "15min", "30min", "1h"]
+BACKTEST_START_DATE = None
+BACKTEST_END_DATE = None
+# Margin-based position sizing (optional)
+USE_MARGIN_PER_TRADE = False
+MARGIN_PER_TRADE = 100 # margin you want to commit per trade
+MIN_MARGIN_LOT_SIZE = 0.002
+MAX_MARGIN_LOT_SIZE = 100.0
+# Optimization execution
+USE_MULTITHREADING = False
+USE_MULTIPROCESSING = True  # if True, uses process pool for random optimization
+# Optional direct data file override (CSV)
+USE_DIRECT_DATA_FILE = True
+DIRECT_DATA_FILE_PATH = "data/MGCG6/1mdata_gold_15min.csv"
+
+# CFD pricing configuration (used when USE_CFD_PRICING is True)
+USE_CFD_PRICING = False
+# fee_pct is a decimal (e.g., 0.0002 = 0.02%) applied once per round-turn trade.
+DEFAULT_CFD_SETTINGS = {
+    "leverage": 20,
+    "fee_pct": 0.001,
+    "spread": 0.1,  # absolute price units
+}
+CFD_SETTINGS_BY_ASSET = {
+    # Example:
+    # "MGCG6": {"leverage": 20.0, "fee_pct": 0.0002, "spread": 0.2},
+}
 
 # ==================== OPTIMIZATION CONFIGURATION ====================
 # Edit these ranges to customize the optimization search space
@@ -93,14 +132,15 @@ FIXED_PARAMS = {
 }
 
 # ==================== OPTIMIZATION SETTINGS ====================
-RUN_OPTIMIZATION = False  # Set to True to run optimization, False for single backtest
+RUN_OPTIMIZATION = True  # Set to True to run optimization, False for single backtest
 USE_EXHAUSTIVE_SEARCH = False  # If True: test ALL parameter combinations in parallel (exhaustive). If False: random search
-RANDOM_SEARCH_SAMPLES = 1000  
+RANDOM_SEARCH_SAMPLES = 10000  
+PROGRESS_STEP_PCT = 5  # Progress update granularity for multiprocessing (per sample)
 
 USE_AUTO_WORKERS = True  # If True: auto-detect CPU count and use that many workers
-MAX_WORKERS = None  # Manual override (ignored if USE_AUTO_WORKERS is True). Set to number like 8, 16, etc.
+MAX_WORKERS = 4  # Manual override (ignored if USE_AUTO_WORKERS is True). Set to number like 8, 16, etc.
 
-USE_FIRST_TENTH_ONLY = False
+USE_FIRST_TENTH_ONLY = True
 
 # CSV Input Settings (alternative to random/exhaustive search)
 USE_CSV_INPUT = False  # If True: read parameter combinations from CSV file instead of generating them
@@ -125,15 +165,28 @@ FINAL_RESULT_LOCK = Lock()  # Lock for final_result.csv writing
 # Map timeframes to data file names in data/MGCG6/
 TIMEFRAME_FILE_MAP = {
     "5min": "GOLD.m_M5.csv",
-    "30min": "NASDAQ100.x_M30.csv",
-    "1h": "NASDAQ100.x_H1.csv",
-    "15min": "GOLD.m_M15_last.csv"  # Added for date range calculation
+    "30min": "GOLD.m_M30.csv",
+    "1h": "GOLD.m_H1.csv",
+    "15min": "1mdata_gold_15min.csv"  # Added for date range calculation
 }
 
 # Global date range for USE_FIRST_TENTH_ONLY (calculated from 5min data - first 205 days)
 DATE_RANGE_START = None
 DATE_RANGE_END = None
-DAYS_FROM_5MIN_FIRST_205 = 205  # Number of days to use from 5min data (first 205 days)
+DAYS_FROM_5MIN_FIRST_205 = None  # Number of days to use from 5min data (first 205 days)
+
+def _parse_datetime_input(value):
+    """Parse date inputs from ms timestamps or ISO strings into UTC timestamps."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return pd.to_datetime(value, unit='ms', utc=True, errors='coerce')
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return pd.to_datetime(int(stripped), unit='ms', utc=True, errors='coerce')
+        return pd.to_datetime(stripped, utc=True, errors='coerce')
+    return pd.to_datetime(value, utc=True, errors='coerce')
 
 
 # ==================== INITIALIZATION FUNCTIONS ====================
@@ -142,9 +195,14 @@ def _load_contracts_data():
     """Load contracts.csv data into global structures"""
     global CONTRACTS_DATA, CONTRACTS_BY_NAME
     
-    contracts_path = os.path.join(os.path.dirname(__file__), "contracts.csv")
-    if not os.path.exists(contracts_path):
-        print(f"⚠️  Warning: contracts.csv not found at {contracts_path}")
+    backtest_dir = os.path.dirname(__file__)
+    contracts_candidates = [
+        os.path.join(backtest_dir, "contracts.csv"),
+        os.path.join(os.path.dirname(backtest_dir), "contracts.csv"),
+    ]
+    contracts_path = next((p for p in contracts_candidates if os.path.exists(p)), None)
+    if not contracts_path:
+        print(f"⚠️  Warning: contracts.csv not found at {contracts_candidates}")
         return
     
     contracts_df = pd.read_csv(contracts_path)
@@ -214,13 +272,15 @@ def get_optimal_worker_count():
     """
     if USE_AUTO_WORKERS:
         cpu_count = multiprocessing.cpu_count()
-        # For I/O-bound tasks (reading CSV files, pandas operations), we can use more workers
-        # than CPU cores. A good multiplier is 1.5-2x for I/O-bound tasks.
-        # For CPU-bound tasks, use CPU count directly.
-        # Since backtesting involves both CPU (calculations) and I/O (file reading),
-        # we'll use a moderate multiplier.
-        optimal_workers = int(cpu_count * 1.5)  # 1.5x CPU cores for mixed workload
-        print(f"💻 Detected {cpu_count} CPU cores. Using {optimal_workers} workers (1.5x for I/O-bound tasks)")
+        # Multiprocessing is CPU-heavy; avoid over-subscribing cores.
+        if USE_MULTIPROCESSING:
+            # Use half the worker budget minus one to reduce contention.
+            optimal_workers = max(1, (cpu_count // 2) - 1)
+            print(f"💻 Detected {cpu_count} CPU cores. Using {optimal_workers} workers (multiprocessing)")
+            return optimal_workers
+        # Threading can benefit from modest oversubscription for mixed I/O/CPU work.
+        optimal_workers = int(cpu_count * 1.5)
+        print(f"💻 Detected {cpu_count} CPU cores. Using {optimal_workers} workers (threading)")
         return optimal_workers
     else:
         if MAX_WORKERS is None:
@@ -228,6 +288,8 @@ def get_optimal_worker_count():
             cpu_count = multiprocessing.cpu_count()
             print(f"⚠️  MAX_WORKERS is None but USE_AUTO_WORKERS is False. Using CPU count: {cpu_count}")
             return cpu_count
+        if USE_MULTIPROCESSING:
+            return max(1, (MAX_WORKERS // 2) - 1)
         return MAX_WORKERS
 
 
@@ -241,12 +303,26 @@ def get_contract_info(asset_id):
     return CONTRACTS_DATA.get(asset_id, {'tick_size': None, 'tick_value': None})
 
 
+def get_cfd_settings(asset_name, asset_id=None):
+    """Get CFD settings for an asset name or ID."""
+    settings = CFD_SETTINGS_BY_ASSET.get(asset_name)
+    if settings is None and asset_id is not None:
+        settings = CFD_SETTINGS_BY_ASSET.get(asset_id)
+    if settings is None:
+        settings = DEFAULT_CFD_SETTINGS
+    return {
+        "leverage": float(settings.get("leverage", DEFAULT_CFD_SETTINGS["leverage"])),
+        "fee_pct": float(settings.get("fee_pct", DEFAULT_CFD_SETTINGS["fee_pct"])),
+        "spread": float(settings.get("spread", DEFAULT_CFD_SETTINGS["spread"])),
+    }
+
+
 def get_contract_id_by_name(asset_name):
     """Get contract ID from asset name (e.g., 'MESH6' -> 'CON.F.US.MES.H26')"""
     return CONTRACTS_BY_NAME.get(asset_name)
 
 
-def _calculate_date_range_from_5min(asset_name="MGCG6"):
+def _calculate_date_range_from_5min(asset_name=BACKTEST_ASSET_NAME):
     """
     Calculate the date range from the first 205 days of 5min data.
     This date range will be used for all timeframes when USE_FIRST_TENTH_ONLY is True.
@@ -256,6 +332,9 @@ def _calculate_date_range_from_5min(asset_name="MGCG6"):
     if DATE_RANGE_START is not None and DATE_RANGE_END is not None:
         # Already calculated, return cached values
         return DATE_RANGE_START, DATE_RANGE_END, DAYS_FROM_5MIN_FIRST_205
+
+    if DAYS_FROM_5MIN_FIRST_205 is None:
+        return (None, None, None)
     
     # Load 5min data
     timeframe_5min = "5min"
@@ -337,19 +416,22 @@ def load_backtest_data(asset_name, timeframe, direct_file_path=None):
         tuple: (historical_data DataFrame, asset_tuple, contract_id)
                Returns (None, None, None) if asset not found or data file missing
     """
-    contract_id = get_contract_id_by_name(asset_name)
-    if not contract_id:
-        print(f"⚠️  Error: Asset name '{asset_name}' not found in contracts.csv")
-        print(f"   Available assets: {', '.join(sorted(CONTRACTS_BY_NAME.keys()))}")
-        return None, None, None
-    
     # If direct file path is provided, use it
     if direct_file_path:
         data_path = direct_file_path
         if not os.path.exists(data_path):
             print(f"⚠️  Error: Data file not found: {data_path}")
             return None, None, None
+        contract_id = get_contract_id_by_name(asset_name)
+        if not contract_id:
+            contract_id = asset_name
+            print(f"⚠️  Warning: Asset name '{asset_name}' not found in contracts.csv. Using asset name as ID for direct file.")
     else:
+        contract_id = get_contract_id_by_name(asset_name)
+        if not contract_id:
+            print(f"⚠️  Error: Asset name '{asset_name}' not found in contracts.csv")
+            print(f"   Available assets: {', '.join(sorted(CONTRACTS_BY_NAME.keys()))}")
+            return None, None, None
         # Clean asset name for folder name
         safe_asset_name = "".join(c for c in asset_name if c.isalnum() or c in (' ', '-', '_')).strip()
         safe_asset_name = safe_asset_name.replace(' ', '_')
@@ -399,13 +481,53 @@ def load_backtest_data(asset_name, timeframe, direct_file_path=None):
                 historical_data = pd.read_csv(data_path, sep=',')
             
             # Ensure timestamp column exists and is properly formatted
-            if 'timestamp' not in historical_data.columns and 'date' in historical_data.columns:
-                historical_data['timestamp'] = pd.to_datetime(historical_data['date'])
-            elif 'timestamp' in historical_data.columns:
-                if pd.api.types.is_numeric_dtype(historical_data['timestamp']):
-                    historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], unit='ms', utc=True)
+            cols_lower = {c.lower(): c for c in historical_data.columns}
+            if 'timestamp' not in cols_lower and 'ts_event' in cols_lower:
+                ts_col = cols_lower['ts_event']
+                historical_data['timestamp'] = pd.to_datetime(historical_data[ts_col], utc=True, errors='coerce')
+            elif 'timestamp' not in cols_lower and 'date' in cols_lower:
+                date_col = cols_lower['date']
+                historical_data['timestamp'] = pd.to_datetime(historical_data[date_col], utc=True, errors='coerce')
+            elif 'timestamp' in cols_lower:
+                ts_col = cols_lower['timestamp']
+                if pd.api.types.is_numeric_dtype(historical_data[ts_col]):
+                    historical_data['timestamp'] = pd.to_datetime(historical_data[ts_col], unit='ms', utc=True, errors='coerce')
                 else:
-                    historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
+                    historical_data['timestamp'] = pd.to_datetime(historical_data[ts_col], utc=True, errors='coerce')
+
+            # Normalize column names and keep only required OHLCV columns
+            standard_map = {
+                'open': 'open',
+                'high': 'high',
+                'low': 'low',
+                'close': 'close',
+                'volume': 'volume',
+                'vol': 'volume',
+                'tickvol': 'volume',
+                'tick_volume': 'volume',
+            }
+            rename_map = {}
+            for col in historical_data.columns:
+                key = col.lower()
+                if key in standard_map:
+                    rename_map[col] = standard_map[key]
+            if rename_map:
+                historical_data = historical_data.rename(columns=rename_map)
+
+            required_columns = ['timestamp', 'open', 'high', 'low', 'close']
+            for col in required_columns:
+                if col not in historical_data.columns:
+                    raise ValueError(f"Missing required column '{col}' in {data_path}")
+
+            if 'volume' not in historical_data.columns:
+                historical_data['volume'] = 0.0
+
+            # Coerce numeric columns
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                historical_data[col] = pd.to_numeric(historical_data[col], errors='coerce')
+
+            # Drop rows with missing OHLC
+            historical_data = historical_data.dropna(subset=['timestamp', 'open', 'high', 'low', 'close'])
     except Exception as e:
         print(f"⚠️  Error reading CSV file {data_path}: {e}")
         return None, None, None
@@ -428,7 +550,9 @@ class BacktestOrder(Order):
     
     def __init__(self, side: str, entry_price: float, take_profit: float, 
                  trailing_stop_loss, entry_atr: float, account_id, asset_id, 
-                 auth_token, lot_size=None, tick_size=None, tick_value=None, round_turn_fee=None):
+                 auth_token, lot_size=None, tick_size=None, tick_value=None, round_turn_fee=None,
+                 use_cfd_pricing=False, cfd_leverage=1.0, cfd_fee_pct=0.0, cfd_spread=0.0,
+                 use_margin_per_trade=False):
         super().__init__(side, entry_price, take_profit, trailing_stop_loss, 
                         entry_atr, account_id, asset_id, auth_token, lot_size)
         self.filled = False
@@ -443,6 +567,11 @@ class BacktestOrder(Order):
         self.tick_size = tick_size
         self.tick_value = tick_value
         self.round_turn_fee = round_turn_fee if round_turn_fee is not None else 0.0
+        self.use_cfd_pricing = bool(use_cfd_pricing)
+        self.cfd_leverage = cfd_leverage if cfd_leverage and cfd_leverage > 0 else 1.0
+        self.cfd_fee_pct = cfd_fee_pct if cfd_fee_pct and cfd_fee_pct > 0 else 0.0
+        self.cfd_spread = cfd_spread if cfd_spread and cfd_spread > 0 else 0.0
+        self.use_margin_per_trade = bool(use_margin_per_trade)
         self.fees = 0.0
     
     def place_order(self, fill_time=None, entry_bar=None):
@@ -452,31 +581,74 @@ class BacktestOrder(Order):
         self.fill_time = fill_time or datetime.now()
         self.entry_bar = entry_bar
         return {'success': True, 'order_id': 'backtest_order', 'message': 'Order filled'}
+
+    def _get_effective_price(self, price, is_entry):
+        if not self.use_cfd_pricing or self.cfd_spread <= 0:
+            return price
+        half_spread = self.cfd_spread / 2
+        if self.side == "BUY":
+            return price + half_spread if is_entry else price - half_spread
+        return price - half_spread if is_entry else price + half_spread
+
+    def get_unrealized_pnl(self, current_price):
+        """Calculate unrealized P&L at a given price (no fees applied)."""
+        if not self.filled:
+            return 0.0
+
+        if self.use_cfd_pricing:
+            entry_price = self._get_effective_price(self.fill_price, is_entry=True)
+            exit_price = self._get_effective_price(current_price, is_entry=False)
+            if self.side == "BUY":
+                price_diff = exit_price - entry_price
+            else:
+                price_diff = entry_price - exit_price
+            leverage_mult = 1.0 if self.use_margin_per_trade else self.cfd_leverage
+            return price_diff * self.lot_size * leverage_mult
+
+        if self.side == "BUY":
+            price_diff = current_price - self.fill_price
+        else:
+            price_diff = self.fill_price - current_price
+        if self.tick_size is not None and self.tick_value is not None and self.tick_size > 0:
+            ticks = price_diff / self.tick_size
+            return ticks * self.tick_value * self.lot_size
+        return price_diff * self.lot_size
     
     def close_order(self):
         """Mock order closing - calculates P&L using tick value if available"""
         if not self.filled or self.exit_price is None or self.pnl != 0.0:
             return
-        
-        # Calculate price difference
-        if self.side == "BUY":
-            price_diff = self.exit_price - self.fill_price
-        else:  # SELL
-            price_diff = self.fill_price - self.exit_price
-        
-        # Calculate P&L using tick value if available
-        if self.tick_size is not None and self.tick_value is not None and self.tick_size > 0:
-            ticks = price_diff / self.tick_size
-            gross_pnl = ticks * self.tick_value * self.lot_size
+
+        if self.use_cfd_pricing:
+            entry_price = self._get_effective_price(self.fill_price, is_entry=True)
+            exit_price = self._get_effective_price(self.exit_price, is_entry=False)
+            if self.side == "BUY":
+                price_diff = exit_price - entry_price
+            else:
+                price_diff = entry_price - exit_price
+            leverage_mult = 1.0 if self.use_margin_per_trade else self.cfd_leverage
+            gross_pnl = price_diff * self.lot_size * leverage_mult
+            entry_value = entry_price * self.lot_size * leverage_mult
+            self.fees = entry_value * self.cfd_fee_pct
         else:
-            gross_pnl = price_diff * self.lot_size
-        
-        # Apply round turn fees
-        self.fees = self.round_turn_fee * self.lot_size
+            # Calculate price difference
+            if self.side == "BUY":
+                price_diff = self.exit_price - self.fill_price
+            else:  # SELL
+                price_diff = self.fill_price - self.exit_price
+            # Calculate P&L using tick value if available
+            if self.tick_size is not None and self.tick_value is not None and self.tick_size > 0:
+                ticks = price_diff / self.tick_size
+                gross_pnl = ticks * self.tick_value * self.lot_size
+            else:
+                gross_pnl = price_diff * self.lot_size
+            # Apply round turn fees
+            self.fees = self.round_turn_fee * self.lot_size
+            entry_value = self.fill_price * self.lot_size
+
         self.pnl = gross_pnl - self.fees
-        
+
         # Calculate P&L percentage
-        entry_value = self.fill_price * self.lot_size
         if entry_value > 0:
             self.pnl_pct = (self.pnl / entry_value) * 100
         else:
@@ -540,10 +712,10 @@ class BacktestStrategy(Strategy):
                 historical_data['timestamp'] = pd.to_datetime(historical_data['timestamp'], utc=True)
             
             if start_date:
-                start_ts = pd.to_datetime(start_date, utc=True)
+                start_ts = _parse_datetime_input(start_date)
                 historical_data = historical_data[historical_data['timestamp'] >= start_ts]
             if end_date:
-                end_ts = pd.to_datetime(end_date, utc=True)
+                end_ts = _parse_datetime_input(end_date)
                 historical_data = historical_data[historical_data['timestamp'] <= end_ts]
             
             # Find start index for volume data timestamp
@@ -584,6 +756,8 @@ class BacktestStrategy(Strategy):
         if USE_FIRST_TENTH_ONLY:
             # Calculate date range from 5min data if not already calculated
             date_start, date_end, num_days = _calculate_date_range_from_5min(asset_name)
+            date_start = _parse_datetime_input(date_start)
+            date_end = _parse_datetime_input(date_end)
             
             if date_start is not None and date_end is not None:
                 original_length = len(self.historical_data)
@@ -636,18 +810,41 @@ class BacktestStrategy(Strategy):
             else:
                 self.has_volume_data = False
         
-        # Get contract information
+        # Get contract or CFD information
         asset_id = asset_tuple[0]
-        contract_info = get_contract_info(asset_id)
-        self.tick_size = contract_info['tick_size']
-        self.tick_value = contract_info['tick_value']
-        self.round_turn_fee = get_round_turn_fee(asset_id)
-        
-        if self.tick_size is not None and self.tick_value is not None:
-            fee_info = f" | Round Turn Fee: ${self.round_turn_fee:.2f}/contract" if self.round_turn_fee > 0 else " | ⚠️  No fee found in ASSETS"
-            print(f"📋 Using contract info: {asset_id} | Tick Size: {self.tick_size} | Tick Value: ${self.tick_value}{fee_info}")
+        self.use_cfd_pricing = bool(USE_CFD_PRICING)
+        self.cfd_leverage = 1.0
+        self.cfd_fee_pct = 0.0
+        self.cfd_spread = 0.0
+
+        if self.use_cfd_pricing:
+            raw_settings = CFD_SETTINGS_BY_ASSET.get(asset_name) or CFD_SETTINGS_BY_ASSET.get(asset_id)
+            cfd_settings = get_cfd_settings(asset_name, asset_id)
+            self.cfd_leverage = cfd_settings["leverage"]
+            self.cfd_fee_pct = cfd_settings["fee_pct"]
+            self.cfd_spread = cfd_settings["spread"]
+            self.tick_size = None
+            self.tick_value = None
+            self.round_turn_fee = 0.0
+            if raw_settings is None:
+                print(f"⚠️  Warning: No CFD settings found for {asset_name or asset_id}. Using DEFAULT_CFD_SETTINGS.")
+            print(
+                f"📋 Using CFD pricing: {asset_name or asset_id} | "
+                f"Leverage: {self.cfd_leverage}x | "
+                f"Fee: {self.cfd_fee_pct * 100:.4f}% | "
+                f"Spread: {self.cfd_spread}"
+            )
         else:
-            print(f"⚠️  Warning: Contract {asset_id} not found in contracts.csv. Using simple P&L calculation.")
+            contract_info = get_contract_info(asset_id)
+            self.tick_size = contract_info['tick_size']
+            self.tick_value = contract_info['tick_value']
+            self.round_turn_fee = get_round_turn_fee(asset_id)
+
+            if self.tick_size is not None and self.tick_value is not None:
+                fee_info = f" | Round Turn Fee: ${self.round_turn_fee:.2f}/contract" if self.round_turn_fee > 0 else " | ⚠️  No fee found in ASSETS"
+                print(f"📋 Using contract info: {asset_id} | Tick Size: {self.tick_size} | Tick Value: ${self.tick_value}{fee_info}")
+            else:
+                print(f"⚠️  Warning: Contract {asset_id} not found in contracts.csv. Using simple P&L calculation.")
         
         # Max loss configuration
         self.max_loss = max_loss
@@ -669,12 +866,26 @@ class BacktestStrategy(Strategy):
         self.account_id = "backtest_account"
         self.auth_token = "backtest_token"
     
+    def _get_order_lot_size(self, atr, sl_multiplier, entry_price):
+        """Calculate lot size; optionally size by fixed margin per trade."""
+        if USE_MARGIN_PER_TRADE:
+            if entry_price is None or entry_price <= 0:
+                return self.calculate_lot_size(atr, sl_multiplier)
+            leverage = self.cfd_leverage if self.use_cfd_pricing else 1.0
+            notional = MARGIN_PER_TRADE * leverage
+            lot_size = notional / entry_price
+            lot_size = max(MIN_MARGIN_LOT_SIZE, lot_size)
+            if MAX_MARGIN_LOT_SIZE is not None:
+                lot_size = min(MAX_MARGIN_LOT_SIZE, lot_size)
+            return lot_size
+        return self.calculate_lot_size(atr, sl_multiplier)
+
     def init_rest(self):
         """Override init_rest to use historical data instead of API"""
         self.account_balance = self.initial_balance
         self.current_balance = self.initial_balance
         self.active_order = None
-        
+
         min_bars_needed = max(100, 50)
         
         # Start from volume_start_index if USE_VOLUME_CHECK is enabled
@@ -1043,17 +1254,23 @@ class BacktestStrategy(Strategy):
                     # Enter at bar close (original behavior)
                     entry_price = self.cur_close
                 
+                print(atr)
                 trailStop = entry_price - atr * self.get_param('SL_MULTIPLIER', 4.0)
                 tp = entry_price + atr * self.get_param('TP_MULTIPLIER', 2000000.0)
                 entryAtr = atr
-                lot_size = self.calculate_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0))
+                lot_size = self._get_order_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0), entry_price)
                 
                 current_time = self.data.iloc[-1].get('timestamp', datetime.now())
                 self.active_order = BacktestOrder("BUY", entry_price, tp, trailStop, 
                                                   entryAtr, self.account_id, self.asset, 
                                                   self.auth_token, lot_size, 
                                                   tick_size=self.tick_size, tick_value=self.tick_value,
-                                                  round_turn_fee=self.round_turn_fee)
+                                                  round_turn_fee=self.round_turn_fee,
+                                                  use_cfd_pricing=self.use_cfd_pricing,
+                                                  cfd_leverage=self.cfd_leverage,
+                                                  cfd_fee_pct=self.cfd_fee_pct,
+                                                  cfd_spread=self.cfd_spread,
+                                                  use_margin_per_trade=USE_MARGIN_PER_TRADE)
                 result = self.active_order.place_order(fill_time=current_time, entry_bar=self.current_bar_index)
                 
                 if result['success']:
@@ -1078,14 +1295,19 @@ class BacktestStrategy(Strategy):
                 trailStop = entry_price + atr * self.get_param('SL_MULTIPLIER', 4.0)
                 tp = entry_price - atr * self.get_param('TP_MULTIPLIER', 2000000.0)
                 entryAtr = atr
-                lot_size = self.calculate_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0))
+                lot_size = self._get_order_lot_size(atr, self.get_param('SL_MULTIPLIER', 4.0), entry_price)
                 
                 current_time = self.data.iloc[-1].get('timestamp', datetime.now())
                 self.active_order = BacktestOrder("SELL", entry_price, tp, trailStop, 
                                                   entryAtr, self.account_id, self.asset, 
                                                   self.auth_token, lot_size,
                                                   tick_size=self.tick_size, tick_value=self.tick_value,
-                                                  round_turn_fee=self.round_turn_fee)
+                                                  round_turn_fee=self.round_turn_fee,
+                                                  use_cfd_pricing=self.use_cfd_pricing,
+                                                  cfd_leverage=self.cfd_leverage,
+                                                  cfd_fee_pct=self.cfd_fee_pct,
+                                                  cfd_spread=self.cfd_spread,
+                                                  use_margin_per_trade=USE_MARGIN_PER_TRADE)
                 result = self.active_order.place_order(fill_time=current_time, entry_bar=self.current_bar_index)
                 
                 if result['success']:
@@ -1181,7 +1403,12 @@ class BacktestStrategy(Strategy):
             'exit_reason': order.exit_reason,
             'entry_bar': order.entry_bar,
             'exit_bar': self.current_bar_index,
-            'bars_held': self.current_bar_index - order.entry_bar if order.entry_bar else 0
+            'bars_held': self.current_bar_index - order.entry_bar if order.entry_bar else 0,
+            'entry_atr': getattr(order, 'entry_atr', None),
+            'sl_price': getattr(order, 'trailing_stop_loss', None),
+            'tp_price': getattr(order, 'take_profit', None),
+            'sl_mult': self.get_param('SL_MULTIPLIER', None),
+            'tp_mult': self.get_param('TP_MULTIPLIER', None),
         }
         self.trades.append(trade)
         self.current_balance += order.pnl
@@ -1256,16 +1483,7 @@ class BacktestStrategy(Strategy):
         if pos and pos.filled:
             current_bar = self.data.iloc[-1]
             current_price = current_bar['close']
-            if pos.side == "BUY":
-                price_diff = current_price - pos.fill_price
-            else:  # SELL
-                price_diff = pos.fill_price - current_price
-            
-            if pos.tick_size is not None and pos.tick_value is not None and pos.tick_size > 0:
-                ticks = price_diff / pos.tick_size
-                unrealized_pnl = ticks * pos.tick_value * pos.lot_size
-            else:
-                unrealized_pnl = price_diff * pos.lot_size
+            unrealized_pnl = pos.get_unrealized_pnl(current_price)
         
         self.equity_curve.append({
             'bar': self.current_bar_index,
@@ -1274,7 +1492,7 @@ class BacktestStrategy(Strategy):
             'equity': self.current_balance + unrealized_pnl
         })
     
-    def run_backtest(self, show_progress=True, progress_prefix="", progress_line=None, suppress_header=False):
+    def run_backtest(self, show_progress=True, progress_prefix="", progress_line=None, suppress_header=False, progress_callback=None, progress_step_pct=10):
         """Run the backtest on historical data"""
         if not suppress_header:
             print(f"\n{'='*60}")
@@ -1294,6 +1512,7 @@ class BacktestStrategy(Strategy):
         
         total_bars = len(self.historical_data)
         progress_interval = max(1, total_bars // 100)  # Update more frequently for smoother progress
+        next_callback_pct = float(progress_step_pct) if progress_callback else None
         
         while self.current_bar_index < len(self.historical_data) and not self.strategy_failed:
             self.fetch_new_data()
@@ -1319,24 +1538,18 @@ class BacktestStrategy(Strategy):
                     # Default behavior: overwrite same line (single backtest mode)
                     print(progress_msg, end='\r', file=sys.stderr)
                     sys.stderr.flush()
+            elif progress_callback is not None:
+                progress = (self.current_bar_index / total_bars) * 100
+                if next_callback_pct is not None and progress >= next_callback_pct:
+                    progress_callback(progress, self.current_bar_index, total_bars)
+                    next_callback_pct += progress_step_pct
             
             # Check max loss after each bar (in case of open position drawdown)
             if self.active_order and self.active_order.filled:
                 current_bar = self.data.iloc[-1]
                 current_price = current_bar['close']
                 
-                if self.active_order.side == "BUY":
-                    price_diff = current_price - self.active_order.fill_price
-                else:  # SELL
-                    price_diff = self.active_order.fill_price - current_price
-                
-                if (self.active_order.tick_size is not None and 
-                    self.active_order.tick_value is not None and 
-                    self.active_order.tick_size > 0):
-                    ticks = price_diff / self.active_order.tick_size
-                    unrealized_pnl = ticks * self.active_order.tick_value * self.active_order.lot_size
-                else:
-                    unrealized_pnl = price_diff * self.active_order.lot_size
+                unrealized_pnl = self.active_order.get_unrealized_pnl(current_price)
                 
                 current_equity = self.current_balance + unrealized_pnl
                 total_loss = self.initial_balance - current_equity
@@ -1369,6 +1582,8 @@ class BacktestStrategy(Strategy):
             else:
                 print(progress_msg, end='\r', file=sys.stderr)
                 sys.stderr.flush()
+        elif progress_callback is not None:
+            progress_callback(100.0, total_bars, total_bars)
         
         return self._get_backtest_results()
     
@@ -1799,7 +2014,7 @@ def _get_current_strategy_params():
     return current_params
 
 
-def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, params_dict, verbose=False, progress_prefix="", progress_line=None, direct_file_path=None, save_individual_results=False):
+def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, params_dict, verbose=False, progress_prefix="", progress_line=None, direct_file_path=None, save_individual_results=False, show_progress=True, progress_callback=None, progress_step_pct=PROGRESS_STEP_PCT, return_error=False):
     """
     Run a single backtest with given parameters and return results
     
@@ -1830,12 +2045,16 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
         if historical_data is None:
             if verbose:
                 print(f"❌ Failed to load data for {asset_name} {timeframe}")
+            if return_error:
+                return None, f"Failed to load data for {asset_name} {timeframe}"
             return None
         
         # Check if data is empty after loading
         if len(historical_data) == 0:
             if verbose:
                 print(f"❌ No data available for {asset_name} {timeframe} after loading")
+            if return_error:
+                return None, f"No data available for {asset_name} {timeframe} after loading"
             return None
         
         # Create and run backtest with captured parameters
@@ -1852,10 +2071,12 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
             # This catches the "Not enough historical data" error from init_rest
             if verbose:
                 print(f"❌ Error initializing backtest: {e}")
+            if return_error:
+                return None, f"Error initializing backtest: {e}"
             return None
         
         # Run with progress shown even when not verbose
-        results = backtest.run_backtest(show_progress=True, progress_prefix=progress_prefix, progress_line=progress_line, suppress_header=not verbose)
+        results = backtest.run_backtest(show_progress=show_progress, progress_prefix=progress_prefix, progress_line=progress_line, suppress_header=not verbose, progress_callback=progress_callback, progress_step_pct=progress_step_pct)
         
         # Save individual results if requested (create gold_results/{id}/ folder)
         if save_individual_results and results is not None:
@@ -1884,10 +2105,17 @@ def _run_single_backtest(asset_name, timeframe, initial_balance, max_loss, param
         if not verbose and progress_prefix:
             print("", file=sys.stderr)  # New line after progress
         
+        if return_error:
+            return results, None
         return results
     except Exception as e:
+        # Always surface errors so failures aren't silent in multithreaded runs.
+        print(f"❌ Error in backtest: {e}", file=sys.stderr)
         if verbose:
-            print(f"❌ Error in backtest: {e}")
+            import traceback
+            traceback.print_exc()
+        if return_error:
+            return None, f"{type(e).__name__}: {e}"
         return None
     finally:
         if not verbose:
@@ -1916,6 +2144,31 @@ def _save_result_to_csv(result_row, csv_filename):
         else:
             # Create new file
             df_new.to_csv(csv_filename, index=False)
+
+
+def _run_backtest_worker(args):
+    """Worker for multiprocessing: run a single backtest and return results."""
+    combo_index, asset_name, combo_timeframe, initial_balance, max_loss, combo, combo_direct_file_path, progress_queue = args
+    def progress_callback(pct, current_bar, total_bars):
+        if progress_queue is not None:
+            progress_queue.put((combo_index, combo_timeframe, pct, current_bar, total_bars))
+    results, error_msg = _run_single_backtest(
+        asset_name,
+        combo_timeframe,
+        initial_balance,
+        max_loss,
+        combo,
+        verbose=False,
+        progress_prefix="",
+        progress_line=None,
+        direct_file_path=combo_direct_file_path,
+        save_individual_results=SAVE_INDIVIDUAL_RESULTS_IN_OPTIMIZATION,
+        show_progress=False,
+        progress_callback=progress_callback,
+        progress_step_pct=PROGRESS_STEP_PCT,
+        return_error=True,
+    )
+    return combo, combo_timeframe, results, error_msg
 
 
 def _generate_all_combinations():
@@ -2361,6 +2614,9 @@ def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0
         
         # Check if CSV has timeframe column
         use_csv_timeframes = any('timeframe' in combo for combo in combinations)
+        if not use_csv_timeframes and timeframe is None:
+            timeframe = BACKTEST_SELECTED_TIMEFRAME
+            print(f"ℹ️  CSV has no timeframe column. Using default timeframe: {timeframe}")
     else:
         # Determine if we're using random timeframes
         use_random_timeframes = (timeframe is None and timeframes_list is not None)
@@ -2466,6 +2722,11 @@ def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0
                     available_lines.sort()  # Keep sorted for consistent assignment
         
         if results is None:
+            print(
+                f"⚠️  Backtest failed for sample {combo_index + 1}/{total_combinations} "
+                f"(timeframe: {combo_timeframe}).",
+                file=sys.stderr
+            )
             return None
         
         # Create result row with all parameters and results
@@ -2522,18 +2783,111 @@ def optimize_strategy_random(asset_name, timeframe=None, initial_balance=50000.0
     best_result = None
     best_pnl = float('-inf')
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_combo = {
-            executor.submit(run_and_save, combo, idx): (combo, idx)
-            for idx, combo in enumerate(combinations)
-        }
-        
-        # Process completed tasks
-        for future in as_completed(future_to_combo):
-            combo, idx = future_to_combo[future]
+    if USE_MULTIPROCESSING:
+        manager = multiprocessing.Manager()
+        progress_queue = manager.Queue()
+        def progress_listener():
+            while True:
+                msg = progress_queue.get()
+                if msg is None:
+                    break
+                combo_index, combo_timeframe, pct, current_bar, total_bars = msg
+                tf_info = f" | TF: {combo_timeframe}" if (use_csv_timeframes or use_random_timeframes) else ""
+                print(f"   [Sample {combo_index + 1}/{total_combinations}] {pct:.0f}% ({current_bar}/{total_bars} bars){tf_info}")
+        listener_thread = Thread(target=progress_listener, daemon=True)
+        listener_thread.start()
+        # Multiprocessing: run backtests in separate processes, write CSV in parent
+        tasks = []
+        for idx, combo in enumerate(combinations):
+            combo_copy = combo.copy()
+            if use_csv_timeframes and 'timeframe' in combo_copy:
+                combo_timeframe = combo_copy.pop('timeframe')
+            elif use_random_timeframes:
+                combo_timeframe = combo_copy.pop('timeframe', timeframe)
+            else:
+                combo_timeframe = timeframe
+
+            combo_direct_file_path = direct_file_path
+            if (use_csv_timeframes or use_random_timeframes) and combo_timeframe in TIMEFRAME_FILE_MAP:
+                combo_direct_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[combo_timeframe])
+            tasks.append((idx, asset_name, combo_timeframe, initial_balance, max_loss, combo_copy, combo_direct_file_path, progress_queue))
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {executor.submit(_run_backtest_worker, task): i for i, task in enumerate(tasks)}
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    combo_used, combo_timeframe, results, error_msg = future.result()
+                    if results is None:
+                        if error_msg:
+                            print(f"   ⚠️  Backtest failed for combo {idx + 1}: {error_msg}")
+                        else:
+                            print(f"   ⚠️  Backtest failed for combo {idx + 1}: no results returned")
+                        continue
+
+                    result_row = combo_used.copy()
+                    if use_csv_timeframes or use_random_timeframes:
+                        result_row['timeframe'] = combo_timeframe
+                    result_row.update({
+                        'total_pnl': results['total_pnl'],
+                        'total_trades': results['total_trades'],
+                        'win_rate': results['win_rate'],
+                        'final_balance': results['final_balance'],
+                        'max_drawdown': results['max_drawdown'],
+                        'max_drawdown_pct': results['max_drawdown_pct'],
+                        'total_fees': results['total_fees'],
+                        'winning_trades': results['winning_trades'],
+                        'losing_trades': results['losing_trades'],
+                        'avg_win': results['avg_win'],
+                        'avg_loss': results['avg_loss'],
+                        'profit_factor': results['profit_factor'],
+                        'total_return': results['total_return'],
+                        'net_profit': results['net_profit'],
+                        'largest_win': results['largest_win'],
+                        'largest_loss': results['largest_loss'],
+                        'trades_per_day': results['trades_per_day'],
+                        'backtest_period_days': results['backtest_period_days'],
+                    })
+                    _save_result_to_csv(result_row, csv_filename)
+
+                    completed_count += 1
+                    progress_pct = (completed_count / total_combinations) * 100
+                    tf_info = f" | TF: {combo_timeframe}" if (use_csv_timeframes or use_random_timeframes) else ""
+                    print(
+                        f"   [{completed_count}/{total_combinations}] ({progress_pct:.1f}%) Completed | "
+                        f"P&L: ${results['total_pnl']:,.2f} | Trades: {results['total_trades']}{tf_info}"
+                    )
+
+                    if results['total_pnl'] > best_pnl:
+                        best_pnl = results['total_pnl']
+                        best_result = result_row
+                except Exception as e:
+                    print(f"   ⚠️  Error processing combination {idx + 1}: {e}")
+        progress_queue.put(None)
+        listener_thread.join()
+        manager.shutdown()
+    elif USE_MULTITHREADING:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_combo = {
+                executor.submit(run_and_save, combo, idx): (combo, idx)
+                for idx, combo in enumerate(combinations)
+            }
+            
+            # Process completed tasks
+            for future in as_completed(future_to_combo):
+                combo, idx = future_to_combo[future]
+                try:
+                    result = future.result()
+                    if result is not None and result['total_pnl'] > best_pnl:
+                        best_pnl = result['total_pnl']
+                        best_result = result
+                except Exception as e:
+                    print(f"   ⚠️  Error processing combination {idx + 1}: {e}")
+    else:
+        for idx, combo in enumerate(combinations):
             try:
-                result = future.result()
+                result = run_and_save(combo, idx)
                 if result is not None and result['total_pnl'] > best_pnl:
                     best_pnl = result['total_pnl']
                     best_result = result
@@ -2732,9 +3086,9 @@ def optimize_strategy(asset_name, timeframe, initial_balance=50000.0, max_loss=2
 
 # ==================== MAIN EXECUTION ====================
 
-def run_backtest_example(asset_name="MGCG6", timeframe="15min", 
-                         initial_balance=50000.0, max_loss=2000, direct_file_path=None,
-                         start_date=None, end_date=None):
+def run_backtest_example(asset_name=BACKTEST_ASSET_NAME, timeframe=BACKTEST_SELECTED_TIMEFRAME, 
+                         initial_balance=BACKTEST_INITIAL_BALANCE, max_loss=BACKTEST_MAX_LOSS, direct_file_path=None,
+                         start_date=BACKTEST_START_DATE, end_date=BACKTEST_END_DATE):
     """Example of how to run a backtest"""
     historical_data, asset_tuple, contract_id = load_backtest_data(asset_name, timeframe, direct_file_path=direct_file_path)
     
@@ -2782,10 +3136,10 @@ def run_backtest_example(asset_name="MGCG6", timeframe="15min",
 if __name__ == "__main__":
     # Initialize data structures once
     initialize_backtest_data()
-        # Configuration for backtest
-    asset_name = "MGCG6"  # Gold contract from contracts.csv
-    initial_balance = 50000.0
-    max_loss = 2000
+    # Configuration for backtest
+    asset_name = BACKTEST_ASSET_NAME
+    initial_balance = BACKTEST_INITIAL_BALANCE
+    max_loss = BACKTEST_MAX_LOSS
     
     # Get optimal worker count (auto-detect or use manual setting)
     optimal_workers = get_optimal_worker_count()
@@ -2802,12 +3156,16 @@ if __name__ == "__main__":
     # Timeframe selection
     # For single backtest: choose one timeframe ("5min", "30min", or "1h")
     # For optimization: will iterate through all timeframes
-    SELECTED_TIMEFRAME = "5min"  # Change this to "5min", "30min", or "1h" for single backtest
+    SELECTED_TIMEFRAME = BACKTEST_SELECTED_TIMEFRAME  # Change this to "5min", "30min", or "1h" for single backtest
     
     # Timeframes to test for optimization (skip 15min as already done)
-    timeframes_to_test = ["5min","15min", "30min", "1h"]
+    timeframes_to_test = BACKTEST_TIMEFRAMES_TO_TEST
     
     # =================================================
+    direct_file_path = None
+    if USE_DIRECT_DATA_FILE and DIRECT_DATA_FILE_PATH:
+        direct_file_path = DIRECT_DATA_FILE_PATH
+        print(f"📂 Using direct data file: {direct_file_path}")
     
     if RUN_OPTIMIZATION:
         if USE_CSV_INPUT:
@@ -2819,36 +3177,52 @@ if __name__ == "__main__":
             
             optimize_strategy_random(asset_name, timeframe=None, initial_balance=initial_balance, max_loss=max_loss, 
                                     max_workers=optimal_workers, num_samples=RANDOM_SEARCH_SAMPLES, 
-                                    direct_file_path=None, timeframes_list=timeframes_to_test, 
+                                    direct_file_path=direct_file_path, timeframes_list=timeframes_to_test, 
                                     csv_input_file=CSV_INPUT_FILE)
         elif USE_EXHAUSTIVE_SEARCH:
-            # Exhaustive search: run for each timeframe separately
-            for timeframe in timeframes_to_test:
-                # Get file path from mapping
-                if timeframe in TIMEFRAME_FILE_MAP:
-                    direct_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[timeframe])
-                    print(f"\n{'='*60}")
-                    print(f"🔄 Processing timeframe: {timeframe}")
-                    print(f"📂 Data file: {direct_file_path}")
-                    print(f"{'='*60}\n")
-                    
-                    optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, optimal_workers, direct_file_path=direct_file_path)
-                else:
-                    print(f"⚠️  Warning: No file mapping for timeframe {timeframe}, skipping...")
+            if direct_file_path:
+                print(f"\n{'='*60}")
+                print(f"🔄 Exhaustive Search (Direct File)")
+                print(f"📂 Data file: {direct_file_path}")
+                print(f"{'='*60}\n")
+                optimize_strategy_multithreaded(asset_name, SELECTED_TIMEFRAME, initial_balance, max_loss, optimal_workers, direct_file_path=direct_file_path)
+            else:
+                # Exhaustive search: run for each timeframe separately
+                for timeframe in timeframes_to_test:
+                    # Get file path from mapping
+                    if timeframe in TIMEFRAME_FILE_MAP:
+                        mapped_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[timeframe])
+                        print(f"\n{'='*60}")
+                        print(f"🔄 Processing timeframe: {timeframe}")
+                        print(f"📂 Data file: {mapped_file_path}")
+                        print(f"{'='*60}\n")
+                        
+                        optimize_strategy_multithreaded(asset_name, timeframe, initial_balance, max_loss, optimal_workers, direct_file_path=mapped_file_path)
+                    else:
+                        print(f"⚠️  Warning: No file mapping for timeframe {timeframe}, skipping...")
         else:
             # Random search: timeframe is randomly selected for each sample
-            print(f"\n{'='*60}")
-            print(f"🔄 Random Search with Random Timeframes")
-            print(f"📂 Timeframes: {', '.join(timeframes_to_test)}")
-            print(f"{'='*60}\n")
-            
-            optimize_strategy_random(asset_name, timeframe=None, initial_balance=initial_balance, max_loss=max_loss, 
-                                    max_workers=optimal_workers, num_samples=RANDOM_SEARCH_SAMPLES, 
-                                    direct_file_path=None, timeframes_list=timeframes_to_test)
+            if direct_file_path:
+                print(f"\n{'='*60}")
+                print(f"🔄 Random Search (Direct File)")
+                print(f"📂 Data file: {direct_file_path}")
+                print(f"{'='*60}\n")
+                
+                optimize_strategy_random(asset_name, timeframe=SELECTED_TIMEFRAME, initial_balance=initial_balance, max_loss=max_loss, 
+                                        max_workers=optimal_workers, num_samples=RANDOM_SEARCH_SAMPLES, 
+                                        direct_file_path=direct_file_path, timeframes_list=None)
+            else:
+                print(f"\n{'='*60}")
+                print(f"🔄 Random Search with Random Timeframes")
+                print(f"📂 Timeframes: {', '.join(timeframes_to_test)}")
+                print(f"{'='*60}\n")
+                
+                optimize_strategy_random(asset_name, timeframe=None, initial_balance=initial_balance, max_loss=max_loss, 
+                                        max_workers=optimal_workers, num_samples=RANDOM_SEARCH_SAMPLES, 
+                                        direct_file_path=None, timeframes_list=timeframes_to_test)
     else:
         # Run single backtest for selected timeframe
-        if SELECTED_TIMEFRAME in TIMEFRAME_FILE_MAP:
-            direct_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[SELECTED_TIMEFRAME])
+        if direct_file_path:
             print(f"\n{'='*60}")
             print(f"🔄 Processing timeframe: {SELECTED_TIMEFRAME}")
             print(f"📂 Data file: {direct_file_path}")
@@ -2860,7 +3234,24 @@ if __name__ == "__main__":
                 initial_balance,
                 max_loss,
                 direct_file_path=direct_file_path,
-                start_date="2025-03-03"
+                start_date=BACKTEST_START_DATE,
+                end_date=BACKTEST_END_DATE
+            )
+        elif SELECTED_TIMEFRAME in TIMEFRAME_FILE_MAP:
+            mapped_file_path = os.path.join("data", asset_name, TIMEFRAME_FILE_MAP[SELECTED_TIMEFRAME])
+            print(f"\n{'='*60}")
+            print(f"🔄 Processing timeframe: {SELECTED_TIMEFRAME}")
+            print(f"📂 Data file: {mapped_file_path}")
+            print(f"{'='*60}\n")
+            
+            run_backtest_example(
+                asset_name,
+                SELECTED_TIMEFRAME,
+                initial_balance,
+                max_loss,
+                direct_file_path=mapped_file_path,
+                start_date=BACKTEST_START_DATE,
+                end_date=BACKTEST_END_DATE
             )
         else:
             print(f"❌ Error: Invalid timeframe '{SELECTED_TIMEFRAME}'")
