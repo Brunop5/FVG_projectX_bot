@@ -14,7 +14,7 @@ input int ATR_Period = 18;
 input double MinFVGPowerPct = 0.01;
 input int    FVGHistoryNbr  = 15;  // Number of FVGs to track (replaces hardcoded 10 and 50)
 
-input double SL_ATR_Mult = 1.0;
+input double SL_ATR_Mult = 2.0;
 input double TP_ATR_Mult = 19.0;
 
 input bool   UseTrailing   = true;
@@ -42,7 +42,7 @@ input int    MaxDailyTrades = 10;  // Maximum trades per day
 input bool   UseVolumeCheck = false;  // Enable volume check
 input double VolumeMultiplier = 5;  // Volume multiplier for marketOK check
 input bool   HoldUntilOpposite = false;  // Close on opposite BOS/CHoCH
-input bool   AllowIntracandleChecks = false;  // If true: check price every tick for FVG touch
+input bool   AllowIntracandleChecks = true;  // If true: check price every tick for FVG touch
 int    MagicNumber = 20260120;  // Magic number to track EA positions
 
 // ================= STRUCTS =================
