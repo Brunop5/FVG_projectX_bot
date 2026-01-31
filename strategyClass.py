@@ -350,14 +350,14 @@ class Strategy:
         self.isBOS = crossover(
             self.cur_close,
             previous_close,
-            self.prevStructureHigh,  # prevStructureHigh[1] in PineScript
+            prevStructureHigh,  # prevStructureHigh[1] in PineScript
         )
 
         # PineScript: isCHOCH = ta.crossunder(close, prevStructureLow[1])
         self.isCHOCH = crossunder(
             self.cur_close,
             previous_close,
-            self.prevStructureLow,   # prevStructureLow[1] in PineScript
+            prevStructureLow,   # prevStructureLow[1] in PineScript
         )
 
     def calculate_indicators(self):
