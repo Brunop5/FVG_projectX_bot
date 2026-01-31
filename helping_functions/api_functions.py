@@ -278,7 +278,7 @@ def fetch_data_(ugh, eeehm, lol, tok=None, l=False):
     
 def load_data(asset, timeframe):
     """
-    If asset data exist and are not older than 35 mins, it returns them as pandas df.
+    If asset data exist and are not older than 35 seconds, it returns them as pandas df.
     otherwise returns None
     """
     path = f"{asset}-{timeframe}.csv"

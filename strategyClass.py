@@ -243,8 +243,6 @@ class Strategy:
         self.bearishPowerOK = None
         self.isBOS = False
         self.isCHOCH = False
-        self.prevStructureHigh = None
-        self.prevStructureLow = None
 
         self.inPosition = False
         self.lastBullFvg = False
@@ -344,8 +342,8 @@ class Strategy:
         self.lastBearFvg = self.data["low"].iloc[-4] > self.data["high"].iloc[-2] and not self.lastBearFvg
 
     def calc_BOS_and_CHOCH(self):
-        self.prevStructureHigh = self.data["high"].iloc[-21:-1].max()
-        self.prevStructureLow = self.data["low"].iloc[-21:-1].min()
+        prevStructureHigh = self.data["high"].iloc[-21:-1].max()
+        prevStructureLow = self.data["low"].iloc[-21:-1].min()
 
         previous_close = self.data["close"].iloc[-2]
 

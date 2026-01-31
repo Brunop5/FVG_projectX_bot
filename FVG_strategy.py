@@ -1,3 +1,4 @@
+from FVG_projectX_bot.helping_functions.api_functions import TIMEFRAME_SECONDS
 from ..strategyTemplate import Strategy, Order
 
 
@@ -106,3 +107,18 @@ class FVG_Order(Order):
                 return True
         
         return False
+
+
+class FVG_Strategy(Strategy):
+    timeframe: str  #"15min" or "1h" or such
+    cur_close: float
+    cur_volume: float
+    isBullishHTF: bool
+    isBearishHTF: bool
+    marketOK: bool
+    bullishPowerOK: bool
+    bearishPowerOK: bool
+    isBOS: bool = False
+    isCHOCH: bool = False
+
+    
