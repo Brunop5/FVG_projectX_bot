@@ -6,7 +6,7 @@ Filter backtest results based on specific criteria.
 import pandas as pd
 
 # ===== CONFIGURATION =====
-INPUT_CSV = "gold_results/optimization_results_15min_20260125_135551.csv"
+INPUT_CSV = "gold_results/optimization_results_15min_20260126_153345.csv"
 OUTPUT_CSV = "filtered_backtest_results.csv"
 
 # Filter criteria
