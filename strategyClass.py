@@ -11,28 +11,28 @@ metadata_lock = threading.Lock()
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 11              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.08          # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 14              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "30"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 50                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.5
+HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 100                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.25
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 7                    # ATR Period (min 1)
-SL_MULTIPLIER = 10               # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 13                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 22                    # ATR Period (min 1)
+SL_MULTIPLIER = 6               # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 1                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
-USE_TRAILING = False                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 1            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
+TRAIL_OFFSET_MULT = 10            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
-HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
+HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)

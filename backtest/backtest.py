@@ -57,7 +57,7 @@ USE_MULTITHREADING = False
 USE_MULTIPROCESSING = True  # if True, uses process pool for random optimization
 # Optional direct data file override (CSV)
 USE_DIRECT_DATA_FILE = True
-DIRECT_DATA_FILE_PATH = "data/MGCG6/1mdata_gold_15min.csv"
+DIRECT_DATA_FILE_PATH = "data/MGCG6/IC_markets_15min.csv"
 
 # CFD pricing configuration (used when USE_CFD_PRICING is True)
 USE_CFD_PRICING = False
@@ -140,10 +140,10 @@ PROGRESS_STEP_PCT = 5  # Progress update granularity for multiprocessing (per sa
 USE_AUTO_WORKERS = True  # If True: auto-detect CPU count and use that many workers
 MAX_WORKERS = 4  # Manual override (ignored if USE_AUTO_WORKERS is True). Set to number like 8, 16, etc.
 
-USE_FIRST_TENTH_ONLY = True
+USE_FIRST_TENTH_ONLY = False
 
 # CSV Input Settings (alternative to random/exhaustive search)
-USE_CSV_INPUT = False  # If True: read parameter combinations from CSV file instead of generating them
+USE_CSV_INPUT = True  # If True: read parameter combinations from CSV file instead of generating them
 CSV_INPUT_FILE = "filtered_backtest_results.csv"  # Path to CSV file with strategy parameters 
 
 # Result Saving Settings
