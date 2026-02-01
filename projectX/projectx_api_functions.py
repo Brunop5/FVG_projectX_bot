@@ -2,9 +2,7 @@ import pandas as pd
 import os
 import time
 import requests
-import shutil
 from datetime import datetime, timedelta, timezone
-from signalrcore.hub_connection_builder import HubConnectionBuilder
 import logging
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 # Massive API is accessed via direct HTTP requests
@@ -139,7 +137,7 @@ def _map_timeframe_to_unit(timeframe: str):
     # Fallback (minutes)
     return 2, number
 
-def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
+def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_partial_bar=False):
 
     """
     Fetch historical bar data from TopStepX API.
@@ -200,7 +198,7 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
         "unit": unit,
         "unitNumber": unit_number,
         "limit": num_bars,
-        "includePartialBar": False
+        "includePartialBar": include_partial_bar
     }
     
     try:
@@ -232,7 +230,7 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False):
                 df = df.iloc[::-1].reset_index(drop=True)
                 return df
             else:
-                return pd.DataFrame()  # Empty DataFrame if no data
+                return None  # Empty DataFrame if no data
         else:
             print(f"Error fetching data: {response.status_code} - {response.text}")
             return None
@@ -291,56 +289,6 @@ def load_data(asset, timeframe):
 
     else:
         return None
-
-def stream_market_data(token: str, contract_id: str, callback, user_name, api_key):
-    response = login_to_api(user_name, api_key)
-    if response["success"]:
-        print("new_token")
-        token = response["token"]
-    market_hub_url = f"https://rtc.topstepx.com/hubs/market?access_token={token}"
-
-    hub_connection = HubConnectionBuilder()\
-        .with_url(
-            market_hub_url,
-            options={
-                "access_token_factory": lambda: token
-            }
-        )\
-        .configure_logging(logging.INFO)\
-        .with_automatic_reconnect({
-            "type": "raw",
-            "keep_alive_interval": 10,
-            "reconnect_interval": 5
-        })\
-        .build()
-
-    # Event handler
-    def handle_event(args):
-        if isinstance(args, list) and len(args) >= 2:
-            _, data = args
-            callback(data)
-        elif isinstance(args, dict):
-            callback(args)
-        else:
-            print("Warning: unexpected payload format:", args)
-
-    hub_connection.on("GatewayQuote", handle_event)
-
-    # Subscribe when connection is open
-    def on_open():
-        print(f"Connected. Subscribing to {contract_id}")
-        hub_connection.invoke("SubscribeContractQuotes", [contract_id])
-
-    hub_connection.on_open(on_open)
-    hub_connection.start()
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        hub_connection.invoke("UnsubscribeContractQuotes", [contract_id])
-        hub_connection.stop()
-        print("Connection closed.")
 
 
 def sleep_until_next_boundary(timeframe: str):
