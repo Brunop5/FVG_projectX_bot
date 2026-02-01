@@ -4,17 +4,16 @@ import threading
 from abc import abstractmethod
 from datetime import datetime
 
-from FVG_projectX_bot.helping_functions.indicators import get_atr
-from FVG_projectX_bot.helping_functions.indicators import sma
-from FVG_projectX_bot.helping_functions.indicators import ema
-from FVG_projectX_bot.helping_functions.indicators import crossover
-from FVG_projectX_bot.helping_functions.indicators import crossunder
+from .helping_functions.indicators import get_atr
+from .helping_functions.indicators import sma
+from .helping_functions.indicators import ema
+from .helping_functions.indicators import crossover
+from .helping_functions.indicators import crossunder
 
-from FVG_projectX_bot.helping_functions.api_functions import sleep_until_next_boundary
-from FVG_projectX_bot.helping_functions.api_functions import TIMEFRAME_SECONDS
+from .projectX.projectx_api_functions import sleep_until_next_boundary
 
 
-from ..strategyTemplate import Strategy, Order
+from strategyTemplate import Strategy, Order
 
 
 # ==================== CONFIGURATION PARAMETERS ====================
@@ -61,13 +60,8 @@ class FVG_Order(Order):
     entry_atr: float
 
     def __init__(
-        self, entry_atr, side, entry_price, take_profit, stop_loss, 
-        trailing_stop_loss, order_size, use_trailing=USE_TRAILING
-        ):
-        super().__init__(
-            side, entry_price, order_size, take_profit, stop_loss, 
-            trailing_stop_loss, use_trailing
-        )
+        self, entry_atr, **kwargs):
+        super().__init__(**kwargs)
 
         self.entry_atr = entry_atr
 
@@ -152,10 +146,8 @@ class FVG_Strategy(Strategy):
 
     fvg_zones: list[dict]
     
-    def __init__(self, timeframe, metadata_filename, csv_filename):
-        self.timeframe = timeframe
-        self.metadata_filename = metadata_filename
-        self.csv_filename = csv_filename
+    def __init__(self):
+        print("layer 2 init")
         self.isBOS = False
         self.isCHOCH = False
 
@@ -403,8 +395,8 @@ class FVG_Strategy(Strategy):
                 lot_size = self.calculate_order_size(atr=atr, sl_mult=SL_MULTIPLIER)
 
                 active_order = self.Order(
-                    side="BUY", entry_price=self.cur_close, take_profit=tp,
-                    stop_loss=stop_loss, trailing_stop_loss=trail_stop, entry_atr=entryAtr, order_size=lot_size,
+                    entry_atr=entryAtr, side="BUY", entry_price=self.cur_close, take_profit=tp,
+                    stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=lot_size,
                     **self.api_order_kwargs()
                 )
                 result = active_order.place_order()
@@ -438,8 +430,8 @@ class FVG_Strategy(Strategy):
                 entryAtr = atr
                 lot_size = self.calculate_order_size(atr=atr, sl_mult=SL_MULTIPLIER)
                 active_order = self.Order(
-                    side="SELL", entry_price=self.cur_close, take_profit=tp,
-                    trailing_stop_loss=trail_stop, stop_loss=stop_loss, entry_atr=entryAtr, order_size=lot_size,
+                    entry_atr=entryAtr, side="SELL", entry_price=self.cur_close, take_profit=tp,
+                    trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=lot_size,
                     **self.api_order_kwargs()
                 )
                 result = active_order.place_order()
@@ -499,7 +491,6 @@ class FVG_Strategy(Strategy):
         self.entry_logic()
         self.update_stops()
         self.save_data()
-        self.subscribe_to_price_updates()
 
     def bar_iteration(self):
         with self._lock:
@@ -509,5 +500,3 @@ class FVG_Strategy(Strategy):
             self.entry_logic()
             self.update_stops()
             self.save_data()
-        print(f"\n⏰ New bar - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} close: {self.cur_close}")
-
