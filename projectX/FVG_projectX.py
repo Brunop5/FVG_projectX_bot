@@ -19,7 +19,7 @@ from .projectx_api_functions import sleep_until_next_boundary
 
 
 
-ASSETS = [("CON.F.US.GCE.G26","1min", "PRAC-V2-252499-51361945")]
+ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-38617147")]
 
 load_dotenv()
 USERNAME = os.getenv("USERNAME")
