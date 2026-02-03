@@ -18,32 +18,32 @@ from strategyTemplate import Strategy, Order
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 14              # Number of FVGs to work with
+FVG_HISTORY_NBR = 9              # Number of FVGs to work with
 MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
+HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
 EMA_PERIOD = 100                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.25
+VOLUME_MULTIPLIER = 1.3
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 22                    # ATR Period (min 1)
-SL_MULTIPLIER = 6               # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 1                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 18                    # ATR Period (min 1)
+SL_MULTIPLIER = 5.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 20                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 10            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+TRAIL_OFFSET_MULT = 1            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
-HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
+HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 1                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 0.002                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -243,7 +243,6 @@ class FVG_Strategy(Strategy):
 
         with self._lock:
             self.cur_close = new_row["close"].iloc[-1]
-            print(f"updated price: {self.cur_close}")
 
             if len(self.active_orders) > 0:
                 self.update_stops()
@@ -270,12 +269,12 @@ class FVG_Strategy(Strategy):
             self.fvg_zones.append(
                 {
                     "direction": "bull",
-                    "top": self.data["low"].iloc[-2],     # low[1]
-                    "bottom": self.data["high"].iloc[-4], # high[3]
+                    "top": self.data["low"].iloc[-1],     # low[1]
+                    "bottom": self.data["high"].iloc[-3], # high[3]
                     "mitigated": False,
                 }
             )
-            print(f"🟢 Bullish FVG detected: {self.data['high'].iloc[-4]:.5f} - {self.data['low'].iloc[-2]:.5f}")
+            print(f"🟢 Bullish FVG detected: {self.data['high'].iloc[-3]:.5f} - {self.data['low'].iloc[-1]:.5f}")
 
 
         if self.bearishPowerOK and self.isBearishHTF and self.marketOK:
@@ -283,12 +282,12 @@ class FVG_Strategy(Strategy):
             self.fvg_zones.append(
                 {
                     "direction": "bear",
-                    "top": self.data["low"].iloc[-4],     # low[3]
-                    "bottom": self.data["high"].iloc[-2], # high[1]
+                    "top": self.data["low"].iloc[-3],     # low[3]
+                    "bottom": self.data["high"].iloc[-1], # high[1]
                     "mitigated": False,
                 }
             )
-            print(f"🔴 Bearish FVG detected: {self.data['high'].iloc[-2]:.5f} - {self.data['low'].iloc[-4]:.5f}")
+            print(f"🔴 Bearish FVG detected: {self.data['high'].iloc[-1]:.5f} - {self.data['low'].iloc[-3]:.5f}")
 
 
         # Limit number of stored FVGs, similar to fvgHistoryNbr trimming in Pine
@@ -300,22 +299,28 @@ class FVG_Strategy(Strategy):
         bars = self.fetch_htf_data()
         htfEMA = ema(bars, EMA_PERIOD)
 
-        self.isBullishHTF = self.cur_close > htfEMA
-        self.isBearishHTF = self.cur_close < htfEMA
+        if htfEMA is None:
+            self.isBullishHTF = False
+            self.isBearishHTF = False
+        else:
+            self.isBullishHTF = self.cur_close > htfEMA
+            self.isBearishHTF = self.cur_close < htfEMA
 
         atrVal = get_atr(self.data, ATR_PERIOD)
-        atrOK = atrVal.iloc[-1] > sma(atrVal, 20)
+        atr_sma = sma(atrVal, 20) if len(atrVal) > 0 else None
+        atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
         
         if USE_VOLUME_CHECK:
-            volOK = self.cur_volume > sma(self.data["volume"], 20) * VOLUME_MULTIPLIER
+            vol_sma = sma(self.data["volume"], 20)
+            volOK = self.cur_volume > vol_sma * VOLUME_MULTIPLIER if vol_sma is not None else False
             self.marketOK = volOK and atrOK
         else:
             # Skip volume check, only use ATR
             self.marketOK = atrOK
 
 
-        self.lastBullFvg = self.data["high"].iloc[-4] < self.data["low"].iloc[-2] and not self.lastBullFvg
-        self.lastBearFvg = self.data["low"].iloc[-4] > self.data["high"].iloc[-2] and not self.lastBearFvg
+        self.lastBullFvg = self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
+        self.lastBearFvg = self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
 
     def _calc_BOS_and_CHOCH(self):
         prevStructureHigh = self.data["high"].iloc[-21:-1].max()
@@ -342,12 +347,12 @@ class FVG_Strategy(Strategy):
 
         self.bullishPowerOK = (
             self.lastBullFvg
-            and (self.data["low"].iloc[-2] - self.data["high"].iloc[-4]) / gapClose * 100 >= MIN_FVG_POWER_PCT
+            and (self.data["low"].iloc[-1] - self.data["high"].iloc[-3]) / gapClose * 100 >= MIN_FVG_POWER_PCT
         )
 
         self.bearishPowerOK = (
             self.lastBearFvg
-            and (self.data["low"].iloc[-4] - self.data["high"].iloc[-2]) / gapClose * 100 >= MIN_FVG_POWER_PCT
+            and (self.data["low"].iloc[-3] - self.data["high"].iloc[-1]) / gapClose * 100 >= MIN_FVG_POWER_PCT
         )
 
         self._calc_BOS_and_CHOCH()

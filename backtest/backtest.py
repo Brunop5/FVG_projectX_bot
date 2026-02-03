@@ -1118,8 +1118,8 @@ class BacktestStrategy(Strategy):
             self.marketOK = atrOK
         
         # Update FVG detection flags
-        self.lastBullFvg = self.data["high"].iloc[-4] < self.data["low"].iloc[-2] and not self.lastBullFvg
-        self.lastBearFvg = self.data["low"].iloc[-4] > self.data["high"].iloc[-2] and not self.lastBearFvg
+        self.lastBullFvg = self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
+        self.lastBearFvg = self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
     
     def _update_trend_indicators_resample(self):
         """Fallback method: resample current timeframe data to HTF"""
