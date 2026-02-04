@@ -10,7 +10,7 @@ import pandas as pd
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
-from ..FVG_strategy import FVG_Order, FVG_Strategy, HTF_TF, EMA_PERIOD
+from ..FVG_strategy import USE_TRAILING, FVG_Order, FVG_Strategy, HTF_TF, EMA_PERIOD
 from ..FVG_strategy import USE_FIXED_LOT, FIXED_LOT, MAX_DAILY_TRADES
 from ..FVG_strategy import RISK_PERCENT, ORDER_SIZE
 
@@ -128,6 +128,7 @@ class Binance_Order(FVG_Order):
         self.symbol = symbol
         self._client = client
         self._position_side = None
+        self.use_trailing = USE_TRAILING
 
         if self._client is not None:
             try:
@@ -316,6 +317,10 @@ class Binance_Strategy(FVG_Strategy):
                     return
                 close = float(kline.get("c"))
                 volume = float(kline.get("v", 0))
+                print(
+                    f"🧪 ws tick: close={close} high={kline.get('h')} low={kline.get('l')} "
+                    f"ts={kline.get('t')} x={kline.get('x')}"
+                )
                 new_row = pd.DataFrame([{"close": close, "volume": volume}])
                 self.update_price(new_row)
             except Exception as exc:

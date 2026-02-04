@@ -51,6 +51,7 @@ ORDER_SIZE = 1                     # Default order size (overridden by risk calc
 MAX_DAILY_TRADES = 3
 
 ALLOW_INTRACANDLE_ENTRY = True
+DEBUG_STOPS = True
 
 def quiet_log(msg):
     pass
@@ -72,6 +73,14 @@ class FVG_Order(Order):
         last_short = kwargs["last_short"] 
         isBOS = kwargs["isBOS"]
         isCHOCH = kwargs["isCHOCH"] 
+        if DEBUG_STOPS:
+            log(
+                f"🧪 check_close_conditions: side={self.side} "
+                f"price={current_price} tsl={self.trailing_stop_loss} "
+                f"sl={self.stop_loss} tp={self.take_profit} "
+                f"last_long={last_long} last_short={last_short} "
+                f"isBOS={isBOS} isCHOCH={isCHOCH}"
+            )
 
         if self.side == "BUY":
             if self.trailing_stop_loss is not None and current_price <= self.trailing_stop_loss:
@@ -243,8 +252,17 @@ class FVG_Strategy(Strategy):
 
         with self._lock:
             self.cur_close = new_row["close"].iloc[-1]
+            if DEBUG_STOPS:
+                print(
+                    f"🧪 update_price: close={self.cur_close} "
+                    f"orders={len(self.active_orders)} "
+                    f"last_long={self.lastPositionWasLong} "
+                    f"last_short={self.lastPositionWasShort}"
+                )
 
             if len(self.active_orders) > 0:
+                if DEBUG_STOPS:
+                    print("🧪 update_price: calling update_stops + check_close_conditions")
                 self.update_stops()
                 closed = self.active_orders[0].check_close_conditions(
                     current_price=self.cur_close, 
@@ -461,6 +479,11 @@ class FVG_Strategy(Strategy):
 
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
+        if DEBUG_STOPS:
+            print(
+                f"🧪 update_stops: side={pos.side} high={current_high} low={current_low} "
+                f"entry_atr={pos.entry_atr} tsl={pos.trailing_stop_loss}"
+            )
 
         # === UPDATE TRAILING STOPS ===
         if self.lastPositionWasLong:
