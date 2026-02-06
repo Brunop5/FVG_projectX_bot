@@ -51,7 +51,7 @@ ORDER_SIZE = 1                     # Default order size (overridden by risk calc
 MAX_DAILY_TRADES = 3
 
 ALLOW_INTRACANDLE_ENTRY = True
-DEBUG_STOPS = True
+DEBUG_STOPS = False
 
 def quiet_log(msg):
     pass
@@ -508,17 +508,6 @@ class FVG_Strategy(Strategy):
                 else:
                     pos.trailing_stop_loss = potentialStop
 
-    def first_iteration(self):
-        print("🚀 Starting first iteration...")
-        print("Waiting for the first closing bar")
-        sleep_until_next_boundary(self.timeframe)
-
-        self.data = self.gather_data()
-        self.update_indicators()
-        self.add_fvg_zones()
-        self.entry_logic()
-        self.update_stops()
-        self.save_data()
 
     def bar_iteration(self):
         with self._lock:

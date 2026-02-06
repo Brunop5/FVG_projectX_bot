@@ -12,19 +12,20 @@ from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClie
 
 from ..FVG_strategy import USE_TRAILING, FVG_Order, FVG_Strategy, HTF_TF, EMA_PERIOD
 from ..FVG_strategy import USE_FIXED_LOT, FIXED_LOT, MAX_DAILY_TRADES
-from ..FVG_strategy import RISK_PERCENT, ORDER_SIZE
+from ..FVG_strategy import RISK_PERCENT, ORDER_SIZE, DEBUG_STOPS
 
 from ..projectX.projectx_api_functions import sleep_until_next_boundary
 
 
 ASSETS = [("BTCUSDT", "15min")]  # BTCUSDT perpetual (USDT-margined)
-USE_CONTINUOUS_KLINES = True
+USE_CONTINUOUS_KLINES = False
 CONTRACT_TYPE = "PERPETUAL"
 
 BINANCE_BASE_URL = "https://fapi.binance.com"
 BINANCE_TESTNET_URL = "https://testnet.binancefuture.com"
-WEBSOCKET_BASE_URL = "wss://fstream.binance.com/ws"
-WEBSOCKET_TESTNET_URL = "wss://stream.binancefuture.com/ws"
+# UMFuturesWebsocketClient appends "/ws" internally; keep base URL here.
+WEBSOCKET_BASE_URL = "wss://fstream.binance.com"
+WEBSOCKET_TESTNET_URL = "wss://stream.binancefuture.com"
 
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
@@ -317,10 +318,6 @@ class Binance_Strategy(FVG_Strategy):
                     return
                 close = float(kline.get("c"))
                 volume = float(kline.get("v", 0))
-                print(
-                    f"🧪 ws tick: close={close} high={kline.get('h')} low={kline.get('l')} "
-                    f"ts={kline.get('t')} x={kline.get('x')}"
-                )
                 new_row = pd.DataFrame([{"close": close, "volume": volume}])
                 self.update_price(new_row)
             except Exception as exc:
@@ -347,6 +344,7 @@ class Binance_Strategy(FVG_Strategy):
                         )
                 else:
                     self._ws_client.kline(symbol=symbol, interval=interval)
+
                 while True:
                     time.sleep(1)
             except Exception as exc:
@@ -361,8 +359,8 @@ class Binance_Strategy(FVG_Strategy):
     def start_bar_iterations(self):
         while True:
             try:
-                self.bar_iteration()
                 sleep_until_next_boundary(self.timeframe)
+                self.bar_iteration()
             except Exception as exc:
                 print(f"❌ Error in bar iteration: {exc}")
                 time.sleep(60)
@@ -373,7 +371,6 @@ class Binance_Strategy(FVG_Strategy):
         print(f"{'='*60}")
         print(f"Timeframe: {self.timeframe}")
         print(f"HTF Bias: {HTF_TF} | EMA Period: {EMA_PERIOD}")
-        self.first_iteration()
 
         t1 = threading.Thread(target=self.start_bar_iterations)
         t2 = threading.Thread(target=self.subscribe_to_price_updates)
