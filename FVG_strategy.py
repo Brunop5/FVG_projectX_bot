@@ -10,9 +10,6 @@ from .helping_functions.indicators import ema
 from .helping_functions.indicators import crossover
 from .helping_functions.indicators import crossunder
 
-from .projectX.projectx_api_functions import sleep_until_next_boundary
-
-
 from strategyTemplate import Strategy, Order
 
 
