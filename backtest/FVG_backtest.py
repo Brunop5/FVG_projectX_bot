@@ -4,7 +4,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
-CURRENT_DIR = Path(__file__).parent
+PARENT_DIR = Path(__file__).parents[1]
+CURRENT_DIR = Path(__file__).parent / "GOLD_BACKTEST"
+
+START_TIMESTAMP = "1755528300000"
+
+
 
 from FVG_projectX_bot.FVG_strategy import (
     FVG_Strategy,
@@ -17,7 +22,10 @@ from FVG_projectX_bot.FVG_strategy import (
     FIXED_LOT,
     RISK_PERCENT,
     ORDER_SIZE,
+    USE_VOLUME_CHECK,
+    VOLUME_MULTIPLIER
 )
+from FVG_projectX_bot.helping_functions.indicators import get_atr, ema
 
 
 class BacktestOrder(FVG_Order):
@@ -71,6 +79,7 @@ class FVG_Backtest(FVG_Strategy):
         timeframe: str = "15m",
         initial_balance: float = 10000.0,
         warmup_bars: int | None = None,
+        start_timestamp=None,
     ):
         self.asset = asset
         self.timeframe = timeframe
@@ -85,6 +94,7 @@ class FVG_Backtest(FVG_Strategy):
         self.trades = []
         self._stopped = False
         self.trades_csv_path = os.path.join(CURRENT_DIR, "backtest_trades.csv")
+        self._start_from_dt = self._parse_start_timestamp(start_timestamp) if start_timestamp is not None else None
         super().__init__()
 
     def api_order_kwargs(self) -> dict:
@@ -105,17 +115,162 @@ class FVG_Backtest(FVG_Strategy):
             data = data.sort_values("timestamp").reset_index(drop=True)
         return data
 
+    def _precompute_indicators(self) -> None:
+        """
+        Precompute heavy, fully-vectorizable indicators once over the full dataset
+        so we don't recompute them on every bar in the backtest loop.
+        """
+        if self._full_data is None:
+            return
+
+        df = self._full_data
+
+        # === Precompute HTF EMA on close prices (matches ema(..., EMA_PERIOD)) ===
+        if "close" in df.columns:
+            df["htf_ema"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+
+        # === Precompute ATR and its SMA ===
+        try:
+            atr_series = get_atr(df, ATR_PERIOD)
+        except Exception:
+            atr_series = None
+
+        if atr_series is not None and len(atr_series) > 0:
+            # Align ATR series back to full DataFrame index
+            full_atr = pd.Series(index=df.index, dtype=float)
+            start_idx = ATR_PERIOD - 1
+            full_atr.iloc[start_idx:] = atr_series.values
+            df["atr"] = full_atr
+            df["atr_sma"] = full_atr.rolling(20, min_periods=1).mean()
+
+        # === Precompute volume SMA used for volume check ===
+        if "volume" in df.columns:
+            df["vol_sma"] = df["volume"].rolling(20, min_periods=1).mean()
+
+    def _parse_start_timestamp(self, ts) -> datetime | None:
+        """
+        Accepts a timestamp as:
+        - datetime (naive or tz-aware)
+        - numeric seconds since epoch
+        - numeric milliseconds since epoch (if > 1e12)
+        - string parseable by pandas.to_datetime
+        Returns a timezone-aware UTC datetime, or None if parsing fails.
+        """
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                return ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(timezone.utc)
+
+        # Try numeric epoch (seconds or ms)
+        try:
+            val = float(ts)
+            if val > 10**12:
+                return datetime.fromtimestamp(val / 1000.0, tz=timezone.utc)
+            return datetime.fromtimestamp(val, tz=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+
+        # Fallback to pandas parser
+        try:
+            return pd.to_datetime(ts, utc=True).to_pydatetime()
+        except Exception:
+            return None
+
     def _infer_warmup(self) -> int:
         min_bars = max(ATR_PERIOD + 1, 25, EMA_PERIOD + 1)
         return min_bars
 
     def gather_data(self) -> pd.DataFrame:
         self._full_data = self._load_data()
+        # Precompute heavy indicators once, to speed up per-bar loop
+        self._precompute_indicators()
         warmup = self._warmup_bars or self._infer_warmup()
         if len(self._full_data) < warmup:
             raise ValueError("Not enough bars for warmup/backtest.")
+        # Default cursor after warmup
         self._cursor = warmup
+
+        # If no explicit start timestamp, just return warmup slice
+        if self._start_from_dt is None or "timestamp" not in self._full_data.columns:
+            return self._full_data.iloc[:warmup].copy()
+
+        # Find first bar at or after requested start timestamp
+        start_idx = None
+        for idx in range(warmup, len(self._full_data)):
+            row = self._full_data.iloc[[idx]]
+            bar_dt = self._extract_bar_time(row)
+            if bar_dt is not None and bar_dt >= self._start_from_dt:
+                start_idx = idx
+                break
+
+        # If a later start index is found, extend initial data to that point
+        if start_idx is not None and start_idx > warmup:
+            self._cursor = start_idx
+            return self._full_data.iloc[:start_idx].copy()
+
+        # Fallback: start from warmup as usual
         return self._full_data.iloc[:warmup].copy()
+
+    def _update_trend_indicators(self):
+        """
+        Optimized version of FVG_Strategy._update_trend_indicators that uses
+        precomputed indicators stored in self.data instead of recalculating
+        them for every bar.
+        """
+        # === HTF EMA trend (uses precomputed 'htf_ema') ===
+        htf_ema_series = self.data.get("htf_ema")
+        htfEMA = None
+        if htf_ema_series is not None and len(htf_ema_series) > 0:
+            htfEMA = float(htf_ema_series.iloc[-1])
+
+        if htfEMA is None:
+            self.isBullishHTF = False
+            self.isBearishHTF = False
+        else:
+            self.isBullishHTF = self.cur_close > htfEMA
+            self.isBearishHTF = self.cur_close < htfEMA
+
+        # === ATR & volatility checks (use precomputed 'atr', 'atr_sma', 'vol_sma') ===
+        atr_series = self.data.get("atr")
+        atr_sma_series = self.data.get("atr_sma")
+
+        if (
+            atr_series is not None
+            and atr_sma_series is not None
+            and len(atr_series) > 0
+            and len(atr_sma_series) > 0
+        ):
+            last_atr = atr_series.iloc[-1]
+            last_atr_sma = atr_sma_series.iloc[-1]
+            if pd.isna(last_atr) or pd.isna(last_atr_sma):
+                atrOK = False
+            else:
+                atrOK = last_atr > last_atr_sma
+        else:
+            atrOK = False
+
+        if USE_VOLUME_CHECK:
+            vol_sma_series = self.data.get("vol_sma")
+            if vol_sma_series is not None and len(vol_sma_series) > 0:
+                vol_sma_val = vol_sma_series.iloc[-1]
+                if pd.isna(vol_sma_val):
+                    volOK = False
+                else:
+                    volOK = self.cur_volume > vol_sma_val * VOLUME_MULTIPLIER
+            else:
+                volOK = False
+            self.marketOK = volOK and atrOK
+        else:
+            # Skip volume check, only use ATR
+            self.marketOK = atrOK
+
+        # === FVG flags (same logic as parent implementation) ===
+        self.lastBullFvg = (
+            self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
+        )
+        self.lastBearFvg = (
+            self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
+        )
 
     def fetch_new_data(self) -> None:
         if self._cursor >= len(self._full_data):
@@ -182,8 +337,16 @@ class FVG_Backtest(FVG_Strategy):
         }
         self.trades.append(row)
         self._append_trade_csv(row)
+        # Persist full strategy/backtest state after each completed trade
+        try:
+            self.save_data()
+        except Exception:
+            # Saving should not break the backtest loop; ignore persistence errors
+            pass
 
     def _append_trade_csv(self, row: dict):
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(self.trades_csv_path), exist_ok=True)
         write_header = not os.path.exists(self.trades_csv_path)
         with open(self.trades_csv_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
@@ -226,8 +389,10 @@ class FVG_Backtest(FVG_Strategy):
             self.cur_volume = float(new_row["volume"].iloc[-1]) if "volume" in new_row.columns else 0.0
             self._current_dt = self._extract_bar_time(new_row)
 
+
             self.update_indicators()
             self.add_fvg_zones()
+
 
             if len(self.active_orders) > 0:
                 self.update_stops()
@@ -276,7 +441,12 @@ class FVG_Backtest(FVG_Strategy):
 
 
 if __name__ == "__main__":
-    data_path = os.path.join(CURRENT_DIR, "data", "BTCUSDT_PERP_15m.csv")
-    backtest = FVG_Backtest(data_path=data_path)
+    data_path = os.path.join(PARENT_DIR, "data", "MGCG6", "15min.csv")
+
+    backtest = FVG_Backtest(
+        asset="MGCG6",
+        data_path=data_path,
+        start_timestamp=START_TIMESTAMP,
+    )
     trades = backtest.run()
     print(f"✅ Backtest finished. Trades: {len(trades)}")
