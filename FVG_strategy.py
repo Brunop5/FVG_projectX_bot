@@ -1,3 +1,4 @@
+import math
 import pandas as pd
 import threading
 
@@ -45,9 +46,14 @@ HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 5                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 6                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
+
+# Partial close sizing and ATR steps
+EACH_TRADE_SIZE = 1                # Size per child order when splitting FIXED_LOT
+PARTIAL_TP_ATR_STEP = 1  # ATR step size for favorable partial closes
+PARTIAL_SL_ATR_STEP = 2  # ATR step size for adverse partial closes
 
 # Daily Trading Limits
 MAX_DAILY_TRADES = 3
@@ -80,6 +86,9 @@ class FVG_Order(Order):
         self.pyramid_count = 0
         self.next_add_price = None
         self.avg_entry_price = self.entry_price
+        self.group_id = None
+        self.group_seq = None
+        self.entry_reference_price = self.entry_price
 
     def add_to_position(self, add_size: float, log=print):
         if add_size is None or add_size <= 0:
@@ -222,6 +231,10 @@ class FVG_Strategy(Strategy):
             else:
                 self.pyramiding = NoPyramidingPolicy()
 
+        self._partial_groups = {}
+        self._partial_group_counter = 0
+        self._split_order_count = self._validate_split_config()
+
         super().__init__()
 
         self.cur_close = self.data["close"].iloc[-1]
@@ -230,6 +243,106 @@ class FVG_Strategy(Strategy):
 
         self.update_indicators()
         self.add_fvg_zones()
+
+    def _validate_split_config(self) -> int:
+        if not USE_FIXED_LOT:
+            raise ValueError(
+                "Partial close logic requires USE_FIXED_LOT=True to split orders."
+            )
+        if EACH_TRADE_SIZE is None or EACH_TRADE_SIZE <= 0:
+            raise ValueError("EACH_TRADE_SIZE must be a positive number.")
+        if FIXED_LOT is None or FIXED_LOT <= 0:
+            raise ValueError("FIXED_LOT must be a positive number.")
+        count = FIXED_LOT / EACH_TRADE_SIZE
+        if not math.isclose(count, round(count), rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError(
+                f"FIXED_LOT ({FIXED_LOT}) must be an exact multiple of "
+                f"EACH_TRADE_SIZE ({EACH_TRADE_SIZE})."
+            )
+        count_int = int(round(count))
+        if count_int < 1:
+            raise ValueError("Split order count must be at least 1.")
+        return count_int
+
+    def _next_partial_group_id(self) -> int:
+        self._partial_group_counter += 1
+        return self._partial_group_counter
+
+    def _get_partial_close_targets(self, current_price: float) -> dict:
+        if not self.active_orders:
+            return {}
+        if PARTIAL_TP_ATR_STEP <= 0 and PARTIAL_SL_ATR_STEP <= 0:
+            return {}
+
+        groups = {}
+        for order in self.active_orders:
+            group_id = getattr(order, "group_id", None)
+            if group_id is None:
+                continue
+            groups.setdefault(group_id, []).append(order)
+
+        close_map = {}
+        for group_id, orders in groups.items():
+            state = self._partial_groups.get(group_id)
+            if state is None:
+                anchor = orders[0]
+                state = {
+                    "entry_price": getattr(anchor, "entry_reference_price", anchor.entry_price),
+                    "entry_atr": anchor.entry_atr,
+                    "side": anchor.side,
+                    "tp_steps_closed": 0,
+                    "sl_steps_closed": 0,
+                }
+                self._partial_groups[group_id] = state
+
+            entry_price = state["entry_price"]
+            entry_atr = state["entry_atr"]
+            if entry_atr is None or entry_atr <= 0:
+                continue
+
+            if state["side"] == "BUY":
+                favorable_move = current_price - entry_price
+                adverse_move = entry_price - current_price
+            else:
+                favorable_move = entry_price - current_price
+                adverse_move = current_price - entry_price
+
+            sorted_orders = sorted(orders, key=lambda o: getattr(o, "group_seq", 0))
+            available = [o for o in sorted_orders if o not in close_map]
+
+            if PARTIAL_TP_ATR_STEP > 0 and favorable_move > 0:
+                step_size = entry_atr * PARTIAL_TP_ATR_STEP
+                if step_size > 0:
+                    steps_reached = int(favorable_move // step_size)
+                    to_close = steps_reached - state["tp_steps_closed"]
+                    if to_close > 0 and available:
+                        close_count = min(to_close, len(available))
+                        for order in available[:close_count]:
+                            close_map[order] = "partial_tp"
+                        state["tp_steps_closed"] += close_count
+                        available = available[close_count:]
+
+            if PARTIAL_SL_ATR_STEP > 0 and adverse_move > 0 and available:
+                step_size = entry_atr * PARTIAL_SL_ATR_STEP
+                if step_size > 0:
+                    steps_reached = int(adverse_move // step_size)
+                    to_close = steps_reached - state["sl_steps_closed"]
+                    if to_close > 0:
+                        close_count = min(to_close, len(available))
+                        for order in available[:close_count]:
+                            close_map[order] = "partial_sl"
+                        state["sl_steps_closed"] += close_count
+
+        return close_map
+
+    def _cleanup_partial_groups(self):
+        if not self.active_orders:
+            self._partial_groups = {}
+            return
+        active_ids = {getattr(order, "group_id", None) for order in self.active_orders}
+        for group_id in list(self._partial_groups.keys()):
+            if group_id not in active_ids:
+                self._partial_groups.pop(group_id, None)
 
 
     @abstractmethod
@@ -315,16 +428,23 @@ class FVG_Strategy(Strategy):
                 if DEBUG_STOPS:
                     print("🧪 update_price: calling update_stops + check_close_conditions")
                 self.update_stops()
+                partial_close_map = self._get_partial_close_targets(self.cur_close)
                 remaining = []
                 closed_any = False
                 for order in list(self.active_orders):
-                    closed = order.check_close_conditions(
-                        current_price=self.cur_close,
-                        last_long=order.side == "BUY",
-                        last_short=order.side == "SELL",
-                        isBOS=self.isBOS,
-                        isCHOCH=self.isCHOCH,
-                    )
+                    if order in partial_close_map:
+                        if hasattr(order, "exit_reason"):
+                            order.exit_reason = partial_close_map[order]
+                        order.close_order()
+                        closed = True
+                    else:
+                        closed = order.check_close_conditions(
+                            current_price=self.cur_close,
+                            last_long=order.side == "BUY",
+                            last_short=order.side == "SELL",
+                            isBOS=self.isBOS,
+                            isCHOCH=self.isCHOCH,
+                        )
                     if closed:
                         closed_any = True
                         self.pyramiding.on_position_closed(order, self)
@@ -336,6 +456,7 @@ class FVG_Strategy(Strategy):
                 if closed_any:
                     self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
                     self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
+                    self._cleanup_partial_groups()
                     self.save_data()
 
             elif ALLOW_INTRACANDLE_ENTRY:
@@ -478,25 +599,43 @@ class FVG_Strategy(Strategy):
 
                 tp = self.cur_close + atr * TP_MULTIPLIER
                 entryAtr = atr
-                lot_size = self.calculate_order_size(atr=atr, sl_mult=SL_MULTIPLIER)
+                group_id = self._next_partial_group_id()
+                self._partial_groups[group_id] = {
+                    "entry_price": self.cur_close,
+                    "entry_atr": entryAtr,
+                    "side": "BUY",
+                    "tp_steps_closed": 0,
+                    "sl_steps_closed": 0,
+                }
+                any_success = False
+                for idx in range(self._split_order_count):
+                    active_order = self.Order(
+                        entry_atr=entryAtr, side="BUY", entry_price=self.cur_close, take_profit=tp,
+                        stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=EACH_TRADE_SIZE,
+                        **self.api_order_kwargs()
+                    )
+                    active_order.group_id = group_id
+                    active_order.group_seq = idx + 1
+                    active_order.entry_reference_price = self.cur_close
+                    result = active_order.place_order()
 
-                active_order = self.Order(
-                    entry_atr=entryAtr, side="BUY", entry_price=self.cur_close, take_profit=tp,
-                    stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=lot_size,
-                    **self.api_order_kwargs()
-                )
-                result = active_order.place_order()
+                    self.active_orders.append(active_order)
+                    success = isinstance(result, dict) and result.get("success", False)
+                    if result is None:
+                        success = True
+                    if success:
+                        any_success = True
+                        self.pyramiding.on_position_opened(active_order, self)
 
-                self.active_orders.append(active_order)
-                
-                if isinstance(result, dict) and result.get("success"):
-                    self.pyramiding.on_position_opened(active_order, self)
+                if any_success:
                     zone["mitigated"] = True
                     self.lastPositionWasLong = True
                     self.lastPositionWasShort = False
                     self.daily_trades_count += 1
                     self.last_trade_date = str(datetime.now().date())
                     print(f"📈 LONG position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
+                else:
+                    self._partial_groups.pop(group_id, None)
                 break
 
 
@@ -515,24 +654,43 @@ class FVG_Strategy(Strategy):
 
                 tp = self.cur_close - atr * TP_MULTIPLIER
                 entryAtr = atr
-                lot_size = self.calculate_order_size(atr=atr, sl_mult=SL_MULTIPLIER)
-                active_order = self.Order(
-                    entry_atr=entryAtr, side="SELL", entry_price=self.cur_close, take_profit=tp,
-                    trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=lot_size,
-                    **self.api_order_kwargs()
-                )
-                result = active_order.place_order()
+                group_id = self._next_partial_group_id()
+                self._partial_groups[group_id] = {
+                    "entry_price": self.cur_close,
+                    "entry_atr": entryAtr,
+                    "side": "SELL",
+                    "tp_steps_closed": 0,
+                    "sl_steps_closed": 0,
+                }
+                any_success = False
+                for idx in range(self._split_order_count):
+                    active_order = self.Order(
+                        entry_atr=entryAtr, side="SELL", entry_price=self.cur_close, take_profit=tp,
+                        trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=EACH_TRADE_SIZE,
+                        **self.api_order_kwargs()
+                    )
+                    active_order.group_id = group_id
+                    active_order.group_seq = idx + 1
+                    active_order.entry_reference_price = self.cur_close
+                    result = active_order.place_order()
 
-                self.active_orders.append(active_order)
-                
-                if isinstance(result, dict) and result.get("success"):
-                    self.pyramiding.on_position_opened(active_order, self)
+                    self.active_orders.append(active_order)
+                    success = isinstance(result, dict) and result.get("success", False)
+                    if result is None:
+                        success = True
+                    if success:
+                        any_success = True
+                        self.pyramiding.on_position_opened(active_order, self)
+
+                if any_success:
                     zone["mitigated"] = True
                     self.lastPositionWasShort = True
                     self.lastPositionWasLong = False
                     self.daily_trades_count += 1
                     self.last_trade_date = str(datetime.now().date())
                     print(f"📉 SHORT position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
+                else:
+                    self._partial_groups.pop(group_id, None)
                 break
 
 

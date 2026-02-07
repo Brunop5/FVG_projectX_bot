@@ -14,6 +14,10 @@ INITIAL_BALANCE = 10000.0
 DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "MGCG6" / "IC_markets_15min.csv")
 START_TIMESTAMP = "1755528300000"
 
+# Pyramiding mode: "none", "client_atr", or "max_orders"
+PYRAMIDING_MODE = "client_atr" # remake to str enum
+MAX_PYRAMID_ORDERS = 3
+
 # Contract / fee inputs
 USE_CONTRACTS_CSV = True
 CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
@@ -22,21 +26,9 @@ ROUND_TURN_FEE_USD = 3.5
 
 
 
-from FVG_projectX_bot.FVG_strategy import (
-    FVG_Strategy,
-    FVG_Order,
-    ALLOW_INTRACANDLE_ENTRY,
-    ATR_PERIOD,
-    EMA_PERIOD,
-    MAX_DAILY_TRADES,
-    USE_FIXED_LOT,
-    FIXED_LOT,
-    RISK_PERCENT,
-    ORDER_SIZE,
-    USE_VOLUME_CHECK,
-    VOLUME_MULTIPLIER
-)
+from FVG_projectX_bot.FVG_strategy import *
 from FVG_projectX_bot.helping_functions.indicators import get_atr, ema
+from FVG_projectX_bot.helping_functions.pyramiding import MaxOrdersPolicy
 
 
 class BacktestOrder(FVG_Order):
@@ -60,6 +52,13 @@ class BacktestOrder(FVG_Order):
 
     def place_order(self):
         self.is_open = True
+        group_id = getattr(self, "group_id", None)
+        group_seq = getattr(self, "group_seq", None)
+        print(
+            "🧾 OPEN "
+            f"side={self.side} size={self.order_size} entry={self.entry_price} "
+            f"group_id={group_id} group_seq={group_seq}"
+        )
         return {"success": True}
 
     def close_order(self):
@@ -73,6 +72,14 @@ class BacktestOrder(FVG_Order):
             price_delta = self.exit_price - entry_price
             direction = 1 if self.side == "BUY" else -1
             self.pnl = price_delta * direction * float(self.order_size or 0.0)
+        group_id = getattr(self, "group_id", None)
+        group_seq = getattr(self, "group_seq", None)
+        print(
+            "🧾 CLOSE "
+            f"side={self.side} size={self.order_size} entry={self.entry_price} "
+            f"exit={self.exit_price} pnl={self.pnl} reason={self.exit_reason} "
+            f"group_id={group_id} group_seq={group_seq}"
+        )
         return {"success": True}
 
     def check_close_conditions(self, log=print, **kwargs) -> bool:
@@ -95,6 +102,7 @@ class FVG_Backtest(FVG_Strategy):
         initial_balance: float = 10000.0,
         warmup_bars: int | None = None,
         start_timestamp=None,
+        pyramiding_mode: str | None = None,
     ):
         self.asset = asset
         self.timeframe = timeframe
@@ -115,10 +123,30 @@ class FVG_Backtest(FVG_Strategy):
         self.round_turn_fee_usd = ROUND_TURN_FEE_USD if USE_ROUND_TURN_FEE else None
         if USE_CONTRACTS_CSV:
             self._load_contract_info()
+        self._configure_pyramiding(pyramiding_mode)
         super().__init__()
 
     def api_order_kwargs(self) -> dict:
         return {}
+
+    def _configure_pyramiding(self, mode: str | None) -> None:
+        selected = (mode or PYRAMIDING_MODE or "none").strip().lower()
+        if selected in ("none", "off", "no"):
+            self.pyramiding = NoPyramidingPolicy()
+        elif selected in ("client_atr", "atr", "client"):
+            self.pyramiding = ClientAtrPyramidingPolicy(
+                atr_step=PYR_ATR_STEP,
+                add_on_size=PYR_ADD_ON_SIZE,
+                max_adds=PYR_MAX_ADDS,
+            )
+        elif selected in ("max_orders", "max", "orders"):
+            self.pyramiding = MaxOrdersPolicy(MAX_PYRAMID_ORDERS)
+        else:
+            raise ValueError(
+                f"Unknown pyramiding_mode '{mode}'. "
+                "Use 'none', 'client_atr', or 'max_orders'."
+            )
+        print(f"📐 Backtest pyramiding mode: {selected}")
 
     def _load_data(self) -> pd.DataFrame:
         if not os.path.exists(self.data_path):
@@ -405,6 +433,7 @@ class FVG_Backtest(FVG_Strategy):
             "order_size": order.order_size,
             "pnl": order.pnl,
             "equity": self.account_balance,
+            "group_id": getattr(order, "group_id", None),
         }
         self.trades.append(row)
         self._append_trade_csv(row)
@@ -431,6 +460,7 @@ class FVG_Backtest(FVG_Strategy):
                     "order_size",
                     "pnl",
                     "equity",
+                    "group_id",
                 ],
             )
             if write_header:
@@ -471,17 +501,28 @@ class FVG_Backtest(FVG_Strategy):
                 self.update_stops()
                 current_high = float(new_row["high"].iloc[-1])
                 current_low = float(new_row["low"].iloc[-1])
+                partial_close_map = self._get_partial_close_targets(self.cur_close)
                 remaining = []
                 closed_any = False
                 for order in list(self.active_orders):
-                    closed = order.check_close_conditions(
-                        current_price=self.cur_close,
-                        last_long=order.side == "BUY",
-                        last_short=order.side == "SELL",
-                        isBOS=self.isBOS,
-                        isCHOCH=self.isCHOCH,
-                        timestamp=self._current_dt,
-                    )
+                    if order in partial_close_map:
+                        if hasattr(order, "_last_price"):
+                            order._last_price = self.cur_close
+                        if hasattr(order, "_last_timestamp"):
+                            order._last_timestamp = self._current_dt
+                        if hasattr(order, "exit_reason"):
+                            order.exit_reason = partial_close_map[order]
+                        order.close_order()
+                        closed = True
+                    else:
+                        closed = order.check_close_conditions(
+                            current_price=self.cur_close,
+                            last_long=order.side == "BUY",
+                            last_short=order.side == "SELL",
+                            isBOS=self.isBOS,
+                            isCHOCH=self.isCHOCH,
+                            timestamp=self._current_dt,
+                        )
                     if closed:
                         closed_any = True
                         self.pyramiding.on_position_closed(order, self)
@@ -500,6 +541,7 @@ class FVG_Backtest(FVG_Strategy):
                 if closed_any:
                     self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
                     self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
+                    self._cleanup_partial_groups()
                 if self.account_balance <= 0:
                     self._stopped = True
                     break
@@ -538,6 +580,7 @@ if __name__ == "__main__":
         initial_balance=INITIAL_BALANCE,
         data_path=data_path,
         start_timestamp=START_TIMESTAMP,
+        pyramiding_mode=PYRAMIDING_MODE,
     )
     trades = backtest.run()
     print(f"✅ Backtest finished. Trades: {len(trades)}")
