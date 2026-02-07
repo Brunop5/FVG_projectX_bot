@@ -13,6 +13,7 @@ from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClie
 from ..FVG_strategy import USE_TRAILING, FVG_Order, FVG_Strategy, HTF_TF, EMA_PERIOD
 from ..FVG_strategy import USE_FIXED_LOT, FIXED_LOT, MAX_DAILY_TRADES
 from ..FVG_strategy import RISK_PERCENT, ORDER_SIZE, DEBUG_STOPS
+from ..helping_functions.pyramiding import MaxOrdersPolicy
 
 from ..projectX.projectx_api_functions import sleep_until_next_boundary
 
@@ -20,6 +21,7 @@ from ..projectX.projectx_api_functions import sleep_until_next_boundary
 ASSETS = [("BTCUSDT", "15min")]  # BTCUSDT perpetual (USDT-margined)
 USE_CONTINUOUS_KLINES = False
 CONTRACT_TYPE = "PERPETUAL"
+MAX_OPEN_ORDERS = 1
 
 BINANCE_BASE_URL = "https://fapi.binance.com"
 BINANCE_TESTNET_URL = "https://testnet.binancefuture.com"
@@ -204,6 +206,7 @@ class Binance_Strategy(FVG_Strategy):
         self.timeframe = asset_tuple[1]
         self._client = None
         self._ws_client = None
+        self.pyramiding = MaxOrdersPolicy(MAX_OPEN_ORDERS)
 
         suffix = f"-{CONTRACT_TYPE.lower()}" if USE_CONTINUOUS_KLINES else ""
         filename = f"{self.asset}-{self.timeframe}{suffix}"

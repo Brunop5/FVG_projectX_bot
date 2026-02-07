@@ -7,7 +7,18 @@ import pandas as pd
 PARENT_DIR = Path(__file__).parents[1]
 CURRENT_DIR = Path(__file__).parent / "GOLD_BACKTEST"
 
+# ==================== USER CONFIG ====================
+ASSET = "MGCJ6"
+TIMEFRAME = "15m"
+INITIAL_BALANCE = 10000.0
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "MGCG6" / "IC_markets_15min.csv")
 START_TIMESTAMP = "1755528300000"
+
+# Contract / fee inputs
+USE_CONTRACTS_CSV = True
+CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
+USE_ROUND_TURN_FEE = True
+ROUND_TURN_FEE_USD = 3.5
 
 
 
@@ -58,7 +69,8 @@ class BacktestOrder(FVG_Order):
         if self._last_timestamp is not None:
             self.exit_time = self._last_timestamp
         if self.exit_price is not None:
-            price_delta = self.exit_price - self.entry_price
+            entry_price = self.avg_entry_price if self.avg_entry_price is not None else self.entry_price
+            price_delta = self.exit_price - entry_price
             direction = 1 if self.side == "BUY" else -1
             self.pnl = price_delta * direction * float(self.order_size or 0.0)
         return {"success": True}
@@ -66,7 +78,10 @@ class BacktestOrder(FVG_Order):
     def check_close_conditions(self, log=print, **kwargs) -> bool:
         self._last_price = kwargs.get("current_price")
         self._last_timestamp = kwargs.get("timestamp")
-        return super().check_close_conditions(log=log, **kwargs)
+        closed = super().check_close_conditions(log=log, **kwargs)
+        if closed and self.is_open:
+            self.close_order()
+        return closed
 
 
 class FVG_Backtest(FVG_Strategy):
@@ -95,6 +110,11 @@ class FVG_Backtest(FVG_Strategy):
         self._stopped = False
         self.trades_csv_path = os.path.join(CURRENT_DIR, "backtest_trades.csv")
         self._start_from_dt = self._parse_start_timestamp(start_timestamp) if start_timestamp is not None else None
+        self.tick_size = None
+        self.tick_value = None
+        self.round_turn_fee_usd = ROUND_TURN_FEE_USD if USE_ROUND_TURN_FEE else None
+        if USE_CONTRACTS_CSV:
+            self._load_contract_info()
         super().__init__()
 
     def api_order_kwargs(self) -> dict:
@@ -103,17 +123,68 @@ class FVG_Backtest(FVG_Strategy):
     def _load_data(self) -> pd.DataFrame:
         if not os.path.exists(self.data_path):
             raise FileNotFoundError(f"Data file not found: {self.data_path}")
-        data = pd.read_csv(self.data_path)
-        data.columns = [str(col).lower() for col in data.columns]
+        sep = ","
+        try:
+            with open(self.data_path, "r", encoding="utf-8") as f:
+                header_line = f.readline()
+            if "\t" in header_line and "," not in header_line:
+                sep = "\t"
+        except Exception:
+            sep = ","
+        data = pd.read_csv(self.data_path, sep=sep)
+        normalized = []
+        for col in data.columns:
+            name = str(col).strip().lower()
+            if name.startswith("<") and name.endswith(">"):
+                name = name[1:-1]
+            normalized.append(name)
+        data.columns = normalized
+        if "timestamp" not in data.columns and "date" in data.columns and "time" in data.columns:
+            combined = data["date"].astype(str) + " " + data["time"].astype(str)
+            data["timestamp"] = pd.to_datetime(combined, errors="coerce", utc=True)
+            data["timestamp"] = (data["timestamp"].astype("int64") // 10**6).where(
+                data["timestamp"].notna()
+            )
         required = {"open", "high", "low", "close"}
         missing = required - set(data.columns)
         if missing:
             raise ValueError(f"Missing required columns: {sorted(missing)}")
         if "volume" not in data.columns:
-            data["volume"] = 0.0
+            if "tickvol" in data.columns:
+                data["volume"] = data["tickvol"]
+            elif "vol" in data.columns:
+                data["volume"] = data["vol"]
+            else:
+                data["volume"] = 0.0
+        elif data["volume"].fillna(0).sum() == 0 and "tickvol" in data.columns:
+            data["volume"] = data["tickvol"]
         if "timestamp" in data.columns:
             data = data.sort_values("timestamp").reset_index(drop=True)
         return data
+
+    def _load_contract_info(self) -> None:
+        if not os.path.exists(CONTRACTS_CSV_PATH):
+            print(f"⚠️ contracts.csv not found: {CONTRACTS_CSV_PATH}")
+            return
+        try:
+            df = pd.read_csv(CONTRACTS_CSV_PATH)
+        except Exception as exc:
+            print(f"⚠️ Failed to read contracts.csv: {exc}")
+            return
+        if "name" not in df.columns:
+            print("⚠️ contracts.csv missing 'name' column")
+            return
+        match = df[df["name"] == self.asset]
+        if match.empty:
+            print(f"⚠️ No contract row found for asset '{self.asset}' in contracts.csv")
+            return
+        row = match.iloc[0]
+        self.tick_size = row.get("tickSize")
+        self.tick_value = row.get("tickValue")
+        print(
+            f"📄 Contract info loaded for {self.asset}: "
+            f"tickSize={self.tick_size} tickValue={self.tick_value}"
+        )
 
     def _precompute_indicators(self) -> None:
         """
@@ -369,13 +440,15 @@ class FVG_Backtest(FVG_Strategy):
     def _close_open_order_at_end(self):
         if not self.active_orders:
             return
-        order: BacktestOrder = self.active_orders.pop(0)
-        order._last_price = float(self.cur_close)
-        order._last_timestamp = self._current_dt
-        order.close_order()
-        if order.pnl is not None:
-            self.account_balance += order.pnl
-        self._record_trade(order)
+        for order in list(self.active_orders):
+            self.active_orders.pop(0)
+            order._last_price = float(self.cur_close)
+            order._last_timestamp = self._current_dt
+            order.close_order()
+            self.pyramiding.on_position_closed(order, self)
+            if order.pnl is not None:
+                self.account_balance += order.pnl
+            self._record_trade(order)
 
     def run(self):
         total_bars = len(self._full_data)
@@ -396,24 +469,40 @@ class FVG_Backtest(FVG_Strategy):
 
             if len(self.active_orders) > 0:
                 self.update_stops()
-                closed = self.active_orders[0].check_close_conditions(
-                    current_price=self.cur_close,
-                    last_long=self.lastPositionWasLong,
-                    last_short=self.lastPositionWasShort,
-                    isBOS=self.isBOS,
-                    isCHOCH=self.isCHOCH,
-                    timestamp=self._current_dt,
-                )
-                if closed:
-                    closed_order = self.active_orders.pop(0)
-                    self.lastPositionWasLong = False
-                    self.lastPositionWasShort = False
-                    if closed_order.pnl is not None:
-                        self.account_balance += closed_order.pnl
-                    self._record_trade(closed_order)
-                    if self.account_balance <= 0:
-                        self._stopped = True
-                        break
+                current_high = float(new_row["high"].iloc[-1])
+                current_low = float(new_row["low"].iloc[-1])
+                remaining = []
+                closed_any = False
+                for order in list(self.active_orders):
+                    closed = order.check_close_conditions(
+                        current_price=self.cur_close,
+                        last_long=order.side == "BUY",
+                        last_short=order.side == "SELL",
+                        isBOS=self.isBOS,
+                        isCHOCH=self.isCHOCH,
+                        timestamp=self._current_dt,
+                    )
+                    if closed:
+                        closed_any = True
+                        self.pyramiding.on_position_closed(order, self)
+                        if order.pnl is not None:
+                            self.account_balance += order.pnl
+                        self._record_trade(order)
+                    else:
+                        remaining.append(order)
+                self.active_orders = remaining
+                if self.active_orders:
+                    self._apply_pyramiding_add_on(
+                        self.cur_close,
+                        current_high=current_high,
+                        current_low=current_low,
+                    )
+                if closed_any:
+                    self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
+                    self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
+                if self.account_balance <= 0:
+                    self._stopped = True
+                    break
             else:
                 if self.account_balance <= 0:
                     self._stopped = True
@@ -431,8 +520,9 @@ class FVG_Backtest(FVG_Strategy):
                         self.data.at[last_index, "high"] = orig_high
                         self.data.at[last_index, "low"] = orig_low
                 if self.active_orders:
-                    active_order = self.active_orders[0]
-                    active_order.entry_time = self._current_dt
+                    for active_order in self.active_orders:
+                        if active_order.entry_time is None:
+                            active_order.entry_time = self._current_dt
 
             self._cursor += 1
 
@@ -441,10 +531,11 @@ class FVG_Backtest(FVG_Strategy):
 
 
 if __name__ == "__main__":
-    data_path = os.path.join(PARENT_DIR, "data", "MGCG6", "15min.csv")
-
+    data_path = DATA_CSV_PATH
     backtest = FVG_Backtest(
-        asset="MGCG6",
+        asset=ASSET,
+        timeframe=TIMEFRAME,
+        initial_balance=INITIAL_BALANCE,
         data_path=data_path,
         start_timestamp=START_TIMESTAMP,
     )
