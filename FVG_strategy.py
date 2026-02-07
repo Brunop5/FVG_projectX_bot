@@ -9,25 +9,30 @@ from .helping_functions.indicators import sma
 from .helping_functions.indicators import ema
 from .helping_functions.indicators import crossover
 from .helping_functions.indicators import crossunder
+from .helping_functions.pyramiding import (
+    AddOnSpec,
+    ClientAtrPyramidingPolicy,
+    NoPyramidingPolicy,
+)
 
 from strategyTemplate import Strategy, Order
 
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 9              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 14              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.12          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 100                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.3
+HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 200                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.1
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 18                    # ATR Period (min 1)
+ATR_PERIOD = 12                    # ATR Period (min 1)
 SL_MULTIPLIER = 5.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
 TP_MULTIPLIER = 20                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
@@ -40,7 +45,7 @@ HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 0.002                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 5                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -49,6 +54,13 @@ MAX_DAILY_TRADES = 3
 
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
+DEBUG_PYRAMIDING = False
+
+# Pyramiding (client mode)
+ALLOW_PYRAMIDING = True
+PYR_ATR_STEP = 1.0
+PYR_ADD_ON_SIZE = 1
+PYR_MAX_ADDS = 10
 
 def quiet_log(msg):
     pass
@@ -56,12 +68,43 @@ def quiet_log(msg):
 
 class FVG_Order(Order):
     entry_atr: float
+    pyramid_count: int
+    next_add_price: float | None
+    avg_entry_price: float | None
 
     def __init__(
         self, entry_atr, **kwargs):
         super().__init__(**kwargs)
 
         self.entry_atr = entry_atr
+        self.pyramid_count = 0
+        self.next_add_price = None
+        self.avg_entry_price = self.entry_price
+
+    def add_to_position(self, add_size: float, log=print):
+        if add_size is None or add_size <= 0:
+            return {"success": False, "message": "Invalid add-on size"}
+        original_size = float(self.order_size or 0.0)
+        self.order_size = add_size
+        result = self.place_order()
+        success = isinstance(result, dict) and result.get("success", False)
+        if result is None:
+            success = True
+        if success:
+            new_size = original_size + float(add_size)
+            if new_size > 0 and self.avg_entry_price is not None:
+                self.avg_entry_price = (
+                    (self.avg_entry_price * original_size)
+                    + (self.entry_price * float(add_size))
+                ) / new_size
+            self.order_size = new_size
+            log(
+                f"➕ Add-on placed: size={add_size} new_size={self.order_size} "
+                f"side={self.side} entry={self.entry_price}"
+            )
+            return {"success": True, "new_size": self.order_size, "result": result}
+        self.order_size = original_size
+        return {"success": False, "result": result}
 
 
     def check_close_conditions(self, log=print, **kwargs) -> bool:
@@ -167,6 +210,17 @@ class FVG_Strategy(Strategy):
         self._lock = threading.Lock()  # Protects shared state when bar thread and price-update thread run concurrently
 
         self.fvg_zones = []
+        if not hasattr(self, "debug_pyramiding"):
+            self.debug_pyramiding = DEBUG_PYRAMIDING
+        if not hasattr(self, "pyramiding") or self.pyramiding is None:
+            if ALLOW_PYRAMIDING:
+                self.pyramiding = ClientAtrPyramidingPolicy(
+                    atr_step=PYR_ATR_STEP,
+                    add_on_size=PYR_ADD_ON_SIZE,
+                    max_adds=PYR_MAX_ADDS,
+                )
+            else:
+                self.pyramiding = NoPyramidingPolicy()
 
         super().__init__()
 
@@ -261,17 +315,27 @@ class FVG_Strategy(Strategy):
                 if DEBUG_STOPS:
                     print("🧪 update_price: calling update_stops + check_close_conditions")
                 self.update_stops()
-                closed = self.active_orders[0].check_close_conditions(
-                    current_price=self.cur_close, 
-                    last_long=self.lastPositionWasLong, 
-                    last_short=self.lastPositionWasShort,
-                    isBOS=self.isBOS,
-                    isCHOCH=self.isCHOCH
+                remaining = []
+                closed_any = False
+                for order in list(self.active_orders):
+                    closed = order.check_close_conditions(
+                        current_price=self.cur_close,
+                        last_long=order.side == "BUY",
+                        last_short=order.side == "SELL",
+                        isBOS=self.isBOS,
+                        isCHOCH=self.isCHOCH,
                     )
-                if closed:
-                    self.active_orders.pop(0)
-                    self.lastPositionWasLong = False
-                    self.lastPositionWasShort = False
+                    if closed:
+                        closed_any = True
+                        self.pyramiding.on_position_closed(order, self)
+                    else:
+                        remaining.append(order)
+                self.active_orders = remaining
+                if self.active_orders:
+                    self._apply_pyramiding_add_on(self.cur_close)
+                if closed_any:
+                    self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
+                    self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
                     self.save_data()
 
             elif ALLOW_INTRACANDLE_ENTRY:
@@ -374,7 +438,7 @@ class FVG_Strategy(Strategy):
 
 
     def entry_logic(self):
-        if len(self.fvg_zones) == 0 or len(self.active_orders) > 0:
+        if len(self.fvg_zones) == 0:
             return
 
 
@@ -389,6 +453,8 @@ class FVG_Strategy(Strategy):
         atr = get_atr(self.data, ATR_PERIOD).iloc[-1]
 
         for zone in self.fvg_zones[-FVG_HISTORY_NBR:]:
+            if not self.pyramiding.should_allow_entry(self, zone):
+                continue
             if zone["mitigated"]:
                 continue
 
@@ -423,7 +489,8 @@ class FVG_Strategy(Strategy):
 
                 self.active_orders.append(active_order)
                 
-                if result['success']:
+                if isinstance(result, dict) and result.get("success"):
+                    self.pyramiding.on_position_opened(active_order, self)
                     zone["mitigated"] = True
                     self.lastPositionWasLong = True
                     self.lastPositionWasShort = False
@@ -458,7 +525,8 @@ class FVG_Strategy(Strategy):
 
                 self.active_orders.append(active_order)
                 
-                if result['success']:
+                if isinstance(result, dict) and result.get("success"):
+                    self.pyramiding.on_position_opened(active_order, self)
                     zone["mitigated"] = True
                     self.lastPositionWasShort = True
                     self.lastPositionWasLong = False
@@ -472,38 +540,60 @@ class FVG_Strategy(Strategy):
         if len(self.active_orders) == 0:
             return
 
-        pos: FVG_Order = self.active_orders[0]
-
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
-        if DEBUG_STOPS:
-            print(
-                f"🧪 update_stops: side={pos.side} high={current_high} low={current_low} "
-                f"entry_atr={pos.entry_atr} tsl={pos.trailing_stop_loss}"
-            )
 
         # === UPDATE TRAILING STOPS ===
-        if self.lastPositionWasLong:
-            if USE_TRAILING and pos.entry_atr is not None:
-                potentialStop = current_high - pos.entry_atr * TRAIL_OFFSET_MULT
-                if pos.trailing_stop_loss is not None:
-                    new_stop = max(pos.trailing_stop_loss, potentialStop)
-                    if new_stop > pos.trailing_stop_loss:
-                        print(f"📊 Trailing stop updated: {pos.trailing_stop_loss:.5f} → {new_stop:.5f}")
-                        pos.trailing_stop_loss = new_stop
-                else:
-                    pos.trailing_stop_loss = potentialStop
+        for pos in list(self.active_orders):
+            if DEBUG_STOPS:
+                print(
+                    f"🧪 update_stops: side={pos.side} high={current_high} low={current_low} "
+                    f"entry_atr={pos.entry_atr} tsl={pos.trailing_stop_loss}"
+                )
+            if pos.side == "BUY":
+                if USE_TRAILING and pos.entry_atr is not None:
+                    potentialStop = current_high - pos.entry_atr * TRAIL_OFFSET_MULT
+                    if pos.trailing_stop_loss is not None:
+                        new_stop = max(pos.trailing_stop_loss, potentialStop)
+                        if new_stop > pos.trailing_stop_loss:
+                            print(f"📊 Trailing stop updated: {pos.trailing_stop_loss:.5f} → {new_stop:.5f}")
+                            pos.trailing_stop_loss = new_stop
+                    else:
+                        pos.trailing_stop_loss = potentialStop
+            elif pos.side == "SELL":
+                if USE_TRAILING and pos.entry_atr is not None:
+                    potentialStop = current_low + pos.entry_atr * TRAIL_OFFSET_MULT
+                    if pos.trailing_stop_loss is not None:
+                        new_stop = min(pos.trailing_stop_loss, potentialStop)
+                        if new_stop < pos.trailing_stop_loss:
+                            print(f"📊 Trailing stop updated: {pos.trailing_stop_loss:.5f} → {new_stop:.5f}")
+                            pos.trailing_stop_loss = new_stop
+                    else:
+                        pos.trailing_stop_loss = potentialStop
 
-        if self.lastPositionWasShort:
-            if USE_TRAILING and pos.entry_atr is not None:
-                potentialStop = current_low + pos.entry_atr * TRAIL_OFFSET_MULT
-                if pos.trailing_stop_loss is not None:
-                    new_stop = min(pos.trailing_stop_loss, potentialStop)
-                    if new_stop < pos.trailing_stop_loss:
-                        print(f"📊 Trailing stop updated: {pos.trailing_stop_loss:.5f} → {new_stop:.5f}")
-                        pos.trailing_stop_loss = new_stop
-                else:
-                    pos.trailing_stop_loss = potentialStop
+    def _apply_pyramiding_add_on(
+        self,
+        current_price: float,
+        current_high: float | None = None,
+        current_low: float | None = None,
+    ):
+        if not self.active_orders:
+            return
+        order = self.active_orders[0]
+        trigger_price = current_price
+        if order.side == "BUY" and current_high is not None:
+            trigger_price = max(current_price, current_high)
+        elif order.side == "SELL" and current_low is not None:
+            trigger_price = min(current_price, current_low)
+        add_spec: AddOnSpec | None = self.pyramiding.should_add_on(self, trigger_price)
+        if add_spec is None or add_spec.size is None or add_spec.size <= 0:
+            return
+        result = order.add_to_position(add_spec.size)
+        if isinstance(result, dict) and result.get("success"):
+            if add_spec.new_pyramid_count is not None:
+                order.pyramid_count = add_spec.new_pyramid_count
+            if add_spec.next_add_price is not None:
+                order.next_add_price = add_spec.next_add_price
 
 
     def bar_iteration(self):
