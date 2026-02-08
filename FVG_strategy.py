@@ -51,6 +51,7 @@ RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPer
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
 # Partial close sizing and ATR steps
+SPLIT_ORDERS_ENABLED = True        # If False, place a single order with FIXED_LOT
 EACH_TRADE_SIZE = 1                # Size per child order when splitting FIXED_LOT
 PARTIAL_TP_ATR_STEP = 1  # ATR step size for favorable partial closes
 PARTIAL_SL_ATR_STEP = 2  # ATR step size for adverse partial closes
@@ -245,6 +246,8 @@ class FVG_Strategy(Strategy):
         self.add_fvg_zones()
 
     def _validate_split_config(self) -> int:
+        if not SPLIT_ORDERS_ENABLED:
+            return 1
         if not USE_FIXED_LOT:
             raise ValueError(
                 "Partial close logic requires USE_FIXED_LOT=True to split orders."
@@ -460,6 +463,29 @@ class FVG_Strategy(Strategy):
                     self.save_data()
 
             elif ALLOW_INTRACANDLE_ENTRY:
+                tick_price = float(self.cur_close)
+                tick_high = tick_price
+                tick_low = tick_price
+                if "high" in new_row.columns:
+                    tick_high = float(new_row["high"].iloc[-1])
+                if "low" in new_row.columns:
+                    tick_low = float(new_row["low"].iloc[-1])
+                self._intrabar_price = tick_price
+                self._intrabar_high = tick_high
+                self._intrabar_low = tick_low
+                # Update latest bar with intrabar values for live touch checks
+                if self.data is not None and len(self.data) > 0:
+                    last_index = self.data.index[-1]
+                    if "high" in self.data.columns:
+                        self.data.at[last_index, "high"] = max(
+                            float(self.data.at[last_index, "high"]), tick_high
+                        )
+                    if "low" in self.data.columns:
+                        self.data.at[last_index, "low"] = min(
+                            float(self.data.at[last_index, "low"]), tick_low
+                        )
+                    if "close" in self.data.columns:
+                        self.data.at[last_index, "close"] = tick_price
                 self.entry_logic()
 
     def add_fvg_zones(self):
@@ -568,8 +594,12 @@ class FVG_Strategy(Strategy):
             return
 
 
+        allow_intracandle = ALLOW_INTRACANDLE_ENTRY
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
+        if allow_intracandle and hasattr(self, "_intrabar_high") and hasattr(self, "_intrabar_low"):
+            current_high = self._intrabar_high
+            current_low = self._intrabar_low
 
         atr = get_atr(self.data, ATR_PERIOD).iloc[-1]
 
@@ -591,34 +621,58 @@ class FVG_Strategy(Strategy):
                 and self.isBullishHTF
                 and self.marketOK
             ):
-                stop_loss = self.cur_close - atr * SL_MULTIPLIER
+                entry_price = self.cur_close
+                if allow_intracandle:
+                    entry_price = fvg_top
+                stop_loss = entry_price - atr * SL_MULTIPLIER
                 if USE_TRAILING:
-                    trail_stop = self.cur_close - atr * TRAIL_OFFSET_MULT
+                    trail_stop = entry_price - atr * TRAIL_OFFSET_MULT
                 else:
                     trail_stop = None
 
-                tp = self.cur_close + atr * TP_MULTIPLIER
+                tp = entry_price + atr * TP_MULTIPLIER
                 entryAtr = atr
                 group_id = self._next_partial_group_id()
                 self._partial_groups[group_id] = {
-                    "entry_price": self.cur_close,
+                    "entry_price": entry_price,
                     "entry_atr": entryAtr,
                     "side": "BUY",
                     "tp_steps_closed": 0,
                     "sl_steps_closed": 0,
                 }
                 any_success = False
-                for idx in range(self._split_order_count):
+                if SPLIT_ORDERS_ENABLED:
+                    for idx in range(self._split_order_count):
+                        active_order = self.Order(
+                            entry_atr=entryAtr, side="BUY", entry_price=entry_price, take_profit=tp,
+                            stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=EACH_TRADE_SIZE,
+                            **self.api_order_kwargs()
+                        )
+                        active_order.group_id = group_id
+                        active_order.group_seq = idx + 1
+                        active_order.entry_reference_price = entry_price
+                        result = active_order.place_order()
+
+                        self.active_orders.append(active_order)
+                        success = isinstance(result, dict) and result.get("success", False)
+                        if result is None:
+                            success = True
+                        if success:
+                            any_success = True
+                            self.pyramiding.on_position_opened(active_order, self)
+                else:
+                    order_size = FIXED_LOT if USE_FIXED_LOT else self.calculate_order_size(
+                        atr=atr, sl_mult=SL_MULTIPLIER
+                    )
                     active_order = self.Order(
-                        entry_atr=entryAtr, side="BUY", entry_price=self.cur_close, take_profit=tp,
-                        stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=EACH_TRADE_SIZE,
+                        entry_atr=entryAtr, side="BUY", entry_price=entry_price, take_profit=tp,
+                        stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=order_size,
                         **self.api_order_kwargs()
                     )
                     active_order.group_id = group_id
-                    active_order.group_seq = idx + 1
-                    active_order.entry_reference_price = self.cur_close
+                    active_order.group_seq = 1
+                    active_order.entry_reference_price = entry_price
                     result = active_order.place_order()
-
                     self.active_orders.append(active_order)
                     success = isinstance(result, dict) and result.get("success", False)
                     if result is None:
@@ -646,34 +700,58 @@ class FVG_Strategy(Strategy):
                 and self.isBearishHTF
                 and self.marketOK
             ):
-                stop_loss = self.cur_close + atr * SL_MULTIPLIER
+                entry_price = self.cur_close
+                if allow_intracandle:
+                    entry_price = fvg_bottom
+                stop_loss = entry_price + atr * SL_MULTIPLIER
                 if USE_TRAILING:
-                    trail_stop = self.cur_close + atr * TRAIL_OFFSET_MULT
+                    trail_stop = entry_price + atr * TRAIL_OFFSET_MULT
                 else:
                     trail_stop = None
 
-                tp = self.cur_close - atr * TP_MULTIPLIER
+                tp = entry_price - atr * TP_MULTIPLIER
                 entryAtr = atr
                 group_id = self._next_partial_group_id()
                 self._partial_groups[group_id] = {
-                    "entry_price": self.cur_close,
+                    "entry_price": entry_price,
                     "entry_atr": entryAtr,
                     "side": "SELL",
                     "tp_steps_closed": 0,
                     "sl_steps_closed": 0,
                 }
                 any_success = False
-                for idx in range(self._split_order_count):
+                if SPLIT_ORDERS_ENABLED:
+                    for idx in range(self._split_order_count):
+                        active_order = self.Order(
+                            entry_atr=entryAtr, side="SELL", entry_price=entry_price, take_profit=tp,
+                            trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=EACH_TRADE_SIZE,
+                            **self.api_order_kwargs()
+                        )
+                        active_order.group_id = group_id
+                        active_order.group_seq = idx + 1
+                        active_order.entry_reference_price = entry_price
+                        result = active_order.place_order()
+
+                        self.active_orders.append(active_order)
+                        success = isinstance(result, dict) and result.get("success", False)
+                        if result is None:
+                            success = True
+                        if success:
+                            any_success = True
+                            self.pyramiding.on_position_opened(active_order, self)
+                else:
+                    order_size = FIXED_LOT if USE_FIXED_LOT else self.calculate_order_size(
+                        atr=atr, sl_mult=SL_MULTIPLIER
+                    )
                     active_order = self.Order(
-                        entry_atr=entryAtr, side="SELL", entry_price=self.cur_close, take_profit=tp,
-                        trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=EACH_TRADE_SIZE,
+                        entry_atr=entryAtr, side="SELL", entry_price=entry_price, take_profit=tp,
+                        trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=order_size,
                         **self.api_order_kwargs()
                     )
                     active_order.group_id = group_id
-                    active_order.group_seq = idx + 1
-                    active_order.entry_reference_price = self.cur_close
+                    active_order.group_seq = 1
+                    active_order.entry_reference_price = entry_price
                     result = active_order.place_order()
-
                     self.active_orders.append(active_order)
                     success = isinstance(result, dict) and result.get("success", False)
                     if result is None:
