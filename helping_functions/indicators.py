@@ -6,12 +6,14 @@ def ema(data, length):
     Returns the latest EMA value (single number) for the last bar.
     """
     if isinstance(data, pd.DataFrame):
+        if data.empty:
+            return None
         # If DataFrame, assume we want the 'close' column
         series = data['close'] if 'close' in data.columns else data.iloc[:, 0]
     else:
         series = data
     
-    if len(series) < length:
+    if series is None or len(series) < length:
         return None
     
     # Calculate EMA using pandas ewm (exponential weighted moving average)
@@ -25,12 +27,14 @@ def sma(bars, length):
     Returns the latest SMA value (single number) for the last bar.
     """
     if isinstance(bars, pd.DataFrame):
+        if bars.empty:
+            return None
         # If DataFrame, assume we want the first column or 'close'
         series = bars['close'] if 'close' in bars.columns else bars.iloc[:, 0]
     else:
         series = bars
     
-    if len(series) < length:
+    if series is None or len(series) < length:
         return None
     
     # Calculate SMA - simple mean of last 'length' values
