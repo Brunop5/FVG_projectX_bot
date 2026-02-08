@@ -1,4 +1,5 @@
 backtest/GOLD_BACKTEST
+backtest/BTC_BACKTEST
 
 venv/
 __pycache__/

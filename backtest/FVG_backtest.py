@@ -4,14 +4,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
 
+from FVG_projectX_bot.FVG_strategy import *
+from FVG_projectX_bot.helping_functions.indicators import get_atr, ema
+from FVG_projectX_bot.helping_functions.pyramiding import MaxOrdersPolicy
+
+
 PARENT_DIR = Path(__file__).parents[1]
-CURRENT_DIR = Path(__file__).parent / "GOLD_BACKTEST"
+CURRENT_DIR = Path(__file__).parent / "BTC_BACKTEST"
 
 # ==================== USER CONFIG ====================
-ASSET = "MGCJ6"
+ASSET = "BTC"
 TIMEFRAME = "15m"
-INITIAL_BALANCE = 10000.0
-DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "MGCG6" / "IC_markets_15min.csv")
+INITIAL_BALANCE = 50.0
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
 START_TIMESTAMP = "1755528300000"
 
 # Pyramiding mode: "none", "client_atr", or "max_orders"
@@ -22,16 +27,10 @@ MAX_PYRAMID_ORDERS = 3
 BACKTEST_WINDOW_BARS = None
 
 # Contract / fee inputs
-USE_CONTRACTS_CSV = True
+USE_CONTRACTS_CSV = False
 CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
-USE_ROUND_TURN_FEE = True
+USE_ROUND_TURN_FEE = False
 ROUND_TURN_FEE_USD = 3.5
-
-
-
-from FVG_projectX_bot.FVG_strategy import *
-from FVG_projectX_bot.helping_functions.indicators import get_atr, ema
-from FVG_projectX_bot.helping_functions.pyramiding import MaxOrdersPolicy
 
 
 class BacktestOrder(FVG_Order):
@@ -41,6 +40,8 @@ class BacktestOrder(FVG_Order):
     exit_price: float | None
     exit_reason: str | None
     pnl: float | None
+    _last_price: float | None
+    _last_timestamp: float| None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -74,7 +75,7 @@ class BacktestOrder(FVG_Order):
             entry_price = self.avg_entry_price if self.avg_entry_price is not None else self.entry_price
             price_delta = self.exit_price - entry_price
             direction = 1 if self.side == "BUY" else -1
-            self.pnl = price_delta * direction * float(self.order_size or 0.0)
+            self.pnl = price_delta * direction * float(self.order_size or 0.0) - float(self.order_size or 0.0) * self._last_price * 0.0001
         group_id = getattr(self, "group_id", None)
         group_seq = getattr(self, "group_seq", None)
         print(
@@ -221,12 +222,21 @@ class FVG_Backtest(FVG_Strategy):
         if self._full_data is None or "timestamp" not in self._full_data.columns:
             return pd.DataFrame()
         htf_data = self._full_data.copy()
-        if pd.api.types.is_numeric_dtype(htf_data["timestamp"]):
-            htf_data["timestamp"] = pd.to_datetime(
-                htf_data["timestamp"], unit="ms", utc=True
-            )
+        # Normalize timestamps to UTC datetimes even if stored as numeric strings.
+        ts_series = htf_data["timestamp"]
+        if pd.api.types.is_numeric_dtype(ts_series):
+            max_val = pd.Series(ts_series).max()
+            unit = "ms" if max_val > 10**12 else "s"
+            htf_data["timestamp"] = pd.to_datetime(ts_series, unit=unit, utc=True)
         else:
-            htf_data["timestamp"] = pd.to_datetime(htf_data["timestamp"], utc=True)
+            numeric_ts = pd.to_numeric(ts_series, errors="coerce")
+            if numeric_ts.notna().any():
+                max_val = numeric_ts.max()
+                unit = "ms" if max_val > 10**12 else "s"
+                htf_data["timestamp"] = pd.to_datetime(numeric_ts, unit=unit, utc=True)
+            else:
+                htf_data["timestamp"] = pd.to_datetime(ts_series, utc=True, errors="coerce")
+        htf_data = htf_data[htf_data["timestamp"].notna()]
         htf_data = htf_data[htf_data["timestamp"] <= current_timestamp]
         if htf_data.empty:
             return pd.DataFrame()
@@ -412,6 +422,16 @@ class FVG_Backtest(FVG_Strategy):
     def _update_trend_indicators(self):
         bars = self.fetch_htf_data()
         htfEMA = ema(bars, EMA_PERIOD)
+        last_ts_raw = None
+        current_ts = None
+        full_ts_min = None
+        full_ts_max = None
+        if self.data is not None and len(self.data) > 0 and "timestamp" in self.data.columns:
+            last_ts_raw = self.data["timestamp"].iloc[-1]
+            current_ts = self._extract_bar_time(self.data.iloc[[-1]])
+        if self._full_data is not None and "timestamp" in self._full_data.columns:
+            full_ts_min = self._full_data["timestamp"].iloc[0]
+            full_ts_max = self._full_data["timestamp"].iloc[-1]
 
         if htfEMA is None:
             self.isBullishHTF = False
@@ -541,7 +561,6 @@ class FVG_Backtest(FVG_Strategy):
             self.cur_volume = float(new_row["volume"].iloc[-1]) if "volume" in new_row.columns else 0.0
             self._current_dt = self._extract_bar_time(new_row)
 
-
             self.update_indicators()
             self.add_fvg_zones()
 
@@ -670,7 +689,6 @@ if __name__ == "__main__":
         timeframe=TIMEFRAME,
         initial_balance=INITIAL_BALANCE,
         data_path=data_path,
-        start_timestamp=START_TIMESTAMP,
         pyramiding_mode=PYRAMIDING_MODE,
     )
     trades = backtest.run()

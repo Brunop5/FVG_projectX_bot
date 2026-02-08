@@ -21,19 +21,19 @@ from strategyTemplate import Strategy, Order
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 14              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.12          # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 9              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 200                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.1
+HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 100                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.3
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 12                    # ATR Period (min 1)
+ATR_PERIOD = 18                    # ATR Period (min 1)
 SL_MULTIPLIER = 5.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
 TP_MULTIPLIER = 20                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
@@ -46,15 +46,19 @@ HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 6                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 0.002                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
 # Partial close sizing and ATR steps
-SPLIT_ORDERS_ENABLED = True        # If False, place a single order with FIXED_LOT
-EACH_TRADE_SIZE = 1                # Size per child order when splitting FIXED_LOT
-PARTIAL_TP_ATR_STEP = 1  # ATR step size for favorable partial closes
-PARTIAL_SL_ATR_STEP = 2  # ATR step size for adverse partial closes
+SPLIT_ORDERS_ENABLED = False        # If False, place a single order with FIXED_LOT
+EACH_TRADE_SIZE = 0.001                # Size per child order when splitting FIXED_LOT
+PARTIAL_TP_ATR_STEP = 5  # ATR step size for favorable partial closes
+PARTIAL_SL_ATR_STEP = 2.75  # ATR step size for adverse partial closes
+PARTIAL_TP_CLOSE_SIZE = 0.2  # Size to close per favorable step (multiple of EACH_TRADE_SIZE)
+PARTIAL_SL_CLOSE_SIZE = 0.5  # Size to close per adverse step (multiple of EACH_TRADE_SIZE)
+ENABLE_PARTIAL_TP = True
+ENABLE_PARTIAL_SL = True
 
 # Daily Trading Limits
 MAX_DAILY_TRADES = 3
@@ -66,7 +70,7 @@ DEBUG_PYRAMIDING = False
 # Pyramiding (client mode)
 ALLOW_PYRAMIDING = True
 PYR_ATR_STEP = 1.0
-PYR_ADD_ON_SIZE = 1
+PYR_ADD_ON_SIZE = 0.002
 PYR_MAX_ADDS = 10
 
 def quiet_log(msg):
@@ -235,6 +239,22 @@ class FVG_Strategy(Strategy):
         self._partial_groups = {}
         self._partial_group_counter = 0
         self._split_order_count = self._validate_split_config()
+        self._partial_tp_close_count = (
+            self._validate_partial_close_size(
+                PARTIAL_TP_CLOSE_SIZE,
+                "PARTIAL_TP_CLOSE_SIZE",
+            )
+            if ENABLE_PARTIAL_TP
+            else 0
+        )
+        self._partial_sl_close_count = (
+            self._validate_partial_close_size(
+                PARTIAL_SL_CLOSE_SIZE,
+                "PARTIAL_SL_CLOSE_SIZE",
+            )
+            if ENABLE_PARTIAL_SL
+            else 0
+        )
 
         super().__init__()
 
@@ -267,12 +287,30 @@ class FVG_Strategy(Strategy):
             raise ValueError("Split order count must be at least 1.")
         return count_int
 
+    def _validate_partial_close_size(self, size_value: float | None, label: str) -> int:
+        if size_value is None:
+            size_value = EACH_TRADE_SIZE
+        if size_value <= 0:
+            raise ValueError(f"{label} must be a positive number.")
+        count = size_value / EACH_TRADE_SIZE
+        if not math.isclose(count, round(count), rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError(
+                f"{label} ({size_value}) must be an exact multiple of "
+                f"EACH_TRADE_SIZE ({EACH_TRADE_SIZE})."
+            )
+        count_int = int(round(count))
+        if count_int < 1:
+            raise ValueError(f"{label} must be at least one child order.")
+        return count_int
+
     def _next_partial_group_id(self) -> int:
         self._partial_group_counter += 1
         return self._partial_group_counter
 
     def _get_partial_close_targets(self, current_price: float) -> dict:
         if not self.active_orders:
+            return {}
+        if (not ENABLE_PARTIAL_TP) and (not ENABLE_PARTIAL_SL):
             return {}
         if PARTIAL_TP_ATR_STEP <= 0 and PARTIAL_SL_ATR_STEP <= 0:
             return {}
@@ -313,28 +351,35 @@ class FVG_Strategy(Strategy):
             sorted_orders = sorted(orders, key=lambda o: getattr(o, "group_seq", 0))
             available = [o for o in sorted_orders if o not in close_map]
 
-            if PARTIAL_TP_ATR_STEP > 0 and favorable_move > 0:
+            if ENABLE_PARTIAL_TP and PARTIAL_TP_ATR_STEP > 0 and favorable_move > 0:
                 step_size = entry_atr * PARTIAL_TP_ATR_STEP
                 if step_size > 0:
                     steps_reached = int(favorable_move // step_size)
                     to_close = steps_reached - state["tp_steps_closed"]
                     if to_close > 0 and available:
-                        close_count = min(to_close, len(available))
-                        for order in available[:close_count]:
-                            close_map[order] = "partial_tp"
-                        state["tp_steps_closed"] += close_count
-                        available = available[close_count:]
+                        for _ in range(to_close):
+                            if not available:
+                                break
+                            close_count = min(self._partial_tp_close_count, len(available))
+                            for order in available[:close_count]:
+                                close_map[order] = "partial_tp"
+                            available = available[close_count:]
+                            state["tp_steps_closed"] += 1
 
-            if PARTIAL_SL_ATR_STEP > 0 and adverse_move > 0 and available:
+            if ENABLE_PARTIAL_SL and PARTIAL_SL_ATR_STEP > 0 and adverse_move > 0 and available:
                 step_size = entry_atr * PARTIAL_SL_ATR_STEP
                 if step_size > 0:
                     steps_reached = int(adverse_move // step_size)
                     to_close = steps_reached - state["sl_steps_closed"]
                     if to_close > 0:
-                        close_count = min(to_close, len(available))
-                        for order in available[:close_count]:
-                            close_map[order] = "partial_sl"
-                        state["sl_steps_closed"] += close_count
+                        for _ in range(to_close):
+                            if not available:
+                                break
+                            close_count = min(self._partial_sl_close_count, len(available))
+                            for order in available[:close_count]:
+                                close_map[order] = "partial_sl"
+                            available = available[close_count:]
+                            state["sl_steps_closed"] += 1
 
         return close_map
 
@@ -601,7 +646,8 @@ class FVG_Strategy(Strategy):
             current_high = self._intrabar_high
             current_low = self._intrabar_low
 
-        atr = get_atr(self.data, ATR_PERIOD).iloc[-1]
+        atr_series = get_atr(self.data, ATR_PERIOD)
+        atr = atr_series.iloc[-1] if len(atr_series) > 0 else None
 
         for zone in self.fvg_zones[-FVG_HISTORY_NBR:]:
             if not self.pyramiding.should_allow_entry(self, zone):
