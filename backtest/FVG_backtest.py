@@ -18,6 +18,9 @@ START_TIMESTAMP = "1755528300000"
 PYRAMIDING_MODE = "client_atr" # remake to str enum
 MAX_PYRAMID_ORDERS = 3
 
+# Backtest data window (bars)
+BACKTEST_WINDOW_BARS = None
+
 # Contract / fee inputs
 USE_CONTRACTS_CSV = True
 CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
@@ -214,6 +217,51 @@ class FVG_Backtest(FVG_Strategy):
             f"tickSize={self.tick_size} tickValue={self.tick_value}"
         )
 
+    def _resample_htf_data(self, current_timestamp: datetime) -> pd.DataFrame:
+        if self._full_data is None or "timestamp" not in self._full_data.columns:
+            return pd.DataFrame()
+        htf_data = self._full_data.copy()
+        if pd.api.types.is_numeric_dtype(htf_data["timestamp"]):
+            htf_data["timestamp"] = pd.to_datetime(
+                htf_data["timestamp"], unit="ms", utc=True
+            )
+        else:
+            htf_data["timestamp"] = pd.to_datetime(htf_data["timestamp"], utc=True)
+        htf_data = htf_data[htf_data["timestamp"] <= current_timestamp]
+        if htf_data.empty:
+            return pd.DataFrame()
+        htf_data = htf_data.set_index("timestamp")
+
+        htf_minutes = int(HTF_TF)
+        if htf_minutes == 240:
+            resample_period = "4h"
+        elif htf_minutes == 120:
+            resample_period = "2h"
+        elif htf_minutes == 60:
+            resample_period = "1h"
+        elif htf_minutes == 1440:
+            resample_period = "1d"
+        elif htf_minutes >= 1440:
+            resample_period = f"{htf_minutes // 1440}d"
+        elif htf_minutes >= 60:
+            resample_period = f"{htf_minutes // 60}h"
+        else:
+            resample_period = f"{htf_minutes}min"
+
+        agg_dict = {"open": "first", "high": "max", "low": "min", "close": "last"}
+        if "volume" in htf_data.columns:
+            agg_dict["volume"] = "sum"
+        # Use origin='epoch' to align bars to true timeframe boundaries (e.g. 00:00, 04:00, ...)
+        htf_resampled = (
+            htf_data.resample(
+                resample_period, label="right", closed="right", origin="epoch"
+            )
+            .agg(agg_dict)
+            .dropna()
+            .reset_index()
+        )
+        return htf_resampled
+
     def _precompute_indicators(self) -> None:
         """
         Precompute heavy, fully-vectorizable indicators once over the full dataset
@@ -289,9 +337,15 @@ class FVG_Backtest(FVG_Strategy):
         # Default cursor after warmup
         self._cursor = warmup
 
+        window = self._get_window_size()
+        if window < warmup:
+            window = warmup
+
         # If no explicit start timestamp, just return warmup slice
         if self._start_from_dt is None or "timestamp" not in self._full_data.columns:
-            return self._full_data.iloc[:warmup].copy()
+            start_idx = warmup
+            start = max(0, start_idx - window)
+            return self._full_data.iloc[start:start_idx].copy()
 
         # Find first bar at or after requested start timestamp
         start_idx = None
@@ -305,81 +359,46 @@ class FVG_Backtest(FVG_Strategy):
         # If a later start index is found, extend initial data to that point
         if start_idx is not None and start_idx > warmup:
             self._cursor = start_idx
-            return self._full_data.iloc[:start_idx].copy()
+            start = max(0, start_idx - window)
+            return self._full_data.iloc[start:start_idx].copy()
 
         # Fallback: start from warmup as usual
-        return self._full_data.iloc[:warmup].copy()
+        start_idx = warmup
+        start = max(0, start_idx - window)
+        return self._full_data.iloc[start:start_idx].copy()
 
-    def _update_trend_indicators(self):
-        """
-        Optimized version of FVG_Strategy._update_trend_indicators that uses
-        precomputed indicators stored in self.data instead of recalculating
-        them for every bar.
-        """
-        # === HTF EMA trend (uses precomputed 'htf_ema') ===
-        htf_ema_series = self.data.get("htf_ema")
-        htfEMA = None
-        if htf_ema_series is not None and len(htf_ema_series) > 0:
-            htfEMA = float(htf_ema_series.iloc[-1])
-
-        if htfEMA is None:
-            self.isBullishHTF = False
-            self.isBearishHTF = False
-        else:
-            self.isBullishHTF = self.cur_close > htfEMA
-            self.isBearishHTF = self.cur_close < htfEMA
-
-        # === ATR & volatility checks (use precomputed 'atr', 'atr_sma', 'vol_sma') ===
-        atr_series = self.data.get("atr")
-        atr_sma_series = self.data.get("atr_sma")
-
-        if (
-            atr_series is not None
-            and atr_sma_series is not None
-            and len(atr_series) > 0
-            and len(atr_sma_series) > 0
-        ):
-            last_atr = atr_series.iloc[-1]
-            last_atr_sma = atr_sma_series.iloc[-1]
-            if pd.isna(last_atr) or pd.isna(last_atr_sma):
-                atrOK = False
-            else:
-                atrOK = last_atr > last_atr_sma
-        else:
-            atrOK = False
-
-        if USE_VOLUME_CHECK:
-            vol_sma_series = self.data.get("vol_sma")
-            if vol_sma_series is not None and len(vol_sma_series) > 0:
-                vol_sma_val = vol_sma_series.iloc[-1]
-                if pd.isna(vol_sma_val):
-                    volOK = False
-                else:
-                    volOK = self.cur_volume > vol_sma_val * VOLUME_MULTIPLIER
-            else:
-                volOK = False
-            self.marketOK = volOK and atrOK
-        else:
-            # Skip volume check, only use ATR
-            self.marketOK = atrOK
-
-        # === FVG flags (same logic as parent implementation) ===
-        self.lastBullFvg = (
-            self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
-        )
-        self.lastBearFvg = (
-            self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
-        )
+    def _get_window_size(self) -> int:
+        min_window = max(ATR_PERIOD + 20, EMA_PERIOD + 51, 150)
+        min_window = max(min_window, 25, 21 + 4)
+        if BACKTEST_WINDOW_BARS is None:
+            return min_window
+        return max(int(BACKTEST_WINDOW_BARS), min_window)
 
     def fetch_new_data(self) -> None:
         if self._cursor >= len(self._full_data):
             return
         new_row = self._full_data.iloc[[self._cursor]]
         self.data = pd.concat([self.data, new_row], ignore_index=True)
+        window = self._get_window_size()
+        if len(self.data) > window:
+            self.data = self.data.iloc[-window:].reset_index(drop=True)
         self._cursor += 1
 
     def fetch_htf_data(self) -> pd.DataFrame:
-        return self.data
+        if self.data is None or len(self.data) == 0:
+            return pd.DataFrame()
+        current_timestamp = self._extract_bar_time(self.data.iloc[[-1]])
+        if current_timestamp is None:
+            return pd.DataFrame()
+        bars_needed = max(101, EMA_PERIOD + 51)
+
+        htf_resampled = self._resample_htf_data(current_timestamp)
+        if htf_resampled.empty:
+            return pd.DataFrame()
+        if len(htf_resampled) < EMA_PERIOD:
+            return pd.DataFrame()
+        start_idx = max(0, len(htf_resampled) - bars_needed)
+        return htf_resampled.iloc[start_idx:].copy()
 
     def check_daily_trade_limit(self):
         if self._current_dt is None:
@@ -389,6 +408,36 @@ class FVG_Backtest(FVG_Strategy):
             self.daily_trades_count = 0
             self.last_trade_date = str(today)
         return self.daily_trades_count < MAX_DAILY_TRADES
+
+    def _update_trend_indicators(self):
+        bars = self.fetch_htf_data()
+        htfEMA = ema(bars, EMA_PERIOD)
+
+        if htfEMA is None:
+            self.isBullishHTF = False
+            self.isBearishHTF = False
+        else:
+            self.isBullishHTF = self.cur_close > htfEMA
+            self.isBearishHTF = self.cur_close < htfEMA
+
+        atrVal = get_atr(self.data, ATR_PERIOD)
+        atr_sma = sma(atrVal, 20) if len(atrVal) > 0 else None
+        atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
+
+        if USE_VOLUME_CHECK:
+            vol_sma = sma(self.data["volume"], 20)
+            volOK = self.cur_volume > vol_sma * VOLUME_MULTIPLIER if vol_sma is not None else False
+            self.marketOK = volOK and atrOK
+        else:
+            # Skip volume check, only use ATR
+            self.marketOK = atrOK
+
+        self.lastBullFvg = (
+            self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
+        )
+        self.lastBearFvg = (
+            self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
+        )
 
     def calculate_order_size(self, atr, sl_mult):
         if USE_FIXED_LOT:
@@ -505,7 +554,49 @@ class FVG_Backtest(FVG_Strategy):
                 remaining = []
                 closed_any = False
                 for order in list(self.active_orders):
-                    if order in partial_close_map:
+                    intrabar_closed = False
+                    if order.side == "BUY":
+                        if order.trailing_stop_loss is not None and current_low <= order.trailing_stop_loss:
+                            order._last_price = float(order.trailing_stop_loss)
+                            order._last_timestamp = self._current_dt
+                            order.exit_reason = "trailing_stop"
+                            order.close_order()
+                            intrabar_closed = True
+                        elif order.stop_loss is not None and current_low <= order.stop_loss:
+                            order._last_price = float(order.stop_loss)
+                            order._last_timestamp = self._current_dt
+                            order.exit_reason = "stop_loss"
+                            order.close_order()
+                            intrabar_closed = True
+                        elif order.take_profit is not None and current_high >= order.take_profit:
+                            order._last_price = float(order.take_profit)
+                            order._last_timestamp = self._current_dt
+                            order.exit_reason = "take_profit"
+                            order.close_order()
+                            intrabar_closed = True
+                    else:
+                        if order.trailing_stop_loss is not None and current_high >= order.trailing_stop_loss:
+                            order._last_price = float(order.trailing_stop_loss)
+                            order._last_timestamp = self._current_dt
+                            order.exit_reason = "trailing_stop"
+                            order.close_order()
+                            intrabar_closed = True
+                        elif order.stop_loss is not None and current_high >= order.stop_loss:
+                            order._last_price = float(order.stop_loss)
+                            order._last_timestamp = self._current_dt
+                            order.exit_reason = "stop_loss"
+                            order.close_order()
+                            intrabar_closed = True
+                        elif order.take_profit is not None and current_low <= order.take_profit:
+                            order._last_price = float(order.take_profit)
+                            order._last_timestamp = self._current_dt
+                            order.exit_reason = "take_profit"
+                            order.close_order()
+                            intrabar_closed = True
+
+                    if intrabar_closed:
+                        closed = True
+                    elif order in partial_close_map:
                         if hasattr(order, "_last_price"):
                             order._last_price = self.cur_close
                         if hasattr(order, "_last_timestamp"):
