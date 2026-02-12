@@ -74,7 +74,7 @@ def _load_assets_from_env() -> list[tuple[str, str, int]]:
     return assets
 
 
-ASSETS = _load_assets_from_env()
+ASSETS = [["MGC", "15min", 55]]
 
 
 def _tf_to_minutes(timeframe: str) -> int:

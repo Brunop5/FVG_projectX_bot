@@ -18,7 +18,7 @@ from ..helping_functions.pyramiding import MaxOrdersPolicy
 from ..projectX.projectx_api_functions import sleep_until_next_boundary
 
 
-ASSETS = [("BTCUSDT", "15min")]  # BTCUSDT perpetual (USDT-margined)
+ASSETS = [("BTCUSDT", "1min")]  # BTCUSDT perpetual (USDT-margined)
 USE_CONTINUOUS_KLINES = False
 CONTRACT_TYPE = "PERPETUAL"
 MAX_OPEN_ORDERS = 1
@@ -155,7 +155,8 @@ class Binance_Order(FVG_Order):
         if self._position_side:
             params["positionSide"] = self._position_side
         try:
-            result = self._client.new_order(**params)
+            #result = self._client.new_order(**params)
+            result = "nice"
             print(
                 f"✅ Binance order placed: {self.side} {self.symbol} "
                 f"qty={self.order_size} entry={self.entry_price}"
@@ -180,7 +181,8 @@ class Binance_Order(FVG_Order):
         if self._position_side:
             params["positionSide"] = self._position_side
         try:
-            result = self._client.new_order(**params)
+            #result = self._client.new_order(**params)
+            result = "nice"
             print(
                 f"✅ Binance order closed: {opposite} {self.symbol} "
                 f"qty={self.order_size}"
@@ -222,6 +224,7 @@ class Binance_Strategy(FVG_Strategy):
 
     def api_order_kwargs(self) -> dict:
         return {"symbol": self.asset, "client": self._client}
+
 
     def get_account_balance(self) -> float:
         try:
@@ -320,8 +323,12 @@ class Binance_Strategy(FVG_Strategy):
                 if not kline:
                     return
                 close = float(kline.get("c"))
+                high = float(kline.get("h", close))
+                low = float(kline.get("l", close))
                 volume = float(kline.get("v", 0))
-                new_row = pd.DataFrame([{"close": close, "volume": volume}])
+                new_row = pd.DataFrame(
+                    [{"close": close, "high": high, "low": low, "volume": volume}]
+                )
                 self.update_price(new_row)
             except Exception as exc:
                 print(f"⚠️ Websocket parse error: {exc}")

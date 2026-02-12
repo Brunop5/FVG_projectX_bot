@@ -4,6 +4,8 @@ import threading
 
 from abc import abstractmethod
 from datetime import datetime
+import os
+from dotenv import load_dotenv
 
 from .helping_functions.indicators import get_atr
 from .helping_functions.indicators import sma
@@ -19,44 +21,62 @@ from .helping_functions.pyramiding import (
 from strategyTemplate import Strategy, Order
 
 
+
+ASSETS = [("CON.F.US.MGC.J26","1min", "PRAC-V2-252499-51361945")]
+
+#load_dotenv()
+USERNAME = os.getenv("USERNAME")
+API_KEY = os.getenv("API_KEY")
+LIVE = False  # or False
+
+
+# ====================
+# if true, updates contracts.csv - this should be done at least monthly
+UPDATE_CONTRACT_LIST = False
+
+# if true it will print the list of valid accounts for this api key
+SHOW_ACCOUNTS = False
+# ======== if any of those two is true, it will run the option, but not the strategy
+
+
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 9              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
+FVG_HISTORY_NBR = 1              # Number of FVGs to work with
+MIN_FVG_POWER_PCT = 0.00001          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 100                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.3
+HTF_TF = "30"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 15                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.2
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 18                    # ATR Period (min 1)
-SL_MULTIPLIER = 5.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 20                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 23                    # ATR Period (min 1)
+SL_MULTIPLIER = 6.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 7                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 1            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+TRAIL_OFFSET_MULT = 4            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
-HOLD_UNTIL_OPPOSITE = False         # Hold Until Opposite BOS/CHoCH
+HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 0.002                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 6                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
 # Partial close sizing and ATR steps
-SPLIT_ORDERS_ENABLED = False        # If False, place a single order with FIXED_LOT
-EACH_TRADE_SIZE = 0.001                # Size per child order when splitting FIXED_LOT
-PARTIAL_TP_ATR_STEP = 5  # ATR step size for favorable partial closes
-PARTIAL_SL_ATR_STEP = 2.75  # ATR step size for adverse partial closes
-PARTIAL_TP_CLOSE_SIZE = 0.2  # Size to close per favorable step (multiple of EACH_TRADE_SIZE)
-PARTIAL_SL_CLOSE_SIZE = 0.5  # Size to close per adverse step (multiple of EACH_TRADE_SIZE)
+SPLIT_ORDERS_ENABLED = True        # If False, place a single order with FIXED_LOT
+EACH_TRADE_SIZE = 1                # Size per child order when splitting FIXED_LOT
+PARTIAL_TP_ATR_STEP = 1  # ATR step size for favorable partial closes
+PARTIAL_SL_ATR_STEP = 2  # ATR step size for adverse partial closes
+PARTIAL_TP_CLOSE_SIZE = 1  # Size to close per favorable step (multiple of EACH_TRADE_SIZE)
+PARTIAL_SL_CLOSE_SIZE = 2  # Size to close per adverse step (multiple of EACH_TRADE_SIZE)
 ENABLE_PARTIAL_TP = True
 ENABLE_PARTIAL_SL = True
 
@@ -70,7 +90,7 @@ DEBUG_PYRAMIDING = False
 # Pyramiding (client mode)
 ALLOW_PYRAMIDING = True
 PYR_ATR_STEP = 1.0
-PYR_ADD_ON_SIZE = 0.002
+PYR_ADD_ON_SIZE = 1
 PYR_MAX_ADDS = 10
 
 def quiet_log(msg):
@@ -99,21 +119,22 @@ class FVG_Order(Order):
         if add_size is None or add_size <= 0:
             return {"success": False, "message": "Invalid add-on size"}
         original_size = float(self.order_size or 0.0)
-        self.order_size = add_size
+        add_size_int = self._normalize_order_size(add_size)
+        self.order_size = add_size_int
         result = self.place_order()
         success = isinstance(result, dict) and result.get("success", False)
         if result is None:
             success = True
         if success:
-            new_size = original_size + float(add_size)
+            new_size = original_size + float(add_size_int)
             if new_size > 0 and self.avg_entry_price is not None:
                 self.avg_entry_price = (
                     (self.avg_entry_price * original_size)
-                    + (self.entry_price * float(add_size))
+                    + (self.entry_price * float(add_size_int))
                 ) / new_size
-            self.order_size = new_size
+            self.order_size = self._normalize_order_size(new_size)
             log(
-                f"➕ Add-on placed: size={add_size} new_size={self.order_size} "
+                f"➕ Add-on placed: size={add_size_int} new_size={self.order_size} "
                 f"side={self.side} entry={self.entry_price}"
             )
             return {"success": True, "new_size": self.order_size, "result": result}
@@ -126,8 +147,10 @@ class FVG_Order(Order):
         last_long = kwargs["last_long"]
         last_short = kwargs["last_short"] 
         isBOS = kwargs["isBOS"]
-        isCHOCH = kwargs["isCHOCH"] 
-        if DEBUG_STOPS:
+        isCHOCH = kwargs["isCHOCH"]
+        current_high = kwargs.get("current_high")
+        current_low = kwargs.get("current_low")
+        if True:
             log(
                 f"🧪 check_close_conditions: side={self.side} "
                 f"price={current_price} tsl={self.trailing_stop_loss} "
@@ -137,34 +160,38 @@ class FVG_Order(Order):
             )
 
         if self.side == "BUY":
-            if self.trailing_stop_loss is not None and current_price <= self.trailing_stop_loss:
+            stop_check_price = current_low if current_low is not None else current_price
+            tp_check_price = current_high if current_high is not None else current_price
+            if self.trailing_stop_loss is not None and stop_check_price <= self.trailing_stop_loss:
                 log(f"🛑 Trailing Stop Loss hit for LONG position at {current_price:.5f}")
                 self.close_order()
                 return True
 
-            if self.stop_loss is not None and current_price <= self.stop_loss:
+            if self.stop_loss is not None and stop_check_price <= self.stop_loss:
                 log(f"🛑 Stop Loss hit for LONG position at {current_price:.5f}")
                 self.close_order()
                 return True
 
-            if current_price >= self.take_profit:
+            if tp_check_price >= self.take_profit:
                 log(f"🎯 Take Profit hit for LONG position at {current_price:.5f}")
                 self.close_order()
                 return True
 
 
         elif self.side == "SELL":
-            if self.trailing_stop_loss is not None and current_price >= self.trailing_stop_loss:
+            stop_check_price = current_high if current_high is not None else current_price
+            tp_check_price = current_low if current_low is not None else current_price
+            if self.trailing_stop_loss is not None and stop_check_price >= self.trailing_stop_loss:
                 log(f"🛑 Trailing Stop Loss hit for SHORT position at {current_price:.5f}")
                 self.close_order()
                 return True
 
-            if self.stop_loss is not None and current_price >= self.stop_loss:
+            if self.stop_loss is not None and stop_check_price >= self.stop_loss:
                 log(f"🛑 Stop Loss hit for SHORT position at {current_price:.5f}")
                 self.close_order()
                 return True
 
-            if current_price <= self.take_profit:
+            if tp_check_price <= self.take_profit:
                 log(f"🎯 Take Profit hit for SHORT position at {current_price:.5f}")
                 self.close_order()
                 return True
@@ -463,7 +490,17 @@ class FVG_Strategy(Strategy):
             return
 
         with self._lock:
-            self.cur_close = new_row["close"].iloc[-1]
+            self.cur_close = float(new_row["close"].iloc[-1])
+            current_high = (
+                float(new_row["high"].iloc[-1])
+                if "high" in new_row.columns
+                else self.cur_close
+            )
+            current_low = (
+                float(new_row["low"].iloc[-1])
+                if "low" in new_row.columns
+                else self.cur_close
+            )
             if DEBUG_STOPS:
                 print(
                     f"🧪 update_price: close={self.cur_close} "
@@ -475,7 +512,7 @@ class FVG_Strategy(Strategy):
             if len(self.active_orders) > 0:
                 if DEBUG_STOPS:
                     print("🧪 update_price: calling update_stops + check_close_conditions")
-                self.update_stops()
+                self.update_stops(current_high=current_high, current_low=current_low)
                 partial_close_map = self._get_partial_close_targets(self.cur_close)
                 remaining = []
                 closed_any = False
@@ -488,6 +525,8 @@ class FVG_Strategy(Strategy):
                     else:
                         closed = order.check_close_conditions(
                             current_price=self.cur_close,
+                            current_high=current_high,
+                            current_low=current_low,
                             last_long=order.side == "BUY",
                             last_short=order.side == "SELL",
                             isBOS=self.isBOS,
@@ -500,7 +539,11 @@ class FVG_Strategy(Strategy):
                         remaining.append(order)
                 self.active_orders = remaining
                 if self.active_orders:
-                    self._apply_pyramiding_add_on(self.cur_close)
+                    self._apply_pyramiding_add_on(
+                        self.cur_close,
+                        current_high=current_high,
+                        current_low=current_low,
+                    )
                 if closed_any:
                     self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
                     self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
@@ -818,12 +861,15 @@ class FVG_Strategy(Strategy):
                 break
 
 
-    def update_stops(self):
+    def update_stops(self, current_high: float | None = None, current_low: float | None = None):
         if len(self.active_orders) == 0:
             return
 
-        current_high = self.data["high"].iloc[-1]
-        current_low = self.data["low"].iloc[-1]
+
+        if current_high is None:
+            current_high = self.data["high"].iloc[-1]
+        if current_low is None:
+            current_low = self.data["low"].iloc[-1]
 
         # === UPDATE TRAILING STOPS ===
         for pos in list(self.active_orders):
