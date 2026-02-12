@@ -1,3 +1,4 @@
+import math
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -6,9 +7,7 @@ from time import sleep
 import threading
 from dotenv import load_dotenv
 
-from ..FVG_strategy import FVG_Order, FVG_Strategy, HTF_TF, EMA_PERIOD
-from ..FVG_strategy import USE_FIXED_LOT, FIXED_LOT, MAX_DAILY_TRADES
-from ..FVG_strategy import RISK_PERCENT, ORDER_SIZE
+from ..FVG_strategy import *
 from .projectx_api_functions import get_account_id
 from .projectx_api_functions import get_account_balance
 from .projectx_api_functions import load_data
@@ -16,24 +15,6 @@ from .projectx_api_functions import fetch_data
 from .projectx_api_functions import login_to_api
 from .projectx_api_functions import validate_token
 from .projectx_api_functions import sleep_until_next_boundary
-
-
-
-ASSETS = [("CON.F.US.GCE.G26","1min", "50KTC-V2-252499-38617147")]
-
-load_dotenv()
-USERNAME = os.getenv("USERNAME")
-API_KEY = os.getenv("API_KEY")
-LIVE = False  # or False
-
-
-# ====================
-# if true, updates contracts.csv - this should be done at least monthly
-UPDATE_CONTRACT_LIST = False
-
-# if true it will print the list of valid accounts for this api key
-SHOW_ACCOUNTS = False
-# ======== if any of those two is true, it will run the option, but not the strategy
 
 
 
@@ -59,14 +40,35 @@ class ProjectX_Order(FVG_Order):
         self.asset_id = asset_id
         self.auth_token = auth_token
 
+    def _normalize_order_size(self, value):
+        if value is None or isinstance(value, bool):
+            raise ValueError("order_size must be a positive integer.")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"order_size must be numeric, got {value!r}.") from None
+        if not math.isfinite(numeric):
+            raise ValueError(f"order_size must be finite, got {value!r}.")
+        rounded = int(round(numeric))
+        if not math.isclose(numeric, rounded, rel_tol=1e-9, abs_tol=1e-9):
+            print(
+                "⚠️  order_size was not an integer; "
+                f"rounded {numeric!r} → {rounded}"
+            )
+        if rounded <= 0:
+            print(
+                "⚠️  order_size rounded to <= 0; "
+                f"clamped {rounded} → 1"
+            )
+            rounded = 1
+        return rounded
+
 
     def place_order(self):
         """
         Place an order using ProjectX Gateway API.
         Based on: https://gateway.docs.projectx.com/docs/api-reference/order/order-place
-        """        
-        print(f"ORDER_PLACED:{self.__dict__}")
-        return
+        """
         if not self.auth_token:
             print("Error: auth_token is required to place order")
             return {'success': False, 'message': 'auth_token is required'}
@@ -87,7 +89,7 @@ class ProjectX_Order(FVG_Order):
             "contractId": self.asset_id,
             "type": 2,  # 2 = Market order
             "side": side_code,  # 0 = Bid (buy), 1 = Ask (sell)
-            "size": self.lot_size,
+            "size": self.order_size,
             "limitPrice": None,
             "stopPrice": None,
             "trailPrice": None,
@@ -102,7 +104,7 @@ class ProjectX_Order(FVG_Order):
                 if result.get("success", False):
                     order_id = result.get("orderId")
                     print(f"✅ Order placed successfully. Order ID: {order_id}")
-                    print(f"   Side: {self.side}, Size: {self.lot_size}, Entry: {self.entry_price:.5f}")
+                    print(f"   Side: {self.side}, Size: {self.order_size}, Entry: {self.entry_price:.5f}")
                     print(f"   TP: {self.take_profit:.5f}, SL: {self.trailing_stop_loss:.5f}")
                     return {
                         'success': True,
@@ -143,8 +145,6 @@ class ProjectX_Order(FVG_Order):
 
 
     def close_order(self):
-        print(f"ORDER_CLOSED:{self.__dict__}")
-        return
         url = "https://api.topstepx.com/api/Position/closeContract"
 
         headers = {
@@ -168,6 +168,8 @@ class ProjectX_Order(FVG_Order):
 
 
 class ProjectX_Strategy(FVG_Strategy):
+    Order = ProjectX_Order
+
     auth_token: str
     account_id: str
     account_name: str
@@ -289,6 +291,7 @@ class ProjectX_Strategy(FVG_Strategy):
         return ORDER_SIZE
 
     def subscribe_to_price_updates(self):
+        print("subscribed")
         while True:
             sleep(10)
             new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token, LIVE, include_partial_bar=True)
@@ -312,7 +315,6 @@ class ProjectX_Strategy(FVG_Strategy):
         print(f"{'='*60}")
         print(f"Timeframe: {self.timeframe}")
         print(f"HTF Bias: {HTF_TF}min | EMA Period: {EMA_PERIOD}")
-        self.first_iteration()
 
 
         t1 = threading.Thread(target=self.start_bar_iterations)
