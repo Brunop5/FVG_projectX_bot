@@ -22,12 +22,34 @@ from strategyTemplate import Strategy, Order
 
 
 
-ASSETS = [("CON.F.US.MGC.J26","1min", "PRAC-V2-252499-51361945")]
+# all account names can be whatever ("pc account", "whorehouse account",...)
+# every account has to have the same structure:
+# "username": "actual_username",
+# "api_key": "actual_api_key",
+# "assets_list":[the actuall asset list you want, like you see below. the same structure]
 
-#load_dotenv()
-USERNAME = os.getenv("USERNAME")
-API_KEY = os.getenv("API_KEY")
-LIVE = False  # or False
+# if "username", "api_key", "assets_list" or even the actual ones are spelled wrong, it wont work
+
+APIS = {
+    "Personal account": {
+        "username": "Marrove",
+        "api_key": "aojdnagonfdakfna",
+        "assets_list": [
+            ("CON.F.US.MGC.J26","1min", "PRAC-V2-252499-51361945"),
+            ("CON.F.US.MGC.J26","15min", "PRAC-V2-252499-51361945")
+        ]
+    },
+
+    "Wifes account": {
+        "username": "the@email.com",
+        "api_key": "ajrjfg",
+        "assets_list": [
+            ("CON.F.US.MGC.J26","1min", "PRAC-V2-252499-51361945"),
+            ("CON.F.US.MGC.J26","15min", "PRAC-V2-252499-51361945")
+        ]
+    }
+}
+
 
 
 # ====================
@@ -476,30 +498,6 @@ class FVG_Strategy(Strategy):
             return False
         return True
 
-    def _print_position_pnl(self, order, exit_price: float | None, reason: str | None):
-        if getattr(order, "_pnl_printed", False):
-            return
-        pnl_value = getattr(order, "pnl", None)
-        if pnl_value is None and exit_price is not None:
-            entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
-            try:
-                entry_price = float(entry_price)
-                exit_price = float(exit_price)
-                size = float(order.order_size or 0.0)
-            except (TypeError, ValueError):
-                entry_price = None
-            if entry_price is not None:
-                if order.side == "BUY":
-                    pnl_value = (exit_price - entry_price) * size
-                else:
-                    pnl_value = (entry_price - exit_price) * size
-        print(
-            "🧾 PNL "
-            f"side={order.side} size={order.order_size} exit={exit_price} "
-            f"pnl={pnl_value} reason={reason}"
-        )
-        order._pnl_printed = True
-
     def _close_all_positions(self, current_price: float, current_timestamp: datetime, reason: str):
         for order in list(self.active_orders):
             if hasattr(order, "_last_price"):
@@ -514,7 +512,6 @@ class FVG_Strategy(Strategy):
                     self._record_trade(order)
                 except Exception:
                     pass
-            self._print_position_pnl(order, current_price, reason)
         self.active_orders = []
         self.lastPositionWasLong = False
         self.lastPositionWasShort = False
@@ -664,11 +661,7 @@ class FVG_Strategy(Strategy):
                     if closed:
                         closed_any = True
                         self.pyramiding.on_position_closed(order, self)
-                        self._print_position_pnl(
-                            order,
-                            getattr(order, "_last_price", self.cur_close),
-                            getattr(order, "exit_reason", None),
-                        )
+
                     else:
                         remaining.append(order)
                 self.active_orders = remaining
