@@ -84,6 +84,7 @@ class BacktestOrder(FVG_Order):
             f"exit={self.exit_price} pnl={self.pnl} reason={self.exit_reason} "
             f"group_id={group_id} group_seq={group_seq}"
         )
+        self._pnl_printed = True
         return {"success": True}
 
     def check_close_conditions(self, log=print, **kwargs) -> bool:
@@ -560,6 +561,10 @@ class FVG_Backtest(FVG_Strategy):
             self.cur_close = float(new_row["close"].iloc[-1])
             self.cur_volume = float(new_row["volume"].iloc[-1]) if "volume" in new_row.columns else 0.0
             self._current_dt = self._extract_bar_time(new_row)
+
+            if self._check_max_drawdown(self._current_dt, float(self.cur_close)):
+                self._cursor += 1
+                continue
 
             self.update_indicators()
             self.add_fvg_zones()
