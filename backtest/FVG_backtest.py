@@ -84,7 +84,6 @@ class BacktestOrder(FVG_Order):
             f"exit={self.exit_price} pnl={self.pnl} reason={self.exit_reason} "
             f"group_id={group_id} group_seq={group_seq}"
         )
-        self._pnl_printed = True
         return {"success": True}
 
     def check_close_conditions(self, log=print, **kwargs) -> bool:

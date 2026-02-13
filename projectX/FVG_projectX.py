@@ -1,4 +1,5 @@
 import math
+from pandas.core.missing import F
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -18,8 +19,8 @@ from .projectx_api_functions import sleep_until_next_boundary
 
 
 
-def init_api():
-    res = login_to_api(USERNAME, API_KEY)
+def init_api(username, api_key):
+    res = login_to_api(username, api_key)
     if not res["success"]:
         raise RuntimeError("❌ API login failed")
 
@@ -95,7 +96,7 @@ class ProjectX_Order(FVG_Order):
             "trailPrice": None,
             "customTag": None,
         }
-        
+
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             
@@ -127,7 +128,7 @@ class ProjectX_Order(FVG_Order):
                     'order_id': None,
                     'message': error_msg
                 }
-        
+
         except ImportError:
             return {
                 'success': False,
@@ -213,7 +214,7 @@ class ProjectX_Strategy(FVG_Strategy):
         }
 
         payload = {
-            "live": LIVE
+            "live": False
         }
 
         response = requests.post(url, json=payload, headers=headers)
@@ -226,10 +227,10 @@ class ProjectX_Strategy(FVG_Strategy):
         if data is not None:
             return data
         
-        return fetch_data(self.asset, self.timeframe, 100, self.auth_token, LIVE)
+        return fetch_data(self.asset, self.timeframe, 100, self.auth_token)
 
     def fetch_new_data(self):
-        new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token, LIVE)
+        new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token)
         if new_row is None:
             print("now new data")
             return
@@ -249,7 +250,7 @@ class ProjectX_Strategy(FVG_Strategy):
 
         data = load_data(self.asset, htf_tf)
         if data is None or len(data) == 0:
-            data = fetch_data(self.asset, htf_tf, num_bars, self.auth_token, LIVE)
+            data = fetch_data(self.asset, htf_tf, num_bars, self.auth_token)
 
         if data is None or len(data) == 0:
             return pd.DataFrame()
@@ -294,7 +295,7 @@ class ProjectX_Strategy(FVG_Strategy):
         print("subscribed")
         while True:
             sleep(10)
-            new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token, LIVE, include_partial_bar=True)
+            new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token, include_partial_bar=True)
             self.update_price(new_row)
 
     def start_bar_iterations(self):
@@ -345,42 +346,43 @@ def validation_thread(auth_token, strategies: list[ProjectX_Strategy]):
 
 
 if __name__ == "__main__":
-    global_token = init_api()
+    for api in APIS.values():
+        global_token = init_api(api["username"], api["api_key"])
 
-    if UPDATE_CONTRACT_LIST:
-        strat = ProjectX_Strategy(ASSETS[0])
-        strat.init_api(global_token)
-        data = strat.get_assets()
-        data = pd.DataFrame(data)
-        data.to_csv("contracts.csv")
-        print("Contract list updated successfully!!")
-    elif SHOW_ACCOUNTS:
-        strat = ProjectX_Strategy(ASSETS[0])
-        strat.set_token(global_token)
-        print(get_account_id(strat.auth_token, show=True))
+        if UPDATE_CONTRACT_LIST:
+            strat = ProjectX_Strategy(api["assets_list"][0])
+            strat.init_api(global_token)
+            data = strat.get_assets()
+            data = pd.DataFrame(data)
+            data.to_csv("contracts.csv")
+            print("Contract list updated successfully!!")
+        elif SHOW_ACCOUNTS:
+            strat = ProjectX_Strategy(api["assets_list"][0])
+            strat.set_token(global_token)
+            print(get_account_id(strat.auth_token, show=True))
 
-    else:
-        threads = []
-        strats = []
-        for asset_pair in ASSETS:
-            strats.append(ProjectX_Strategy(asset_pair))
-        
-        v_thread = threading.Thread(
-            target = validation_thread,
-            args = (global_token, strats,),
-            daemon=True
-        )
-        v_thread.start()
+        else:
+            threads = []
+            strats = []
 
-        for strat in strats:
-            t = threading.Thread(
-                target=run_strat,
-                args=(strat, global_token,),
+            for asset_pair in api["assets_list"]:
+                strats.append(ProjectX_Strategy(asset_pair))
+            
+            v_thread = threading.Thread(
+                target = validation_thread,
+                args = (global_token, strats,),
                 daemon=True
             )
-            t.start()
-            threads.append(t)
+            v_thread.start()
 
+            for strat in strats:
+                t = threading.Thread(
+                    target=run_strat,
+                    args=(strat, global_token,),
+                    daemon=True
+                )
+                t.start()
+                threads.append(t)
 
 
     while True:
