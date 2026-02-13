@@ -3,7 +3,7 @@ import pandas as pd
 import threading
 
 from abc import abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 
@@ -86,6 +86,10 @@ MAX_DAILY_TRADES = 3
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
 DEBUG_PYRAMIDING = False
+
+# Max drawdown protection (per strategy instance)
+MAX_DRAWDOWN_ENABLED = False
+MAX_DRAWDOWN_PCT = 50.0
 
 # Pyramiding (client mode)
 ALLOW_PYRAMIDING = True
@@ -231,6 +235,9 @@ class FVG_Strategy(Strategy):
     lastPositionWasLong: bool
     lastPositionWasShort: bool
 
+    peak_unrealized_pnl: float
+    max_dd_triggered_until: datetime | None
+
     daily_trades_count: int
     last_trade_date: str | None
 
@@ -282,6 +289,8 @@ class FVG_Strategy(Strategy):
             if ENABLE_PARTIAL_SL
             else 0
         )
+        self.peak_unrealized_pnl = 0.0
+        self.max_dd_triggered_until = None
 
         super().__init__()
 
@@ -419,6 +428,117 @@ class FVG_Strategy(Strategy):
             if group_id not in active_ids:
                 self._partial_groups.pop(group_id, None)
 
+    def _get_current_timestamp(self) -> datetime:
+        if hasattr(self, "_current_dt") and self._current_dt is not None:
+            return self._current_dt
+        if isinstance(getattr(self, "data", None), pd.DataFrame) and "timestamp" in self.data.columns:
+            ts = self.data["timestamp"].iloc[-1]
+            if pd.isna(ts):
+                return datetime.now()
+            try:
+                return pd.to_datetime(ts, utc=True).to_pydatetime()
+            except Exception:
+                return datetime.now()
+        return datetime.now()
+
+    def _get_unrealized_pnl(self, current_price: float | None) -> float:
+        if not self.active_orders:
+            return 0.0
+        if current_price is None:
+            return 0.0
+        pnl = 0.0
+        for order in list(self.active_orders):
+            entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
+            if entry_price is None:
+                continue
+            try:
+                entry_price = float(entry_price)
+                cur_price = float(current_price)
+                size = float(order.order_size or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if order.side == "BUY":
+                pnl += (cur_price - entry_price) * size
+            else:
+                pnl += (entry_price - cur_price) * size
+        return pnl
+
+    def _is_drawdown_lockout(self, current_timestamp: datetime) -> bool:
+        if self.max_dd_triggered_until is None:
+            return False
+        if isinstance(self.max_dd_triggered_until, datetime):
+            lockout_date = self.max_dd_triggered_until.date()
+        else:
+            lockout_date = self.max_dd_triggered_until
+        if current_timestamp.date() >= lockout_date:
+            self.max_dd_triggered_until = None
+            self.peak_unrealized_pnl = 0.0
+            return False
+        return True
+
+    def _print_position_pnl(self, order, exit_price: float | None, reason: str | None):
+        if getattr(order, "_pnl_printed", False):
+            return
+        pnl_value = getattr(order, "pnl", None)
+        if pnl_value is None and exit_price is not None:
+            entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
+            try:
+                entry_price = float(entry_price)
+                exit_price = float(exit_price)
+                size = float(order.order_size or 0.0)
+            except (TypeError, ValueError):
+                entry_price = None
+            if entry_price is not None:
+                if order.side == "BUY":
+                    pnl_value = (exit_price - entry_price) * size
+                else:
+                    pnl_value = (entry_price - exit_price) * size
+        print(
+            "🧾 PNL "
+            f"side={order.side} size={order.order_size} exit={exit_price} "
+            f"pnl={pnl_value} reason={reason}"
+        )
+        order._pnl_printed = True
+
+    def _close_all_positions(self, current_price: float, current_timestamp: datetime, reason: str):
+        for order in list(self.active_orders):
+            if hasattr(order, "_last_price"):
+                order._last_price = float(current_price)
+            if hasattr(order, "_last_timestamp"):
+                order._last_timestamp = current_timestamp
+            if hasattr(order, "exit_reason"):
+                order.exit_reason = reason
+            order.close_order()
+            if hasattr(self, "_record_trade"):
+                try:
+                    self._record_trade(order)
+                except Exception:
+                    pass
+            self._print_position_pnl(order, current_price, reason)
+        self.active_orders = []
+        self.lastPositionWasLong = False
+        self.lastPositionWasShort = False
+
+    def _check_max_drawdown(self, current_timestamp: datetime, current_price: float) -> bool:
+        if not MAX_DRAWDOWN_ENABLED:
+            return False
+        if self._is_drawdown_lockout(current_timestamp):
+            return True
+
+        unrealized_pnl = self._get_unrealized_pnl(current_price)
+        if unrealized_pnl > self.peak_unrealized_pnl:
+            self.peak_unrealized_pnl = unrealized_pnl
+            return False
+        if self.peak_unrealized_pnl <= 0:
+            return False
+
+        drawdown_pct = ((self.peak_unrealized_pnl - unrealized_pnl) / self.peak_unrealized_pnl) * 100.0
+        if drawdown_pct >= MAX_DRAWDOWN_PCT:
+            self._close_all_positions(current_price, current_timestamp, "max_drawdown")
+            self.max_dd_triggered_until = current_timestamp.date() + timedelta(days=1)
+            return True
+        return False
+
 
     @abstractmethod
     def api_order_kwargs(self) -> dict:
@@ -501,6 +621,11 @@ class FVG_Strategy(Strategy):
                 if "low" in new_row.columns
                 else self.cur_close
             )
+            ts = new_row["timestamp"].iloc[-1] if "timestamp" in new_row.columns else None
+            try:
+                self._current_dt = pd.to_datetime(ts, utc=True).to_pydatetime() if ts is not None else None
+            except Exception:
+                self._current_dt = None
             if DEBUG_STOPS:
                 print(
                     f"🧪 update_price: close={self.cur_close} "
@@ -508,6 +633,10 @@ class FVG_Strategy(Strategy):
                     f"last_long={self.lastPositionWasLong} "
                     f"last_short={self.lastPositionWasShort}"
                 )
+
+            current_timestamp = self._get_current_timestamp()
+            if self._check_max_drawdown(current_timestamp, float(self.cur_close)):
+                return
 
             if len(self.active_orders) > 0:
                 if DEBUG_STOPS:
@@ -535,6 +664,11 @@ class FVG_Strategy(Strategy):
                     if closed:
                         closed_any = True
                         self.pyramiding.on_position_closed(order, self)
+                        self._print_position_pnl(
+                            order,
+                            getattr(order, "_last_price", self.cur_close),
+                            getattr(order, "exit_reason", None),
+                        )
                     else:
                         remaining.append(order)
                 self.active_orders = remaining
@@ -674,6 +808,9 @@ class FVG_Strategy(Strategy):
 
     def entry_logic(self):
         if len(self.fvg_zones) == 0:
+            return
+
+        if MAX_DRAWDOWN_ENABLED and self._is_drawdown_lockout(self._get_current_timestamp()):
             return
 
 
@@ -927,6 +1064,9 @@ class FVG_Strategy(Strategy):
     def bar_iteration(self):
         with self._lock:
             self.fetch_new_data()
+            if self._check_max_drawdown(self._get_current_timestamp(), float(self.cur_close)):
+                self.save_data()
+                return
             self.update_indicators()
             self.add_fvg_zones()
             self.entry_logic()
