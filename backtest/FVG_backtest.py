@@ -329,7 +329,7 @@ class FVG_Backtest(FVG_Strategy):
 
         # Fallback to pandas parser
         try:
-            return pd.to_datetime(ts, utc=True).to_pydatetime()
+            return pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
         except Exception:
             return None
 
@@ -488,7 +488,7 @@ class FVG_Backtest(FVG_Strategy):
             return datetime.fromtimestamp(ts, tz=timezone.utc)
         except Exception:
             try:
-                return pd.to_datetime(ts, utc=True).to_pydatetime()
+                return pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
             except Exception:
                 return None
 

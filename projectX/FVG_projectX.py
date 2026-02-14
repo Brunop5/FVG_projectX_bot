@@ -185,9 +185,23 @@ class ProjectX_Strategy(FVG_Strategy):
         self.timeframe = asset_tuple[1]
         self.account_name = asset_tuple[2]
 
-        filename = f"{self.asset}-{self.timeframe}-{self.account_name}"
+        filename = self._safe_filename(f"{self.asset}-{self.timeframe}-{self.account_name}")
         self.csv_filename = f"{filename}.csv"
         self.metadata_filename = f"{filename}.json"
+
+    def _safe_filename(self, name: str) -> str:
+        # Avoid Windows reserved device names like CON, PRN, AUX, NUL, COM1, LPT1
+        safe = name.replace("CON.", "")
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in safe)
+        upper = safe.upper()
+        reserved = {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        }
+        if upper in reserved or upper.split(".")[0] in reserved:
+            safe = f"PX_{safe}"
+        return safe
 
     def init_api(self, auth_token):
         self.set_token(auth_token)
@@ -195,6 +209,7 @@ class ProjectX_Strategy(FVG_Strategy):
         self.account_balance = get_account_balance(self.account_id, self.auth_token)
 
         super().__init__()
+        print("strat initializeds")
 
     
     def set_token(self, token):
