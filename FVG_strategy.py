@@ -5,7 +5,6 @@ import threading
 from abc import abstractmethod
 from datetime import datetime, timedelta
 import os
-from dotenv import load_dotenv
 
 from .helping_functions.indicators import get_atr
 from .helping_functions.indicators import sma
@@ -21,7 +20,6 @@ from .helping_functions.pyramiding import (
 from strategyTemplate import Strategy, Order
 
 
-
 # all account names can be whatever ("pc account", "whorehouse account",...)
 # every account has to have the same structure:
 # "username": "actual_username",
@@ -33,23 +31,23 @@ from strategyTemplate import Strategy, Order
 APIS = {
     "Personal account": {
         "username": "Marrove",
-        "api_key": "aojdnagonfdakfna",
+        "api_key": "z8Xnx8AJQyciYe/q/+NXTKZoTYZhSiLj/C52ka2vKzM=",
         "assets_list": [
-            ("CON.F.US.MGC.J26","1min", "PRAC-V2-252499-51361945"),
-            ("CON.F.US.MGC.J26","15min", "PRAC-V2-252499-51361945")
+            ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
+
         ]
     },
 
     "Wifes account": {
-        "username": "the@email.com",
-        "api_key": "ajrjfg",
+        "username": "afribuymoz@gmail.com",
+        "api_key": "NEV2P9zTW7+cTNDi/yW8rcjn22EAPH8/t6SgxObrVvM=",
         "assets_list": [
-            ("CON.F.US.MGC.J26","1min", "PRAC-V2-252499-51361945"),
-            ("CON.F.US.MGC.J26","15min", "PRAC-V2-252499-51361945")
+            ("CON.F.US.MGC.J26", "15min", "50KTC-V2-498538-71564652"),
+            ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-498538-71564652"),
+
         ]
     }
 }
-
 
 
 # ====================
@@ -64,7 +62,7 @@ SHOW_ACCOUNTS = False
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
 FVG_HISTORY_NBR = 1              # Number of FVGs to work with
-MIN_FVG_POWER_PCT = 0.00001          # Min FVG Power % (formerly MinFVGPowerPct)
+MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
 HTF_TF = "30"                     # HTF Bias (4H) - PERIOD_H4
@@ -458,7 +456,7 @@ class FVG_Strategy(Strategy):
             if pd.isna(ts):
                 return datetime.now()
             try:
-                return pd.to_datetime(ts, utc=True).to_pydatetime()
+                return pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
             except Exception:
                 return datetime.now()
         return datetime.now()
@@ -620,7 +618,7 @@ class FVG_Strategy(Strategy):
             )
             ts = new_row["timestamp"].iloc[-1] if "timestamp" in new_row.columns else None
             try:
-                self._current_dt = pd.to_datetime(ts, utc=True).to_pydatetime() if ts is not None else None
+                self._current_dt = pd.to_datetime(ts, utc=True).to_pydatetime(warn=False) if ts is not None else None
             except Exception:
                 self._current_dt = None
             if DEBUG_STOPS:
