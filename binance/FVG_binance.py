@@ -141,6 +141,29 @@ class Binance_Order(FVG_Order):
             except Exception:
                 self._position_side = None
 
+    def _sync_time_and_get_timestamp(self) -> int:
+        """
+        Syncs local time with Binance server time and returns a timestamp in ms.
+        """
+        try:
+            if self._client is None:
+                return int(time.time() * 1000)
+            server_time = self._client.time()
+            if isinstance(server_time, dict) and "serverTime" in server_time:
+                server_ms = int(server_time["serverTime"])
+                local_ms = int(time.time() * 1000)
+                offset = server_ms - local_ms
+                # Some python-binance clients support timestamp_offset; set if present.
+                try:
+                    setattr(self._client, "timestamp_offset", offset)
+                except Exception:
+                    pass
+                return int(time.time() * 1000 + offset)
+        except Exception:
+            # Fallback to local time if server time fetch fails.
+            pass
+        return int(time.time() * 1000)
+
     def place_order(self):
         if self._client is None:
             print("Error: Binance REST client not initialized.")
@@ -154,17 +177,42 @@ class Binance_Order(FVG_Order):
         }
         if self._position_side:
             params["positionSide"] = self._position_side
+
+        # First attempt with best-guess synced timestamp and generous recvWindow.
+        timestamp = self._sync_time_and_get_timestamp()
         try:
-            #result = self._client.new_order(**params)
-            result = "nice"
+            result = self._client.new_order(
+                timestamp=timestamp,
+                recvWindow=10000,
+                **params,
+            )
             print(
                 f"✅ Binance order placed: {self.side} {self.symbol} "
                 f"qty={self.order_size} entry={self.entry_price}"
             )
             return {"success": True, "order": result}
         except Exception as exc:
+            msg = str(exc)
+            # On timestamp / recvWindow errors, resync and retry once with fresh timestamp.
+            if "Timestamp for this request" in msg or "recvWindow" in msg:
+                try:
+                    timestamp = self._sync_time_and_get_timestamp()
+                    result = self._client.new_order(
+                        timestamp=timestamp,
+                        recvWindow=10000,
+                        **params,
+                    )
+                    print(
+                        f"✅ Binance order placed after time resync: {self.side} {self.symbol} "
+                        f"qty={self.order_size} entry={self.entry_price}"
+                    )
+                    return {"success": True, "order": result}
+                except Exception as exc2:
+                    print(f"❌ Binance order failed after time resync: {exc2}")
+                    return {"success": False, "message": str(exc2)}
+
             print(f"❌ Binance order failed: {exc}")
-            return {"success": False, "message": str(exc)}
+            return {"success": False, "message": msg}
 
     def close_order(self):
         if self._client is None:
@@ -180,17 +228,40 @@ class Binance_Order(FVG_Order):
         }
         if self._position_side:
             params["positionSide"] = self._position_side
+
+        timestamp = self._sync_time_and_get_timestamp()
         try:
-            #result = self._client.new_order(**params)
-            result = "nice"
+            result = self._client.new_order(
+                timestamp=timestamp,
+                recvWindow=10000,
+                **params,
+            )
             print(
                 f"✅ Binance order closed: {opposite} {self.symbol} "
                 f"qty={self.order_size}"
             )
             return {"success": True, "order": result}
         except Exception as exc:
+            msg = str(exc)
+            if "Timestamp for this request" in msg or "recvWindow" in msg:
+                try:
+                    timestamp = self._sync_time_and_get_timestamp()
+                    result = self._client.new_order(
+                        timestamp=timestamp,
+                        recvWindow=10000,
+                        **params,
+                    )
+                    print(
+                        f"✅ Binance order closed after time resync: {opposite} {self.symbol} "
+                        f"qty={self.order_size}"
+                    )
+                    return {"success": True, "order": result}
+                except Exception as exc2:
+                    print(f"❌ Binance close failed after time resync: {exc2}")
+                    return {"success": False, "message": str(exc2)}
+
             print(f"❌ Binance close failed: {exc}")
-            return {"success": False, "message": str(exc)}
+            return {"success": False, "message": msg}
 
 
 class Binance_Strategy(FVG_Strategy):

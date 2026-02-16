@@ -861,20 +861,26 @@ class FVG_Strategy(Strategy):
                 if SPLIT_ORDERS_ENABLED:
                     for idx in range(self._split_order_count):
                         active_order = self.Order(
-                            entry_atr=entryAtr, side="BUY", entry_price=entry_price, take_profit=tp,
-                            stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=EACH_TRADE_SIZE,
-                            **self.api_order_kwargs()
+                            entry_atr=entryAtr,
+                            side="BUY",
+                            entry_price=entry_price,
+                            take_profit=tp,
+                            stop_loss=stop_loss,
+                            trailing_stop_loss=trail_stop,
+                            order_size=EACH_TRADE_SIZE,
+                            **self.api_order_kwargs(),
                         )
                         active_order.group_id = group_id
                         active_order.group_seq = idx + 1
                         active_order.entry_reference_price = entry_price
                         result = active_order.place_order()
 
-                        self.active_orders.append(active_order)
                         success = isinstance(result, dict) and result.get("success", False)
                         if result is None:
+                            # Backtest or non-API mode: treat as success
                             success = True
                         if success:
+                            self.active_orders.append(active_order)
                             any_success = True
                             self.pyramiding.on_position_opened(active_order, self)
                 else:
@@ -882,19 +888,25 @@ class FVG_Strategy(Strategy):
                         atr=atr, sl_mult=SL_MULTIPLIER
                     )
                     active_order = self.Order(
-                        entry_atr=entryAtr, side="BUY", entry_price=entry_price, take_profit=tp,
-                        stop_loss=stop_loss, trailing_stop_loss=trail_stop, order_size=order_size,
-                        **self.api_order_kwargs()
+                        entry_atr=entryAtr,
+                        side="BUY",
+                        entry_price=entry_price,
+                        take_profit=tp,
+                        stop_loss=stop_loss,
+                        trailing_stop_loss=trail_stop,
+                        order_size=order_size,
+                        **self.api_order_kwargs(),
                     )
                     active_order.group_id = group_id
                     active_order.group_seq = 1
                     active_order.entry_reference_price = entry_price
                     result = active_order.place_order()
-                    self.active_orders.append(active_order)
                     success = isinstance(result, dict) and result.get("success", False)
                     if result is None:
+                        # Backtest or non-API mode: treat as success
                         success = True
                     if success:
+                        self.active_orders.append(active_order)
                         any_success = True
                         self.pyramiding.on_position_opened(active_order, self)
 
@@ -940,20 +952,26 @@ class FVG_Strategy(Strategy):
                 if SPLIT_ORDERS_ENABLED:
                     for idx in range(self._split_order_count):
                         active_order = self.Order(
-                            entry_atr=entryAtr, side="SELL", entry_price=entry_price, take_profit=tp,
-                            trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=EACH_TRADE_SIZE,
-                            **self.api_order_kwargs()
+                            entry_atr=entryAtr,
+                            side="SELL",
+                            entry_price=entry_price,
+                            take_profit=tp,
+                            trailing_stop_loss=trail_stop,
+                            stop_loss=stop_loss,
+                            order_size=EACH_TRADE_SIZE,
+                            **self.api_order_kwargs(),
                         )
                         active_order.group_id = group_id
                         active_order.group_seq = idx + 1
                         active_order.entry_reference_price = entry_price
                         result = active_order.place_order()
 
-                        self.active_orders.append(active_order)
                         success = isinstance(result, dict) and result.get("success", False)
                         if result is None:
+                            # Backtest or non-API mode: treat as success
                             success = True
                         if success:
+                            self.active_orders.append(active_order)
                             any_success = True
                             self.pyramiding.on_position_opened(active_order, self)
                 else:
@@ -961,19 +979,25 @@ class FVG_Strategy(Strategy):
                         atr=atr, sl_mult=SL_MULTIPLIER
                     )
                     active_order = self.Order(
-                        entry_atr=entryAtr, side="SELL", entry_price=entry_price, take_profit=tp,
-                        trailing_stop_loss=trail_stop, stop_loss=stop_loss, order_size=order_size,
-                        **self.api_order_kwargs()
+                        entry_atr=entryAtr,
+                        side="SELL",
+                        entry_price=entry_price,
+                        take_profit=tp,
+                        trailing_stop_loss=trail_stop,
+                        stop_loss=stop_loss,
+                        order_size=order_size,
+                        **self.api_order_kwargs(),
                     )
                     active_order.group_id = group_id
                     active_order.group_seq = 1
                     active_order.entry_reference_price = entry_price
                     result = active_order.place_order()
-                    self.active_orders.append(active_order)
                     success = isinstance(result, dict) and result.get("success", False)
                     if result is None:
+                        # Backtest or non-API mode: treat as success
                         success = True
                     if success:
+                        self.active_orders.append(active_order)
                         any_success = True
                         self.pyramiding.on_position_opened(active_order, self)
 
