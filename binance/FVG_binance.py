@@ -88,6 +88,37 @@ def _klines_to_df(klines: list[list[Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _sync_time_and_get_timestamp_for_client(client: UMFutures | None) -> int:
+    """
+    Syncs local time with Binance server time and returns a timestamp in ms.
+    """
+    if client is None:
+        return int(time.time() * 1000)
+    try:
+        server_time = client.time()
+        if isinstance(server_time, dict) and "serverTime" in server_time:
+            server_ms = int(server_time["serverTime"])
+            local_ms = int(time.time() * 1000)
+            offset = server_ms - local_ms
+            # Some python-binance clients support timestamp_offset; set if present.
+            try:
+                setattr(client, "timestamp_offset", offset)
+            except Exception:
+                pass
+            return int(time.time() * 1000 + offset)
+    except Exception:
+        # Fallback to local time if server time fetch fails.
+        pass
+    return int(time.time() * 1000)
+
+
+def _signed_request_params(client: UMFutures | None, recv_window: int = 10000) -> dict:
+    return {
+        "timestamp": _sync_time_and_get_timestamp_for_client(client),
+        "recvWindow": recv_window,
+    }
+
+
 def fetch_klines(client: UMFutures, symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
     if USE_CONTINUOUS_KLINES and hasattr(client, "continuous_klines"):
         klines = client.continuous_klines(
@@ -135,7 +166,12 @@ class Binance_Order(FVG_Order):
 
         if self._client is not None:
             try:
-                mode = self._client.get_position_mode()
+                try:
+                    mode = self._client.get_position_mode(
+                        **_signed_request_params(self._client),
+                    )
+                except TypeError:
+                    mode = self._client.get_position_mode()
                 if isinstance(mode, dict) and mode.get("dualSidePosition"):
                     self._position_side = "LONG" if self.side.upper() == "BUY" else "SHORT"
             except Exception:
@@ -145,24 +181,7 @@ class Binance_Order(FVG_Order):
         """
         Syncs local time with Binance server time and returns a timestamp in ms.
         """
-        try:
-            if self._client is None:
-                return int(time.time() * 1000)
-            server_time = self._client.time()
-            if isinstance(server_time, dict) and "serverTime" in server_time:
-                server_ms = int(server_time["serverTime"])
-                local_ms = int(time.time() * 1000)
-                offset = server_ms - local_ms
-                # Some python-binance clients support timestamp_offset; set if present.
-                try:
-                    setattr(self._client, "timestamp_offset", offset)
-                except Exception:
-                    pass
-                return int(time.time() * 1000 + offset)
-        except Exception:
-            # Fallback to local time if server time fetch fails.
-            pass
-        return int(time.time() * 1000)
+        return _sync_time_and_get_timestamp_for_client(self._client)
 
     def place_order(self):
         if self._client is None:
@@ -179,11 +198,9 @@ class Binance_Order(FVG_Order):
             params["positionSide"] = self._position_side
 
         # First attempt with best-guess synced timestamp and generous recvWindow.
-        timestamp = self._sync_time_and_get_timestamp()
         try:
             result = self._client.new_order(
-                timestamp=timestamp,
-                recvWindow=10000,
+                **_signed_request_params(self._client),
                 **params,
             )
             print(
@@ -196,10 +213,8 @@ class Binance_Order(FVG_Order):
             # On timestamp / recvWindow errors, resync and retry once with fresh timestamp.
             if "Timestamp for this request" in msg or "recvWindow" in msg:
                 try:
-                    timestamp = self._sync_time_and_get_timestamp()
                     result = self._client.new_order(
-                        timestamp=timestamp,
-                        recvWindow=10000,
+                        **_signed_request_params(self._client),
                         **params,
                     )
                     print(
@@ -229,11 +244,9 @@ class Binance_Order(FVG_Order):
         if self._position_side:
             params["positionSide"] = self._position_side
 
-        timestamp = self._sync_time_and_get_timestamp()
         try:
             result = self._client.new_order(
-                timestamp=timestamp,
-                recvWindow=10000,
+                **_signed_request_params(self._client),
                 **params,
             )
             print(
@@ -245,10 +258,8 @@ class Binance_Order(FVG_Order):
             msg = str(exc)
             if "Timestamp for this request" in msg or "recvWindow" in msg:
                 try:
-                    timestamp = self._sync_time_and_get_timestamp()
                     result = self._client.new_order(
-                        timestamp=timestamp,
-                        recvWindow=10000,
+                        **_signed_request_params(self._client),
                         **params,
                     )
                     print(
@@ -302,10 +313,7 @@ class Binance_Strategy(FVG_Strategy):
         try:
             if self._client is None:
                 return 0.0
-            balances = self._client.balance(
-                timestamp=self._sync_time_and_get_timestamp(),
-                recvWindow=10000,
-            )
+            balances = self._client.balance(**_signed_request_params(self._client))
             for item in balances:
                 if item.get("asset") == "USDT":
                     return float(item.get("availableBalance", 0))
@@ -313,10 +321,7 @@ class Binance_Strategy(FVG_Strategy):
             msg = str(exc)
             if "Timestamp for this request" in msg or "recvWindow" in msg:
                 try:
-                    balances = self._client.balance(
-                        timestamp=self._sync_time_and_get_timestamp(),
-                        recvWindow=10000,
-                    )
+                    balances = self._client.balance(**_signed_request_params(self._client))
                     for item in balances:
                         if item.get("asset") == "USDT":
                             return float(item.get("availableBalance", 0))
@@ -327,38 +332,10 @@ class Binance_Strategy(FVG_Strategy):
         return 0.0
 
     def _sync_client_time(self):
-        if self._client is None:
-            return
-        try:
-            server_time = self._client.time()
-            if isinstance(server_time, dict) and "serverTime" in server_time:
-                server_ms = int(server_time["serverTime"])
-                local_ms = int(time.time() * 1000)
-                offset = server_ms - local_ms
-                try:
-                    setattr(self._client, "timestamp_offset", offset)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _sync_time_and_get_timestamp_for_client(self._client)
 
     def _sync_time_and_get_timestamp(self) -> int:
-        if self._client is None:
-            return int(time.time() * 1000)
-        try:
-            server_time = self._client.time()
-            if isinstance(server_time, dict) and "serverTime" in server_time:
-                server_ms = int(server_time["serverTime"])
-                local_ms = int(time.time() * 1000)
-                offset = server_ms - local_ms
-                try:
-                    setattr(self._client, "timestamp_offset", offset)
-                except Exception:
-                    pass
-                return int(time.time() * 1000 + offset)
-        except Exception:
-            pass
-        return int(time.time() * 1000)
+        return _sync_time_and_get_timestamp_for_client(self._client)
 
     def gather_data(self) -> pd.DataFrame:
         cached = load_cached_data(self.csv_filename)
@@ -512,6 +489,18 @@ class Binance_Strategy(FVG_Strategy):
 
 def run_strat(strat: Binance_Strategy, api_key: str, api_secret: str):
     strat.init_api(api_key, api_secret)
+    active_order = strat.Order(
+        entry_atr=50,
+        side="SELL",
+        entry_price=67000,
+        take_profit=68000,
+        stop_loss=66000,
+        trailing_stop_loss=66500,
+        order_size=0.002,
+        **strat.api_order_kwargs(),
+    )
+
+    active_order.place_order()
     strat.run()
 
 
