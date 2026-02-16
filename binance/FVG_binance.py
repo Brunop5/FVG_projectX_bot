@@ -290,6 +290,7 @@ class Binance_Strategy(FVG_Strategy):
         self.api_key = api_key
         self.api_secret = api_secret
         self._client = UMFutures(key=api_key, secret=api_secret, base_url=_binance_base_url())
+        self._sync_client_time()
         self.account_balance = self.get_account_balance()
         super().__init__()
 
@@ -301,13 +302,63 @@ class Binance_Strategy(FVG_Strategy):
         try:
             if self._client is None:
                 return 0.0
-            balances = self._client.balance()
+            balances = self._client.balance(
+                timestamp=self._sync_time_and_get_timestamp(),
+                recvWindow=10000,
+            )
             for item in balances:
                 if item.get("asset") == "USDT":
                     return float(item.get("availableBalance", 0))
         except Exception as exc:
+            msg = str(exc)
+            if "Timestamp for this request" in msg or "recvWindow" in msg:
+                try:
+                    balances = self._client.balance(
+                        timestamp=self._sync_time_and_get_timestamp(),
+                        recvWindow=10000,
+                    )
+                    for item in balances:
+                        if item.get("asset") == "USDT":
+                            return float(item.get("availableBalance", 0))
+                except Exception as exc2:
+                    print(f"⚠️ Failed to fetch balance after time resync: {exc2}")
+                    return 0.0
             print(f"⚠️ Failed to fetch balance: {exc}")
         return 0.0
+
+    def _sync_client_time(self):
+        if self._client is None:
+            return
+        try:
+            server_time = self._client.time()
+            if isinstance(server_time, dict) and "serverTime" in server_time:
+                server_ms = int(server_time["serverTime"])
+                local_ms = int(time.time() * 1000)
+                offset = server_ms - local_ms
+                try:
+                    setattr(self._client, "timestamp_offset", offset)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _sync_time_and_get_timestamp(self) -> int:
+        if self._client is None:
+            return int(time.time() * 1000)
+        try:
+            server_time = self._client.time()
+            if isinstance(server_time, dict) and "serverTime" in server_time:
+                server_ms = int(server_time["serverTime"])
+                local_ms = int(time.time() * 1000)
+                offset = server_ms - local_ms
+                try:
+                    setattr(self._client, "timestamp_offset", offset)
+                except Exception:
+                    pass
+                return int(time.time() * 1000 + offset)
+        except Exception:
+            pass
+        return int(time.time() * 1000)
 
     def gather_data(self) -> pd.DataFrame:
         cached = load_cached_data(self.csv_filename)
