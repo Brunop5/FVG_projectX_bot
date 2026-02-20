@@ -489,18 +489,6 @@ class Binance_Strategy(FVG_Strategy):
 
 def run_strat(strat: Binance_Strategy, api_key: str, api_secret: str):
     strat.init_api(api_key, api_secret)
-    active_order = strat.Order(
-        entry_atr=50,
-        side="SELL",
-        entry_price=67000,
-        take_profit=68000,
-        stop_loss=66000,
-        trailing_stop_loss=66500,
-        order_size=0.002,
-        **strat.api_order_kwargs(),
-    )
-
-    active_order.place_order()
     strat.run()
 
 

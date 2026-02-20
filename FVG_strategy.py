@@ -86,7 +86,7 @@ HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 6                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 2                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -102,6 +102,9 @@ ENABLE_PARTIAL_SL = True
 
 # Daily Trading Limits
 MAX_DAILY_TRADES = 3
+ENABLE_DAILY_PNL_LIMITS = True
+MAX_DAILY_GAIN = 1400
+MAX_DAILY_LOSS = 1400
 
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
@@ -225,10 +228,12 @@ class FVG_Order(Order):
         if HOLD_UNTIL_OPPOSITE:
             if last_long and isCHOCH:
                 log("🔄 CHoCH detected - Closing LONG position")
+                self.close_order()
                 return True
 
             if last_short and isBOS:
                 log("🔄 BOS detected - Closing SHORT position")
+                self.close_order()
                 return True
         
         return False
@@ -313,6 +318,10 @@ class FVG_Strategy(Strategy):
         self.max_dd_triggered_until = None
 
         super().__init__()
+        if not hasattr(self, "daily_realized_pnl"):
+            self.daily_realized_pnl = 0.0
+        if not hasattr(self, "last_pnl_date"):
+            self.last_pnl_date = None
 
         self.cur_close = self.data["close"].iloc[-1]
         self.cur_volume = self.data["volume"].iloc[-1]
@@ -461,6 +470,48 @@ class FVG_Strategy(Strategy):
                 return datetime.now()
         return datetime.now()
 
+    def _reset_daily_pnl_if_needed(self, current_timestamp: datetime) -> None:
+        today = str(current_timestamp.date())
+        if self.last_pnl_date != today:
+            self.daily_realized_pnl = 0.0
+            self.last_pnl_date = today
+
+    def calculate_trade_pnl(
+        self,
+        order: Order,
+        exit_price: float | None,
+        exit_timestamp: datetime | None = None,
+    ) -> float:
+        entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
+        if entry_price is None or exit_price is None:
+            return 0.0
+        try:
+            entry_price = float(entry_price)
+            exit_price = float(exit_price)
+            size = float(order.order_size or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if size <= 0:
+            return 0.0
+        if order.side == "BUY":
+            return (exit_price - entry_price) * size
+        return (entry_price - exit_price) * size
+
+    def _record_trade(
+        self,
+        order: Order,
+        exit_price: float | None,
+        exit_timestamp: datetime | None = None,
+    ) -> float:
+        if exit_timestamp is None:
+            exit_timestamp = self._get_current_timestamp()
+        self._reset_daily_pnl_if_needed(exit_timestamp)
+        pnl = self.calculate_trade_pnl(order, exit_price, exit_timestamp)
+        self.daily_realized_pnl += pnl
+        if hasattr(order, "realized_pnl"):
+            order.realized_pnl = pnl
+        return pnl
+
     def _get_unrealized_pnl(self, current_price: float | None) -> float:
         if not self.active_orders:
             return 0.0
@@ -507,7 +558,7 @@ class FVG_Strategy(Strategy):
             order.close_order()
             if hasattr(self, "_record_trade"):
                 try:
-                    self._record_trade(order)
+                    self._record_trade(order, current_price, current_timestamp)
                 except Exception:
                     pass
         self.active_orders = []
@@ -630,6 +681,7 @@ class FVG_Strategy(Strategy):
                 )
 
             current_timestamp = self._get_current_timestamp()
+            self._reset_daily_pnl_if_needed(current_timestamp)
             if self._check_max_drawdown(current_timestamp, float(self.cur_close)):
                 return
 
@@ -641,10 +693,20 @@ class FVG_Strategy(Strategy):
                 remaining = []
                 closed_any = False
                 for order in list(self.active_orders):
+                    recorded_trade = False
                     if order in partial_close_map:
                         if hasattr(order, "exit_reason"):
                             order.exit_reason = partial_close_map[order]
+                        if hasattr(order, "_last_price"):
+                            order._last_price = float(self.cur_close)
+                        if hasattr(order, "_last_timestamp"):
+                            order._last_timestamp = current_timestamp
                         order.close_order()
+                        try:
+                            self._record_trade(order, self.cur_close, current_timestamp)
+                            recorded_trade = True
+                        except Exception:
+                            pass
                         closed = True
                     else:
                         closed = order.check_close_conditions(
@@ -657,6 +719,15 @@ class FVG_Strategy(Strategy):
                             isCHOCH=self.isCHOCH,
                         )
                     if closed:
+                        if hasattr(order, "_last_price"):
+                            order._last_price = float(self.cur_close)
+                        if hasattr(order, "_last_timestamp"):
+                            order._last_timestamp = current_timestamp
+                        if (not recorded_trade) and hasattr(self, "_record_trade"):
+                            try:
+                                self._record_trade(order, self.cur_close, current_timestamp)
+                            except Exception:
+                                pass
                         closed_any = True
                         self.pyramiding.on_position_closed(order, self)
 
@@ -799,6 +870,9 @@ class FVG_Strategy(Strategy):
 
     def entry_logic(self):
         if len(self.fvg_zones) == 0:
+            return
+
+        if getattr(self, "trading_paused", False):
             return
 
         if MAX_DRAWDOWN_ENABLED and self._is_drawdown_lockout(self._get_current_timestamp()):
