@@ -1,12 +1,9 @@
-import math
-from pandas.core.missing import F
+import os
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-import os
+from datetime import datetime
 from time import sleep
 import threading
-from dotenv import load_dotenv
 
 from ..FVG_strategy import *
 from .projectx_api_functions import get_account_id
@@ -180,6 +177,7 @@ class ProjectX_Strategy(FVG_Strategy):
         print("layer 3 init ran!")
         self.auth_token = None
         self.account_id = None
+        self._contract_specs = None
 
         self.asset = asset_tuple[0]
         self.timeframe = asset_tuple[1]
@@ -306,6 +304,82 @@ class ProjectX_Strategy(FVG_Strategy):
         
         return ORDER_SIZE
 
+    def _contracts_csv_path(self) -> str | None:
+        candidates = [
+            os.path.join(os.getcwd(), "contracts.csv"),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "contracts.csv")),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _load_contract_specs(self) -> dict:
+        if self._contract_specs is not None:
+            return self._contract_specs
+        path = self._contracts_csv_path()
+        if path is None:
+            self._contract_specs = {}
+            return self._contract_specs
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            self._contract_specs = {}
+            return self._contract_specs
+        if "id" not in df.columns:
+            self._contract_specs = {}
+            return self._contract_specs
+        df = df.set_index("id", drop=False)
+        self._contract_specs = df.to_dict(orient="index")
+        return self._contract_specs
+
+    def _get_contract_tick_info(self, contract_id: str) -> tuple[float | None, float | None]:
+        specs = self._load_contract_specs()
+        row = specs.get(contract_id)
+        if not row:
+            return None, None
+        try:
+            tick_size = float(row.get("tickSize")) if row.get("tickSize") is not None else None
+            tick_value = float(row.get("tickValue")) if row.get("tickValue") is not None else None
+        except (TypeError, ValueError):
+            return None, None
+        if tick_size is None or tick_value is None or tick_size == 0:
+            return None, None
+        return tick_size, tick_value
+
+    def calculate_trade_pnl(
+        self,
+        order: Order,
+        exit_price: float | None,
+        exit_timestamp: datetime | None = None,
+    ) -> float:
+        entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
+        if entry_price is None or exit_price is None:
+            return 0.0
+        try:
+            entry_price = float(entry_price)
+            exit_price = float(exit_price)
+            size = float(order.order_size or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if size <= 0:
+            return 0.0
+
+        contract_id = getattr(order, "asset_id", None) or self.asset
+        tick_size, tick_value = self._get_contract_tick_info(contract_id)
+        if tick_size is None or tick_value is None:
+            if order.side == "BUY":
+                return (exit_price - entry_price) * size
+            return (entry_price - exit_price) * size
+
+        price_move = exit_price - entry_price
+        ticks = price_move / tick_size
+        if order.side == "SELL":
+            ticks = -ticks
+        gross = ticks * tick_value * size
+        fee = 3.5 * size
+        return gross - fee
+
     def subscribe_to_price_updates(self):
         print("subscribed")
         while True:
@@ -338,6 +412,123 @@ class ProjectX_Strategy(FVG_Strategy):
         t1.start()
         t2.start()
 
+
+class ProjectX_AccountRunner:
+    def __init__(
+        self,
+        api_config: dict,
+        check_interval: int = 5,
+        enable_limits: bool = ENABLE_DAILY_PNL_LIMITS,
+        max_daily_gain: float = MAX_DAILY_GAIN,
+        max_daily_loss: float = MAX_DAILY_LOSS,
+    ):
+        self.api_config = api_config
+        self.check_interval = check_interval
+        self.enable_limits = enable_limits
+        self.max_daily_gain = max_daily_gain
+        self.max_daily_loss = max_daily_loss
+        self.strategies = [
+            ProjectX_Strategy(asset_tuple)
+            for asset_tuple in api_config.get("assets_list", [])
+        ]
+        self._limit_triggered = False
+        self._limit_triggered_date = None
+
+    def start(self):
+        token = init_api(self.api_config["username"], self.api_config["api_key"])
+        v_thread = threading.Thread(
+            target=validation_thread,
+            args=(token, self.strategies),
+            daemon=True,
+        )
+        v_thread.start()
+
+        for strat in self.strategies:
+            t = threading.Thread(
+                target=run_strat,
+                args=(strat, token,),
+                daemon=True,
+            )
+            t.start()
+
+        monitor = threading.Thread(target=self._monitor_pnl, daemon=True)
+        monitor.start()
+
+    def _monitor_pnl(self):
+        while True:
+            if not self.enable_limits:
+                sleep(self.check_interval)
+                continue
+
+            today = datetime.now().date()
+            if self._limit_triggered_date != today:
+                self._limit_triggered = False
+                self._limit_triggered_date = today
+                for strat in self.strategies:
+                    strat.trading_paused = False
+                    strat.daily_realized_pnl = 0.0
+                    strat.last_pnl_date = str(today)
+
+            total_pnl = 0.0
+            for strat in self.strategies:
+                unrealized = self._calculate_strategy_unrealized_pnl(strat)
+                total_pnl += float(getattr(strat, "daily_realized_pnl", 0.0)) + unrealized
+
+            hit_gain = self.max_daily_gain and total_pnl >= self.max_daily_gain
+            hit_loss = self.max_daily_loss and total_pnl <= -self.max_daily_loss
+            if (not self._limit_triggered) and (hit_gain or hit_loss):
+                self._limit_triggered = True
+                for strat in self.strategies:
+                    strat.trading_paused = True
+                    cur_price = getattr(strat, "cur_close", None)
+                    if cur_price is None:
+                        continue
+                    try:
+                        cur_ts = strat._get_current_timestamp()
+                    except Exception:
+                        cur_ts = datetime.now()
+                    try:
+                        strat._close_all_positions(float(cur_price), cur_ts, "daily_pnl_limit")
+                    except Exception:
+                        pass
+                print(
+                    "⚠️ Daily account PnL limit reached "
+                    f"({total_pnl:.2f}) for {self.api_config.get('username', 'account')}"
+                )
+
+            sleep(self.check_interval)
+
+    def _calculate_strategy_unrealized_pnl(self, strat: ProjectX_Strategy) -> float:
+        cur_price = getattr(strat, "cur_close", None)
+        if cur_price is None or not strat.active_orders:
+            return 0.0
+        total = 0.0
+        for order in list(strat.active_orders):
+            entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
+            if entry_price is None:
+                continue
+            try:
+                entry_price = float(entry_price)
+                cur_price_val = float(cur_price)
+                size = float(order.order_size or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if size <= 0:
+                continue
+            contract_id = getattr(order, "asset_id", None) or strat.asset
+            tick_size, tick_value = strat._get_contract_tick_info(contract_id)
+            if tick_size is not None and tick_value is not None and tick_size != 0:
+                price_move = cur_price_val - entry_price
+                ticks = price_move / float(tick_size)
+                if order.side == "SELL":
+                    ticks = -ticks
+                total += ticks * float(tick_value) * size
+            else:
+                if order.side == "BUY":
+                    total += (cur_price_val - entry_price) * size
+                else:
+                    total += (entry_price - cur_price_val) * size
+        return total
 
 
 def run_strat(strat: ProjectX_Strategy, token):
@@ -377,27 +568,8 @@ if __name__ == "__main__":
             print(get_account_id(strat.auth_token, show=True))
 
         else:
-            threads = []
-            strats = []
-
-            for asset_pair in api["assets_list"]:
-                strats.append(ProjectX_Strategy(asset_pair))
-            
-            v_thread = threading.Thread(
-                target = validation_thread,
-                args = (global_token, strats,),
-                daemon=True
-            )
-            v_thread.start()
-
-            for strat in strats:
-                t = threading.Thread(
-                    target=run_strat,
-                    args=(strat, global_token,),
-                    daemon=True
-                )
-                t.start()
-                threads.append(t)
+            runner = ProjectX_AccountRunner(api)
+            runner.start()
 
 
     while True:

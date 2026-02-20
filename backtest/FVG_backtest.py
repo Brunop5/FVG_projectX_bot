@@ -2,6 +2,8 @@ import os
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
+from tkinter.constants import FALSE
+from numpy import True_
 import pandas as pd
 
 from FVG_projectX_bot.FVG_strategy import *
@@ -10,13 +12,13 @@ from FVG_projectX_bot.helping_functions.pyramiding import MaxOrdersPolicy
 
 
 PARENT_DIR = Path(__file__).parents[1]
-CURRENT_DIR = Path(__file__).parent / "BTC_BACKTEST"
+CURRENT_DIR = Path(__file__).parent / "GOLD_BACKTEST_NEW"
 
 # ==================== USER CONFIG ====================
-ASSET = "BTC"
+ASSET = "MGCJ6"
 TIMEFRAME = "15m"
-INITIAL_BALANCE = 50.0
-DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
+INITIAL_BALANCE = 50000.0
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "MGCG6" / "IC_markets_15min.csv")
 START_TIMESTAMP = "1755528300000"
 
 # Pyramiding mode: "none", "client_atr", or "max_orders"
@@ -27,10 +29,28 @@ MAX_PYRAMID_ORDERS = 3
 BACKTEST_WINDOW_BARS = None
 
 # Contract / fee inputs
-USE_CONTRACTS_CSV = False
+USE_CONTRACTS_CSV = True
 CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
-USE_ROUND_TURN_FEE = False
+USE_ROUND_TURN_FEE = True
 ROUND_TURN_FEE_USD = 3.5
+
+# Margin trading inputs
+USE_MARGIN_PRICING = False  # If False, use ROUND_TURN_FEE_USD (if enabled)
+FEE_PCT = 0.001  # Round-turn fee as % of notional
+LEVERAGE = 50
+# Position sizing inputs (backtest only)
+USE_MARGIN_PER_TRADE = False
+MARGIN_PER_TRADE_USD = 10
+
+# CSV output options
+TRADE_CSV_WRITE_MODE = "append"  # "prepend" (newest first) or "append" (faster)
+
+
+_ACTIVE_BACKTEST = None
+
+
+def _get_active_backtest():
+    return _ACTIVE_BACKTEST
 
 
 class BacktestOrder(FVG_Order):
@@ -53,8 +73,50 @@ class BacktestOrder(FVG_Order):
         self.pnl = None
         self._last_price = None
         self._last_timestamp = None
+        self.margin_required = None
+        self.margin_used = None
+        self.fee_paid = None
+
+    def _calc_notional(self, price: float | None = None) -> float:
+        ref_price = price if price is not None else self.entry_price
+        return abs(float(ref_price) * float(self.order_size or 0.0))
+
+    def _calc_margin(self, notional: float) -> float:
+        if LEVERAGE <= 0:
+            return notional
+        return notional / float(LEVERAGE)
+
+    def _calc_fee(self, notional: float) -> float:
+        if USE_MARGIN_PRICING:
+            return notional * float(FEE_PCT)
+        backtest = _get_active_backtest()
+        if backtest is not None and backtest.round_turn_fee_usd is not None:
+            return float(backtest.round_turn_fee_usd) * float(self.order_size or 0.0)
+        # Legacy fallback (0.01% of notional)
+        return notional * 0.0001
 
     def place_order(self):
+        was_open = self.is_open
+        notional = self._calc_notional()
+        if USE_MARGIN_PRICING:
+            required_margin = self._calc_margin(notional)
+            backtest = _get_active_backtest()
+            if backtest is not None:
+                if backtest.account_balance < required_margin:
+                    print(
+                        "❌ OPEN rejected (insufficient margin): "
+                        f"needed={required_margin:.4f} balance={backtest.account_balance:.4f}"
+                    )
+                    return {"success": False, "message": "Insufficient margin"}
+                backtest.account_balance -= required_margin
+                backtest.used_margin += required_margin
+            if was_open and self.margin_required is not None:
+                self.margin_required += required_margin
+                if self.margin_used is not None:
+                    self.margin_used += required_margin
+            else:
+                self.margin_required = required_margin
+                self.margin_used = required_margin
         self.is_open = True
         group_id = getattr(self, "group_id", None)
         group_seq = getattr(self, "group_seq", None)
@@ -72,10 +134,24 @@ class BacktestOrder(FVG_Order):
         if self._last_timestamp is not None:
             self.exit_time = self._last_timestamp
         if self.exit_price is not None:
-            entry_price = self.avg_entry_price if self.avg_entry_price is not None else self.entry_price
-            price_delta = self.exit_price - entry_price
-            direction = 1 if self.side == "BUY" else -1
-            self.pnl = price_delta * direction * float(self.order_size or 0.0) - float(self.order_size or 0.0) * self._last_price * 0.0001
+            backtest = _get_active_backtest()
+            if backtest is not None:
+                self.pnl = backtest.calculate_trade_pnl(self, self.exit_price, self.exit_time)
+                self.fee_paid = backtest.calculate_trade_fee(self, self.exit_price, self.exit_time)
+            else:
+                entry_price = self.avg_entry_price if self.avg_entry_price is not None else self.entry_price
+                price_delta = self.exit_price - entry_price
+                direction = 1 if self.side == "BUY" else -1
+                notional = self._calc_notional(price=entry_price)
+                fee = self._calc_fee(notional)
+                self.fee_paid = fee
+                self.pnl = price_delta * direction * float(self.order_size or 0.0) - fee
+        if USE_MARGIN_PRICING and self.margin_required:
+            backtest = _get_active_backtest()
+            if backtest is not None:
+                backtest.account_balance += float(self.margin_required)
+                backtest.used_margin -= float(self.margin_required)
+            self.margin_required = None
         group_id = getattr(self, "group_id", None)
         group_seq = getattr(self, "group_seq", None)
         print(
@@ -108,14 +184,19 @@ class FVG_Backtest(FVG_Strategy):
         start_timestamp=None,
         pyramiding_mode: str | None = None,
     ):
+        global _ACTIVE_BACKTEST
+        _ACTIVE_BACKTEST = self
         self.asset = asset
         self.timeframe = timeframe
         self.account_balance = float(initial_balance)
+        self.used_margin = 0.0
         self.data_path = data_path
         self.metadata_filename = os.path.join(CURRENT_DIR, "backtest_metadata.json")
         self.csv_filename = os.path.join(CURRENT_DIR, "backtest_data.csv")
         self._warmup_bars = warmup_bars
         self._full_data = None
+        self._htf_resampled = None
+        self._current_index = None
         self._cursor = 0
         self._current_dt = None
         self.trades = []
@@ -303,6 +384,60 @@ class FVG_Backtest(FVG_Strategy):
         # === Precompute volume SMA used for volume check ===
         if "volume" in df.columns:
             df["vol_sma"] = df["volume"].rolling(20, min_periods=1).mean()
+        self._precompute_htf_resample()
+
+    def _precompute_htf_resample(self) -> None:
+        if self._full_data is None or "timestamp" not in self._full_data.columns:
+            self._htf_resampled = None
+            return
+        htf_data = self._full_data.copy()
+        ts_series = htf_data["timestamp"]
+        if pd.api.types.is_numeric_dtype(ts_series):
+            max_val = pd.Series(ts_series).max()
+            unit = "ms" if max_val > 10**12 else "s"
+            htf_data["timestamp"] = pd.to_datetime(ts_series, unit=unit, utc=True)
+        else:
+            numeric_ts = pd.to_numeric(ts_series, errors="coerce")
+            if numeric_ts.notna().any():
+                max_val = numeric_ts.max()
+                unit = "ms" if max_val > 10**12 else "s"
+                htf_data["timestamp"] = pd.to_datetime(numeric_ts, unit=unit, utc=True)
+            else:
+                htf_data["timestamp"] = pd.to_datetime(ts_series, utc=True, errors="coerce")
+        htf_data = htf_data[htf_data["timestamp"].notna()]
+        if htf_data.empty:
+            self._htf_resampled = None
+            return
+        htf_data = htf_data.set_index("timestamp")
+
+        htf_minutes = int(HTF_TF)
+        if htf_minutes == 240:
+            resample_period = "4h"
+        elif htf_minutes == 120:
+            resample_period = "2h"
+        elif htf_minutes == 60:
+            resample_period = "1h"
+        elif htf_minutes == 1440:
+            resample_period = "1d"
+        elif htf_minutes >= 1440:
+            resample_period = f"{htf_minutes // 1440}d"
+        elif htf_minutes >= 60:
+            resample_period = f"{htf_minutes // 60}h"
+        else:
+            resample_period = f"{htf_minutes}min"
+
+        agg_dict = {"open": "first", "high": "max", "low": "min", "close": "last"}
+        if "volume" in htf_data.columns:
+            agg_dict["volume"] = "sum"
+
+        self._htf_resampled = (
+            htf_data.resample(
+                resample_period, label="right", closed="right", origin="epoch"
+            )
+            .agg(agg_dict)
+            .dropna()
+            .reset_index()
+        )
 
     def _parse_start_timestamp(self, ts) -> datetime | None:
         """
@@ -402,13 +537,312 @@ class FVG_Backtest(FVG_Strategy):
             return pd.DataFrame()
         bars_needed = max(101, EMA_PERIOD + 51)
 
-        htf_resampled = self._resample_htf_data(current_timestamp)
+        if self._htf_resampled is None:
+            htf_resampled = self._resample_htf_data(current_timestamp)
+        else:
+            htf_resampled = self._htf_resampled
+            htf_resampled = htf_resampled[htf_resampled["timestamp"] <= current_timestamp]
         if htf_resampled.empty:
             return pd.DataFrame()
         if len(htf_resampled) < EMA_PERIOD:
             return pd.DataFrame()
         start_idx = max(0, len(htf_resampled) - bars_needed)
         return htf_resampled.iloc[start_idx:].copy()
+
+    def _get_current_atr_value(self):
+        if (
+            self._full_data is not None
+            and "atr" in self._full_data.columns
+            and self._current_index is not None
+        ):
+            val = self._full_data["atr"].iloc[self._current_index]
+            if pd.notna(val):
+                return float(val)
+        atr_series = get_atr(self.data, ATR_PERIOD)
+        return atr_series.iloc[-1] if len(atr_series) > 0 else None
+
+    def _calc_order_size_from_margin(self, entry_price: float) -> float:
+        if entry_price <= 0:
+            return 0.0
+        notional = float(MARGIN_PER_TRADE_USD) * float(LEVERAGE)
+        return notional / float(entry_price)
+
+    def _update_trend_indicators(self):
+        bars = self.fetch_htf_data()
+        htfEMA = ema(bars, EMA_PERIOD)
+
+        if htfEMA is None:
+            self.isBullishHTF = False
+            self.isBearishHTF = False
+        else:
+            self.isBullishHTF = self.cur_close > htfEMA
+            self.isBearishHTF = self.cur_close < htfEMA
+
+        atr_val = None
+        atr_sma = None
+        if (
+            self._full_data is not None
+            and "atr" in self._full_data.columns
+            and "atr_sma" in self._full_data.columns
+            and self._current_index is not None
+        ):
+            atr_val = self._full_data["atr"].iloc[self._current_index]
+            atr_sma = self._full_data["atr_sma"].iloc[self._current_index]
+        atrOK = (
+            atr_val > atr_sma
+            if (atr_val is not None and atr_sma is not None and pd.notna(atr_val) and pd.notna(atr_sma))
+            else False
+        )
+
+        if USE_VOLUME_CHECK:
+            vol_sma = None
+            if (
+                self._full_data is not None
+                and "vol_sma" in self._full_data.columns
+                and self._current_index is not None
+            ):
+                vol_sma = self._full_data["vol_sma"].iloc[self._current_index]
+            volOK = (
+                self.cur_volume > vol_sma * VOLUME_MULTIPLIER
+                if (vol_sma is not None and pd.notna(vol_sma))
+                else False
+            )
+            self.marketOK = volOK and atrOK
+        else:
+            self.marketOK = atrOK
+
+        self.lastBullFvg = (
+            self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
+        )
+        self.lastBearFvg = (
+            self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
+        )
+
+    def entry_logic(self):
+        if len(self.fvg_zones) == 0:
+            return
+
+        if MAX_DRAWDOWN_ENABLED and self._is_drawdown_lockout(self._get_current_timestamp()):
+            return
+
+        if not self.check_daily_trade_limit():
+            print(f"⚠️ Daily trade limit reached ({MAX_DAILY_TRADES}). No new trades today.")
+            return
+
+        allow_intracandle = ALLOW_INTRACANDLE_ENTRY
+        current_high = self.data["high"].iloc[-1]
+        current_low = self.data["low"].iloc[-1]
+        if allow_intracandle and hasattr(self, "_intrabar_high") and hasattr(self, "_intrabar_low"):
+            current_high = self._intrabar_high
+            current_low = self._intrabar_low
+
+        atr = self._get_current_atr_value()
+
+        for zone in self.fvg_zones[-FVG_HISTORY_NBR:]:
+            if not self.pyramiding.should_allow_entry(self, zone):
+                continue
+            if zone["mitigated"]:
+                continue
+
+            fvg_bottom = zone["bottom"]
+            fvg_top = zone["top"]
+
+            # Full touch: current bar's high/low overlaps the FVG zone
+            touchesFVG = current_high >= fvg_bottom and current_low <= fvg_top
+
+            if (
+                zone["direction"] == "bull"
+                and touchesFVG
+                and self.isBullishHTF
+                and self.marketOK
+            ):
+                entry_price = self.cur_close
+                if allow_intracandle:
+                    entry_price = fvg_top
+                stop_loss = entry_price - atr * SL_MULTIPLIER
+                if USE_TRAILING:
+                    trail_stop = entry_price - atr * TRAIL_OFFSET_MULT
+                else:
+                    trail_stop = None
+
+                tp = entry_price + atr * TP_MULTIPLIER
+                entryAtr = atr
+                group_id = self._next_partial_group_id()
+                self._partial_groups[group_id] = {
+                    "entry_price": entry_price,
+                    "entry_atr": entryAtr,
+                    "side": "BUY",
+                    "tp_steps_closed": 0,
+                    "sl_steps_closed": 0,
+                }
+                any_success = False
+                if SPLIT_ORDERS_ENABLED:
+                    if USE_MARGIN_PER_TRADE:
+                        total_size = self._calc_order_size_from_margin(entry_price)
+                        per_order_size = total_size / float(self._split_order_count)
+                    else:
+                        per_order_size = EACH_TRADE_SIZE
+                    for idx in range(self._split_order_count):
+                        active_order = self.Order(
+                            entry_atr=entryAtr,
+                            side="BUY",
+                            entry_price=entry_price,
+                            take_profit=tp,
+                            stop_loss=stop_loss,
+                            trailing_stop_loss=trail_stop,
+                            order_size=per_order_size,
+                            **self.api_order_kwargs(),
+                        )
+                        active_order.group_id = group_id
+                        active_order.group_seq = idx + 1
+                        active_order.entry_reference_price = entry_price
+                        result = active_order.place_order()
+
+                        success = isinstance(result, dict) and result.get("success", False)
+                        if result is None:
+                            # Backtest or non-API mode: treat as success
+                            success = True
+                        if success:
+                            self.active_orders.append(active_order)
+                            any_success = True
+                            self.pyramiding.on_position_opened(active_order, self)
+                else:
+                    if USE_MARGIN_PER_TRADE:
+                        order_size = self._calc_order_size_from_margin(entry_price)
+                    else:
+                        order_size = FIXED_LOT if USE_FIXED_LOT else self.calculate_order_size(
+                            atr=atr, sl_mult=SL_MULTIPLIER
+                        )
+                    active_order = self.Order(
+                        entry_atr=entryAtr,
+                        side="BUY",
+                        entry_price=entry_price,
+                        take_profit=tp,
+                        stop_loss=stop_loss,
+                        trailing_stop_loss=trail_stop,
+                        order_size=order_size,
+                        **self.api_order_kwargs(),
+                    )
+                    active_order.group_id = group_id
+                    active_order.group_seq = 1
+                    active_order.entry_reference_price = entry_price
+                    result = active_order.place_order()
+                    success = isinstance(result, dict) and result.get("success", False)
+                    if result is None:
+                        # Backtest or non-API mode: treat as success
+                        success = True
+                    if success:
+                        self.active_orders.append(active_order)
+                        any_success = True
+                        self.pyramiding.on_position_opened(active_order, self)
+
+                if any_success:
+                    zone["mitigated"] = True
+                    self.lastPositionWasLong = True
+                    self.lastPositionWasShort = False
+                    self.daily_trades_count += 1
+                    self.last_trade_date = str(datetime.now().date())
+                    print(f"📈 LONG position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
+                else:
+                    self._partial_groups.pop(group_id, None)
+                break
+
+            elif (
+                zone["direction"] == "bear"
+                and touchesFVG
+                and self.isBearishHTF
+                and self.marketOK
+            ):
+                entry_price = self.cur_close
+                if allow_intracandle:
+                    entry_price = fvg_bottom
+                stop_loss = entry_price + atr * SL_MULTIPLIER
+                if USE_TRAILING:
+                    trail_stop = entry_price + atr * TRAIL_OFFSET_MULT
+                else:
+                    trail_stop = None
+
+                tp = entry_price - atr * TP_MULTIPLIER
+                entryAtr = atr
+                group_id = self._next_partial_group_id()
+                self._partial_groups[group_id] = {
+                    "entry_price": entry_price,
+                    "entry_atr": entryAtr,
+                    "side": "SELL",
+                    "tp_steps_closed": 0,
+                    "sl_steps_closed": 0,
+                }
+                any_success = False
+                if SPLIT_ORDERS_ENABLED:
+                    if USE_MARGIN_PER_TRADE:
+                        total_size = self._calc_order_size_from_margin(entry_price)
+                        per_order_size = total_size / float(self._split_order_count)
+                    else:
+                        per_order_size = EACH_TRADE_SIZE
+                    for idx in range(self._split_order_count):
+                        active_order = self.Order(
+                            entry_atr=entryAtr,
+                            side="SELL",
+                            entry_price=entry_price,
+                            take_profit=tp,
+                            trailing_stop_loss=trail_stop,
+                            stop_loss=stop_loss,
+                            order_size=per_order_size,
+                            **self.api_order_kwargs(),
+                        )
+                        active_order.group_id = group_id
+                        active_order.group_seq = idx + 1
+                        active_order.entry_reference_price = entry_price
+                        result = active_order.place_order()
+
+                        success = isinstance(result, dict) and result.get("success", False)
+                        if result is None:
+                            # Backtest or non-API mode: treat as success
+                            success = True
+                        if success:
+                            self.active_orders.append(active_order)
+                            any_success = True
+                            self.pyramiding.on_position_opened(active_order, self)
+                else:
+                    if USE_MARGIN_PER_TRADE:
+                        order_size = self._calc_order_size_from_margin(entry_price)
+                    else:
+                        order_size = FIXED_LOT if USE_FIXED_LOT else self.calculate_order_size(
+                            atr=atr, sl_mult=SL_MULTIPLIER
+                        )
+                    active_order = self.Order(
+                        entry_atr=entryAtr,
+                        side="SELL",
+                        entry_price=entry_price,
+                        take_profit=tp,
+                        trailing_stop_loss=trail_stop,
+                        stop_loss=stop_loss,
+                        order_size=order_size,
+                        **self.api_order_kwargs(),
+                    )
+                    active_order.group_id = group_id
+                    active_order.group_seq = 1
+                    active_order.entry_reference_price = entry_price
+                    result = active_order.place_order()
+                    success = isinstance(result, dict) and result.get("success", False)
+                    if result is None:
+                        # Backtest or non-API mode: treat as success
+                        success = True
+                    if success:
+                        self.active_orders.append(active_order)
+                        any_success = True
+                        self.pyramiding.on_position_opened(active_order, self)
+
+                if any_success:
+                    zone["mitigated"] = True
+                    self.lastPositionWasShort = True
+                    self.lastPositionWasLong = False
+                    self.daily_trades_count += 1
+                    self.last_trade_date = str(datetime.now().date())
+                    print(f"📉 SHORT position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
+                else:
+                    self._partial_groups.pop(group_id, None)
+                break
 
     def check_daily_trade_limit(self):
         if self._current_dt is None:
@@ -469,6 +903,58 @@ class FVG_Backtest(FVG_Strategy):
             return max(0.001, round(lot_size, 3))
         return ORDER_SIZE
 
+    def calculate_trade_fee(
+        self,
+        order: BacktestOrder,
+        exit_price: float | None = None,
+        exit_timestamp: datetime | None = None,
+    ) -> float:
+        try:
+            entry_price = float(
+                order.avg_entry_price if order.avg_entry_price is not None else order.entry_price
+            )
+            size = float(order.order_size or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if size <= 0 or entry_price <= 0:
+            return 0.0
+        notional = abs(entry_price * size)
+        return order._calc_fee(notional)
+
+    def calculate_trade_pnl(
+        self,
+        order: BacktestOrder,
+        exit_price: float | None,
+        exit_timestamp: datetime | None = None,
+    ) -> float:
+        entry_price = order.avg_entry_price if order.avg_entry_price is not None else order.entry_price
+        if entry_price is None or exit_price is None:
+            return 0.0
+        try:
+            entry_price = float(entry_price)
+            exit_price = float(exit_price)
+            size = float(order.order_size or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if size <= 0:
+            return 0.0
+
+        if self.tick_size is not None and self.tick_value is not None and float(self.tick_size) != 0:
+            tick_size = float(self.tick_size)
+            tick_value = float(self.tick_value)
+            price_move = exit_price - entry_price
+            ticks = price_move / tick_size
+            if order.side == "SELL":
+                ticks = -ticks
+            gross = ticks * tick_value * size
+            fee = self.calculate_trade_fee(order, exit_price, exit_timestamp)
+            return gross - fee
+
+        price_delta = exit_price - entry_price
+        direction = 1 if order.side == "BUY" else -1
+        fee = self.calculate_trade_fee(order, exit_price, exit_timestamp)
+        return price_delta * direction * size - fee
+
     def subscribe_to_price_updates(self):
         return
 
@@ -503,6 +989,9 @@ class FVG_Backtest(FVG_Strategy):
             "pnl": order.pnl,
             "equity": self.account_balance,
             "group_id": getattr(order, "group_id", None),
+            "margin_per_trade": order.margin_used,
+            "lot_size": order.order_size,
+            "total_fees": order.fee_paid,
         }
         self.trades.append(row)
         self._append_trade_csv(row)
@@ -516,22 +1005,36 @@ class FVG_Backtest(FVG_Strategy):
     def _append_trade_csv(self, row: dict):
         # Ensure output directory exists
         os.makedirs(os.path.dirname(self.trades_csv_path), exist_ok=True)
+        fieldnames = [
+            "side",
+            "entry_price",
+            "exit_price",
+            "entry_time",
+            "exit_time",
+            "order_size",
+            "pnl",
+            "equity",
+            "group_id",
+            "margin_per_trade",
+            "lot_size",
+            "total_fees",
+        ]
+        if TRADE_CSV_WRITE_MODE == "prepend":
+            temp_path = f"{self.trades_csv_path}.tmp"
+            with open(temp_path, "w", newline="", encoding="utf-8") as out_f:
+                writer = csv.DictWriter(out_f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow(row)
+                if os.path.exists(self.trades_csv_path):
+                    with open(self.trades_csv_path, "r", newline="", encoding="utf-8") as in_f:
+                        reader = csv.DictReader(in_f)
+                        for existing in reader:
+                            writer.writerow(existing)
+            os.replace(temp_path, self.trades_csv_path)
+            return
         write_header = not os.path.exists(self.trades_csv_path)
         with open(self.trades_csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=[
-                    "side",
-                    "entry_price",
-                    "exit_price",
-                    "entry_time",
-                    "exit_time",
-                    "order_size",
-                    "pnl",
-                    "equity",
-                    "group_id",
-                ],
-            )
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             if write_header:
                 writer.writeheader()
             writer.writerow(row)
@@ -560,6 +1063,7 @@ class FVG_Backtest(FVG_Strategy):
             self.cur_close = float(new_row["close"].iloc[-1])
             self.cur_volume = float(new_row["volume"].iloc[-1]) if "volume" in new_row.columns else 0.0
             self._current_dt = self._extract_bar_time(new_row)
+            self._current_index = self._cursor
 
             if self._check_max_drawdown(self._current_dt, float(self.cur_close)):
                 self._cursor += 1
