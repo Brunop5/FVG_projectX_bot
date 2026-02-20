@@ -111,7 +111,7 @@ DEBUG_STOPS = False
 DEBUG_PYRAMIDING = False
 
 # Max drawdown protection (per strategy instance)
-MAX_DRAWDOWN_ENABLED = False
+MAX_DRAWDOWN_ENABLED = True
 MAX_DRAWDOWN_PCT = 50.0
 
 # Pyramiding (client mode)
