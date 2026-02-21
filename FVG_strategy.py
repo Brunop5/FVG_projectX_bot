@@ -707,12 +707,28 @@ class FVG_Strategy(Strategy):
                     high_changed=high_changed,
                     low_changed=low_changed,
                 )
-                partial_close_map = self._get_partial_close_targets(self.cur_close)
+                allow_partial_closes = SPLIT_ORDERS_ENABLED and (
+                    ENABLE_PARTIAL_TP or ENABLE_PARTIAL_SL
+                )
+                partial_close_map = (
+                    self._get_partial_close_targets(self.cur_close)
+                    if allow_partial_closes
+                    else {}
+                )
                 remaining = []
                 closed_any = False
                 for order in list(self.active_orders):
                     recorded_trade = False
-                    if order in partial_close_map:
+                    closed = order.check_close_conditions(
+                        current_price=self.cur_close,
+                        current_high=current_high,
+                        current_low=current_low,
+                        last_long=order.side == "BUY",
+                        last_short=order.side == "SELL",
+                        isBOS=self.isBOS,
+                        isCHOCH=self.isCHOCH,
+                    )
+                    if (not closed) and allow_partial_closes and order in partial_close_map:
                         if hasattr(order, "exit_reason"):
                             order.exit_reason = partial_close_map[order]
                         if hasattr(order, "_last_price"):
@@ -726,16 +742,6 @@ class FVG_Strategy(Strategy):
                         except Exception:
                             pass
                         closed = True
-                    else:
-                        closed = order.check_close_conditions(
-                            current_price=self.cur_close,
-                            current_high=current_high,
-                            current_low=current_low,
-                            last_long=order.side == "BUY",
-                            last_short=order.side == "SELL",
-                            isBOS=self.isBOS,
-                            isCHOCH=self.isCHOCH,
-                        )
                     if closed:
                         if hasattr(order, "_last_price"):
                             order._last_price = float(self.cur_close)
