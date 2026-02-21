@@ -51,6 +51,18 @@ TIMEFRAME_MAP = {
 }
 
 
+def _timeframe_to_seconds(timeframe: str) -> int:
+    if timeframe in TIMEFRAME_MAP:
+        timeframe = TIMEFRAME_MAP[timeframe]
+    if timeframe.endswith("m") and timeframe[:-1].isdigit():
+        return int(timeframe[:-1]) * 60
+    if timeframe.endswith("h") and timeframe[:-1].isdigit():
+        return int(timeframe[:-1]) * 60 * 60
+    if timeframe.endswith("d") and timeframe[:-1].isdigit():
+        return int(timeframe[:-1]) * 60 * 60 * 24
+    return 60
+
+
 def _binance_interval_from_timeframe(timeframe: str) -> str:
     if timeframe in TIMEFRAME_MAP:
         return TIMEFRAME_MAP[timeframe]
@@ -290,6 +302,7 @@ class Binance_Strategy(FVG_Strategy):
         self.timeframe = asset_tuple[1]
         self._client = None
         self._ws_client = None
+        self._ws_last_message_ts = 0.0
         self.pyramiding = MaxOrdersPolicy(MAX_OPEN_ORDERS)
 
         suffix = f"-{CONTRACT_TYPE.lower()}" if USE_CONTINUOUS_KLINES else ""
@@ -414,9 +427,16 @@ class Binance_Strategy(FVG_Strategy):
     def subscribe_to_price_updates(self):
         interval = _binance_interval_from_timeframe(self.timeframe)
         symbol = self.asset.lower()
+        reconnect_delay = 5
+        idle_timeout = max(60, _timeframe_to_seconds(self.timeframe) * 2)
+
+        connected_ok = False
 
         def on_message(_, message):
+            nonlocal connected_ok
             try:
+                connected_ok = True
+                self._ws_last_message_ts = time.time()
                 payload = json.loads(message) if isinstance(message, str) else message
                 kline = payload.get("k") or payload.get("data", {}).get("k", {})
                 if not kline:
@@ -433,9 +453,21 @@ class Binance_Strategy(FVG_Strategy):
                 print(f"⚠️ Websocket parse error: {exc}")
 
         while True:
+            reconnect_event = threading.Event()
+
+            def on_error(_, err):
+                print(f"⚠️ Websocket error: {err}")
+                reconnect_event.set()
+
+            def on_close(_, code=None, reason=None):
+                print(f"⚠️ Websocket closed: code={code} reason={reason}")
+                reconnect_event.set()
+
             try:
                 self._ws_client = UMFuturesWebsocketClient(
                     on_message=on_message,
+                    on_error=on_error,
+                    on_close=on_close,
                     stream_url=_binance_ws_url(),
                 )
                 if USE_CONTINUOUS_KLINES and hasattr(self._ws_client, "continuous_kline"):
@@ -454,16 +486,26 @@ class Binance_Strategy(FVG_Strategy):
                 else:
                     self._ws_client.kline(symbol=symbol, interval=interval)
 
-                while True:
+                self._ws_last_message_ts = time.time()
+                connected_ok = False
+                while not reconnect_event.is_set():
                     time.sleep(1)
+                    if time.time() - self._ws_last_message_ts > idle_timeout:
+                        print("⚠️ Websocket idle timeout; reconnecting.")
+                        reconnect_event.set()
             except Exception as exc:
+                print(f"⚠️ Websocket reconnecting after error: {exc}")
+            finally:
                 if self._ws_client is not None:
                     try:
                         self._ws_client.stop()
                     except Exception:
                         pass
-                print(f"⚠️ Websocket reconnecting after error: {exc}")
-                time.sleep(5)
+                time.sleep(reconnect_delay)
+                if connected_ok:
+                    reconnect_delay = 5
+                else:
+                    reconnect_delay = min(60, reconnect_delay * 2)
 
     def start_bar_iterations(self):
         while True:
