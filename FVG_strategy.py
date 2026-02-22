@@ -28,13 +28,18 @@ from strategyTemplate import Strategy, Order
 
 # if "username", "api_key", "assets_list" or even the actual ones are spelled wrong, it wont work
 
+
+# if "username", "api_key", "assets_list" or even the actual ones are spelled wrong, it wont work
+
 APIS = {
     "Personal account": {
         "username": "Marrove",
         "api_key": "z8Xnx8AJQyciYe/q/+NXTKZoTYZhSiLj/C52ka2vKzM=",
         "assets_list": [
             ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
-
+            ("CON.F.US.RTY.H26", "15min", "50KTC-V2-252499-69493223"),
+            ("CON.F.US.MCLE.H26", "15min", "50KTC-V2-252499-69493223"),
+            ("CON.F.US.M2K.H26", "15min", "50KTC-V2-252499-69493223"),
         ]
     },
 
@@ -42,9 +47,11 @@ APIS = {
         "username": "afribuymoz@gmail.com",
         "api_key": "NEV2P9zTW7+cTNDi/yW8rcjn22EAPH8/t6SgxObrVvM=",
         "assets_list": [
-            ("CON.F.US.MGC.J26", "15min", "50KTC-V2-498538-71564652"),
             ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-498538-71564652"),
-
+            ("CON.F.US.SIL.H26", "15min", "50KTC-V2-498538-71564652"),
+            ("CON.F.US.MYM.H26", "15min", "50KTC-V2-498538-71564652"),
+            ("CON.F.US.MES.H26", "15min", "50KTC-V2-498538-71564652"),
+            ("CON.F.US.M2K.H26", "15min", "50KTC-V2-498538-71564652")
         ]
     }
 }
@@ -86,7 +93,7 @@ HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 2                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 6                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
@@ -314,12 +321,12 @@ class FVG_Strategy(Strategy):
             if ENABLE_PARTIAL_SL
             else 0
         )
-        self.peak_unrealized_pnl = 0.0
+        self.peak_unrealized_pnl = 500
         self.max_dd_triggered_until = None
 
         super().__init__()
         if not hasattr(self, "daily_realized_pnl"):
-            self.daily_realized_pnl = 0.0
+            self.daily_realized_pnl = 500
         if not hasattr(self, "last_pnl_date"):
             self.last_pnl_date = None
 
