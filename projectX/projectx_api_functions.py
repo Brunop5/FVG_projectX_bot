@@ -20,6 +20,37 @@ TIMEFRAME_SECONDS = {
     "1d": 86400,
 }
 
+
+def _seconds_until_sunday_18_et(now_et: datetime | None = None) -> float:
+    tz_et = timezone(timedelta(hours=-5))
+    now_et = now_et or datetime.now(tz_et)
+    weekday = now_et.weekday()  # Mon=0 ... Sun=6
+    if weekday == 6 and now_et.hour >= 18:
+        return 0.0
+    if weekday == 6:
+        target = now_et.replace(hour=18, minute=0, second=0, microsecond=0)
+    elif weekday == 5:
+        target = (now_et + timedelta(days=1)).replace(
+            hour=18, minute=0, second=0, microsecond=0
+        )
+    else:
+        return 0.0
+    return max(0.0, (target - now_et).total_seconds())
+
+
+def _wait_before_retry_for_weekend() -> None:
+    wait_seconds = _seconds_until_sunday_18_et()
+    if wait_seconds > 0:
+        wait_minutes = int(wait_seconds // 60)
+        wait_rem = int(wait_seconds % 60)
+        print(
+            f"⏳ Weekend detected. Waiting {wait_minutes}m {wait_rem}s "
+            "until Sunday 18:00 (UTC-5) before retrying."
+        )
+        time.sleep(wait_seconds)
+    else:
+        time.sleep(10)
+
 def login_to_api(user_name, api_key):
     url = "https://api.topstepx.com/api/Auth/loginKey"
     
@@ -201,46 +232,55 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
         "includePartialBar": include_partial_bar
     }
     
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        if response.status_code == 200:
-            # Parse response - assuming it returns JSON array of bars
-            data = response.json()["bars"]            
-            # Convert to DataFrame
-            # Adjust column names based on actual API response structure
-            if isinstance(data, list) and len(data) > 0:
-                df = pd.DataFrame(data)
+    while True:
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                # Parse response - assuming it returns JSON array of bars
+                data = response.json()["bars"]            
+                # Convert to DataFrame
+                # Adjust column names based on actual API response structure
+                if isinstance(data, list) and len(data) > 0:
+                    df = pd.DataFrame(data)
     
-                # Rename columns
-                df = df.rename(columns={
-                    't': 'timestamp',
-                    'o': 'open',
-                    'h': 'high',
-                    'l': 'low',
-                    'c': 'close',
-                    'v': 'volume'
-                })
-                
-                # Convert timestamp to datetime if needed
-                df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-                df['timestamp'] = df['timestamp'].astype('int64') // 1_000_000
-                
-                # Optional: reorder columns
-                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-                df = df.iloc[::-1].reset_index(drop=True)
-                return df
-            else:
-                return None  # Empty DataFrame if no data
-        else:
+                    # Rename columns
+                    df = df.rename(columns={
+                        't': 'timestamp',
+                        'o': 'open',
+                        'h': 'high',
+                        'l': 'low',
+                        'c': 'close',
+                        'v': 'volume'
+                    })
+                    
+                    # Convert timestamp to datetime if needed
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+                    df['timestamp'] = df['timestamp'].astype('int64') // 1_000_000
+                    
+                    # Optional: reorder columns
+                    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                    df = df.iloc[::-1].reset_index(drop=True)
+                    return df
+                else:
+                    return None  # Empty DataFrame if no data
+            if response.status_code == 502:
+                print("⚠️  502 from TopStepX. Will retry.")
+                _wait_before_retry_for_weekend()
+                continue
             print(f"Error fetching data: {response.status_code} - {response.text}")
             return None
     
-    except requests.exceptions.RequestException as e:
-        print(f"Request error: {str(e)}")
-        return None
-    except Exception as e:
-        print(f"Error parsing response: {str(e)}")
-        return None
+        except requests.exceptions.RequestException as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 502 or "502" in str(e):
+                print(f"⚠️  502 from TopStepX: {e}. Will retry.")
+                _wait_before_retry_for_weekend()
+                continue
+            print(f"Request error: {str(e)}")
+            return None
+        except Exception as e:
+            print(f"Error parsing response: {str(e)}")
+            return None
 
 def fetch_data_(ugh, eeehm, lol, tok=None, l=False):
     """Fetch 100 bars of 30m BTC-USDT perpetual futures data from Binance Futures."""
