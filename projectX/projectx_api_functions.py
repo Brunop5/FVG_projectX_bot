@@ -264,7 +264,10 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
                 else:
                     return None  # Empty DataFrame if no data
             if response.status_code == 502:
-                print("⚠️  502 from TopStepX. Will retry.")
+                body_preview = (response.text or "").strip()
+                if len(body_preview) > 500:
+                    body_preview = f"{body_preview[:500]}..."
+                print(f"⚠️  502 from TopStepX. Will retry. Body: {body_preview}")
                 _wait_before_retry_for_weekend()
                 continue
             print(f"Error fetching data: {response.status_code} - {response.text}")
