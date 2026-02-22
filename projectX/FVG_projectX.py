@@ -291,8 +291,11 @@ class ProjectX_Strategy(FVG_Strategy):
         data = load_data(self.asset, self.timeframe)
         if data is not None:
             return data
-        
-        return fetch_data(self.asset, self.timeframe, 100, self.auth_token)
+        data = fetch_data(self.asset, self.timeframe, 100, self.auth_token)
+        if data is None:
+            print("⚠️  Initial data fetch failed; starting with empty dataset.")
+            return pd.DataFrame()
+        return data
 
     def fetch_new_data(self):
         new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token)
