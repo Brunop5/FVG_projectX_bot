@@ -321,12 +321,12 @@ class FVG_Strategy(Strategy):
             if ENABLE_PARTIAL_SL
             else 0
         )
-        self.peak_unrealized_pnl = 0.0
+        self.peak_unrealized_pnl = 500
         self.max_dd_triggered_until = None
 
         super().__init__()
         if not hasattr(self, "daily_realized_pnl"):
-            self.daily_realized_pnl = 0.0
+            self.daily_realized_pnl = 500
         if not hasattr(self, "last_pnl_date"):
             self.last_pnl_date = None
 
