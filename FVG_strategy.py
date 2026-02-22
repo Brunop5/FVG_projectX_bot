@@ -546,8 +546,16 @@ class FVG_Strategy(Strategy):
             return False
         if isinstance(self.max_dd_triggered_until, datetime):
             lockout_date = self.max_dd_triggered_until.date()
+        elif isinstance(self.max_dd_triggered_until, str):
+            try:
+                lockout_date = datetime.fromisoformat(self.max_dd_triggered_until).date()
+            except ValueError:
+                lockout_date = None
         else:
             lockout_date = self.max_dd_triggered_until
+        if lockout_date is None:
+            self.max_dd_triggered_until = None
+            return False
         if current_timestamp.date() >= lockout_date:
             self.max_dd_triggered_until = None
             self.peak_unrealized_pnl = 0.0
