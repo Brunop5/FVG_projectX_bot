@@ -1,4 +1,7 @@
 import os
+import sys
+import logging
+import warnings
 import requests
 import pandas as pd
 from datetime import datetime
@@ -14,6 +17,55 @@ from .projectx_api_functions import login_to_api
 from .projectx_api_functions import validate_token
 from .projectx_api_functions import sleep_until_next_boundary
 
+PROJECTX_LOG_PATH = os.path.join(os.getcwd(), "projectx_run.log")
+
+
+def setup_global_logging(log_path: str) -> None:
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_path, mode="a", encoding="utf-8")],
+    )
+
+    class _StreamToLogger:
+        def __init__(self, logger: logging.Logger, level: int):
+            self.logger = logger
+            self.level = level
+
+        def write(self, message: str) -> None:
+            message = message.rstrip()
+            if message:
+                self.logger.log(self.level, message)
+
+        def flush(self) -> None:
+            pass
+
+    stdout_logger = logging.getLogger("stdout")
+    stderr_logger = logging.getLogger("stderr")
+    sys.stdout = _StreamToLogger(stdout_logger, logging.INFO)
+    sys.stderr = _StreamToLogger(stderr_logger, logging.ERROR)
+
+    def _showwarning(message, category, filename, lineno, file=None, line=None):
+        warn_logger = logging.getLogger("warnings")
+        warn_logger.warning(
+            "%s:%s: %s: %s",
+            filename,
+            lineno,
+            category.__name__,
+            message,
+        )
+
+    warnings.showwarning = _showwarning
+
+    def _excepthook(exc_type, exc_value, exc_traceback):
+        logger = logging.getLogger("exceptions")
+        logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = _excepthook
 
 
 def init_api(username, api_key):
@@ -552,6 +604,7 @@ def validation_thread(auth_token, strategies: list[ProjectX_Strategy]):
 
 
 if __name__ == "__main__":
+    setup_global_logging(PROJECTX_LOG_PATH)
     for api in APIS.values():
         global_token = init_api(api["username"], api["api_key"])
 

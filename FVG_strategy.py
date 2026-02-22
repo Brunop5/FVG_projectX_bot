@@ -110,8 +110,8 @@ ENABLE_PARTIAL_SL = True
 # Daily Trading Limits
 MAX_DAILY_TRADES = 3
 ENABLE_DAILY_PNL_LIMITS = True
-MAX_DAILY_GAIN = 1400
-MAX_DAILY_LOSS = 1400
+MAX_DAILY_GAIN = 150
+MAX_DAILY_LOSS = 150
 
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
@@ -693,15 +693,49 @@ class FVG_Strategy(Strategy):
                 return
 
             if len(self.active_orders) > 0:
+                high_changed = False
+                low_changed = False
+                if hasattr(self, "_last_kline_high") and hasattr(self, "_last_kline_low"):
+                    try:
+                        high_changed = float(current_high) != float(self._last_kline_high)
+                        low_changed = float(current_low) != float(self._last_kline_low)
+                    except (TypeError, ValueError):
+                        high_changed = True
+                        low_changed = True
+                self._last_kline_high = current_high
+                self._last_kline_low = current_low
                 if DEBUG_STOPS:
                     print("🧪 update_price: calling update_stops + check_close_conditions")
-                self.update_stops(current_high=current_high, current_low=current_low)
-                partial_close_map = self._get_partial_close_targets(self.cur_close)
+                if not high_changed and not low_changed:
+                    return
+                self.update_stops(
+                    current_high=current_high,
+                    current_low=current_low,
+                    high_changed=high_changed,
+                    low_changed=low_changed,
+                )
+                allow_partial_closes = SPLIT_ORDERS_ENABLED and (
+                    ENABLE_PARTIAL_TP or ENABLE_PARTIAL_SL
+                )
+                partial_close_map = (
+                    self._get_partial_close_targets(self.cur_close)
+                    if allow_partial_closes
+                    else {}
+                )
                 remaining = []
                 closed_any = False
                 for order in list(self.active_orders):
                     recorded_trade = False
-                    if order in partial_close_map:
+                    closed = order.check_close_conditions(
+                        current_price=self.cur_close,
+                        current_high=current_high,
+                        current_low=current_low,
+                        last_long=order.side == "BUY",
+                        last_short=order.side == "SELL",
+                        isBOS=self.isBOS,
+                        isCHOCH=self.isCHOCH,
+                    )
+                    if (not closed) and allow_partial_closes and order in partial_close_map:
                         if hasattr(order, "exit_reason"):
                             order.exit_reason = partial_close_map[order]
                         if hasattr(order, "_last_price"):
@@ -715,16 +749,6 @@ class FVG_Strategy(Strategy):
                         except Exception:
                             pass
                         closed = True
-                    else:
-                        closed = order.check_close_conditions(
-                            current_price=self.cur_close,
-                            current_high=current_high,
-                            current_low=current_low,
-                            last_long=order.side == "BUY",
-                            last_short=order.side == "SELL",
-                            isBOS=self.isBOS,
-                            isCHOCH=self.isCHOCH,
-                        )
                     if closed:
                         if hasattr(order, "_last_price"):
                             order._last_price = float(self.cur_close)
@@ -1094,7 +1118,13 @@ class FVG_Strategy(Strategy):
                 break
 
 
-    def update_stops(self, current_high: float | None = None, current_low: float | None = None):
+    def update_stops(
+        self,
+        current_high: float | None = None,
+        current_low: float | None = None,
+        high_changed: bool = True,
+        low_changed: bool = True,
+    ):
         if len(self.active_orders) == 0:
             return
 
@@ -1112,6 +1142,8 @@ class FVG_Strategy(Strategy):
                     f"entry_atr={pos.entry_atr} tsl={pos.trailing_stop_loss}"
                 )
             if pos.side == "BUY":
+                if not high_changed:
+                    continue
                 if USE_TRAILING and pos.entry_atr is not None:
                     potentialStop = current_high - pos.entry_atr * TRAIL_OFFSET_MULT
                     if pos.trailing_stop_loss is not None:
@@ -1122,6 +1154,8 @@ class FVG_Strategy(Strategy):
                     else:
                         pos.trailing_stop_loss = potentialStop
             elif pos.side == "SELL":
+                if not low_changed:
+                    continue
                 if USE_TRAILING and pos.entry_atr is not None:
                     potentialStop = current_low + pos.entry_atr * TRAIL_OFFSET_MULT
                     if pos.trailing_stop_loss is not None:
