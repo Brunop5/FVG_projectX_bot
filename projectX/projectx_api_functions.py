@@ -2,6 +2,7 @@ import pandas as pd
 import os
 import time
 import requests
+import random
 from datetime import datetime, timedelta, timezone
 import logging
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -38,7 +39,7 @@ def _seconds_until_sunday_18_et(now_et: datetime | None = None) -> float:
     return max(0.0, (target - now_et).total_seconds())
 
 
-def _wait_before_retry_for_weekend() -> None:
+def _wait_before_retry_for_weekend(fallback_seconds: float = 10.0) -> float:
     wait_seconds = _seconds_until_sunday_18_et()
     if wait_seconds > 0:
         wait_minutes = int(wait_seconds // 60)
@@ -47,9 +48,17 @@ def _wait_before_retry_for_weekend() -> None:
             f"⏳ Weekend detected. Waiting {wait_minutes}m {wait_rem}s "
             "until Sunday 18:00 (UTC-5) before retrying."
         )
-        time.sleep(wait_seconds)
     else:
-        time.sleep(10)
+        wait_seconds = fallback_seconds
+    time.sleep(wait_seconds)
+    return wait_seconds
+
+
+def _compute_retry_delay(attempt: int, base_seconds: float = 5.0, max_seconds: float = 60.0) -> float:
+    exponent = max(0, attempt - 1)
+    delay = min(max_seconds, base_seconds * (2 ** exponent))
+    jitter = random.uniform(0.0, delay * 0.2)
+    return delay + jitter
 
 def login_to_api(user_name, api_key):
     url = "https://api.topstepx.com/api/Auth/loginKey"
@@ -232,12 +241,42 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
         "includePartialBar": include_partial_bar
     }
     
+    retryable_statuses = {429, 500, 502, 503, 504, 520, 522, 524}
+    attempt = 0
+
     while True:
+        attempt += 1
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=30)
             if response.status_code == 200:
+                try:
+                    payload_json = response.json()
+                except ValueError:
+                    body_preview = (response.text or "").strip()
+                    if len(body_preview) > 500:
+                        body_preview = f"{body_preview[:500]}..."
+                    delay = _compute_retry_delay(attempt)
+                    print(
+                        f"⚠️  Invalid JSON from TopStepX. Retrying in {int(delay)}s "
+                        f"(attempt {attempt}). Body: {body_preview}"
+                    )
+                    _wait_before_retry_for_weekend(delay)
+                    continue
+
                 # Parse response - assuming it returns JSON array of bars
-                data = response.json()["bars"]            
+                data = payload_json.get("bars")
+                if data is None:
+                    body_preview = (response.text or "").strip()
+                    if len(body_preview) > 500:
+                        body_preview = f"{body_preview[:500]}..."
+                    delay = _compute_retry_delay(attempt)
+                    print(
+                        f"⚠️  Missing 'bars' in TopStepX response. Retrying in {int(delay)}s "
+                        f"(attempt {attempt}). Body: {body_preview}"
+                    )
+                    _wait_before_retry_for_weekend(delay)
+                    continue
+
                 # Convert to DataFrame
                 # Adjust column names based on actual API response structure
                 if isinstance(data, list) and len(data) > 0:
@@ -263,21 +302,36 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
                     return df
                 else:
                     return None  # Empty DataFrame if no data
-            if response.status_code == 502:
+            if response.status_code in retryable_statuses:
                 body_preview = (response.text or "").strip()
                 if len(body_preview) > 500:
                     body_preview = f"{body_preview[:500]}..."
-                print(f"⚠️  502 from TopStepX. Will retry. Body: {body_preview}")
-                _wait_before_retry_for_weekend()
+                delay = _compute_retry_delay(attempt)
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = max(delay, float(retry_after))
+                        except ValueError:
+                            pass
+                print(
+                    f"⚠️  {response.status_code} from TopStepX. Retrying in {int(delay)}s "
+                    f"(attempt {attempt}). Body: {body_preview}"
+                )
+                _wait_before_retry_for_weekend(delay)
                 continue
             print(f"Error fetching data: {response.status_code} - {response.text}")
             return None
     
         except requests.exceptions.RequestException as e:
             status_code = getattr(getattr(e, "response", None), "status_code", None)
-            if status_code == 502 or "502" in str(e):
-                print(f"⚠️  502 from TopStepX: {e}. Will retry.")
-                _wait_before_retry_for_weekend()
+            if status_code in retryable_statuses or "502" in str(e):
+                delay = _compute_retry_delay(attempt)
+                print(
+                    f"⚠️  Request error from TopStepX: {e}. Retrying in {int(delay)}s "
+                    f"(attempt {attempt})."
+                )
+                _wait_before_retry_for_weekend(delay)
                 continue
             print(f"Request error: {str(e)}")
             return None
