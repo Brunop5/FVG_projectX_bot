@@ -3,6 +3,7 @@ import os
 import time
 import requests
 import random
+import threading
 from datetime import datetime, timedelta, timezone
 import logging
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -20,6 +21,10 @@ TIMEFRAME_SECONDS = {
     "4h": 14400,
     "1d": 86400,
 }
+
+TOPSTEPX_MAX_CONCURRENCY = int(os.getenv("TOPSTEPX_MAX_CONCURRENCY", "4"))
+_TOPSTEPX_SEMAPHORE = threading.BoundedSemaphore(TOPSTEPX_MAX_CONCURRENCY)
+DEFAULT_TOPSTEPX_TIMEOUT = (5, 30)
 
 
 def _seconds_until_sunday_18_et(now_et: datetime | None = None) -> float:
@@ -60,6 +65,11 @@ def _compute_retry_delay(attempt: int, base_seconds: float = 5.0, max_seconds: f
     jitter = random.uniform(0.0, delay * 0.2)
     return delay + jitter
 
+
+def topstepx_post(url: str, headers: dict, payload: dict, timeout=DEFAULT_TOPSTEPX_TIMEOUT):
+    with _TOPSTEPX_SEMAPHORE:
+        return requests.post(url, headers=headers, json=payload, timeout=timeout)
+
 def login_to_api(user_name, api_key):
     url = "https://api.topstepx.com/api/Auth/loginKey"
     
@@ -74,7 +84,7 @@ def login_to_api(user_name, api_key):
     }
     
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response = topstepx_post(url, headers=headers, payload=payload, timeout=10)
         #print(response.text, response.status_code)
         
         if response.status_code == 200:
@@ -111,7 +121,7 @@ def get_account_id(token, account_name=None, show=False):
         "onlyActiveAccounts": True
     }
 
-    response = requests.post(url, json=payload, headers=headers)
+    response = topstepx_post(url, headers=headers, payload=payload, timeout=DEFAULT_TOPSTEPX_TIMEOUT)
     response.raise_for_status()
 
     data = response.json()
@@ -247,7 +257,7 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
     while True:
         attempt += 1
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response = topstepx_post(url, headers=headers, payload=payload, timeout=DEFAULT_TOPSTEPX_TIMEOUT)
             if response.status_code == 200:
                 try:
                     payload_json = response.json()
@@ -415,7 +425,7 @@ def get_account_balance(account_id, auth_token):
         "onlyActiveAccounts": True
     }
 
-    response = requests.post(url, json=payload, headers=headers)
+    response = topstepx_post(url, headers=headers, payload=payload, timeout=DEFAULT_TOPSTEPX_TIMEOUT)
     response.raise_for_status()
 
     data = response.json()
@@ -436,7 +446,7 @@ def validate_token(auth_token: str):
     }
 
     try:
-        response = requests.post(url, headers=headers, timeout=10)
+        response = topstepx_post(url, headers=headers, payload={}, timeout=10)
 
         if response.status_code != 200:
             return {

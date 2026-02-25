@@ -16,6 +16,7 @@ from .projectx_api_functions import fetch_data
 from .projectx_api_functions import login_to_api
 from .projectx_api_functions import validate_token
 from .projectx_api_functions import sleep_until_next_boundary
+from .projectx_api_functions import topstepx_post
 
 PROJECTX_LOG_PATH = os.path.join(os.getcwd(), "projectx_run.log")
 
@@ -147,7 +148,7 @@ class ProjectX_Order(FVG_Order):
         }
 
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response = topstepx_post(url, headers=headers, payload=payload, timeout=30)
             
             if response.status_code == 200:
                 result = response.json()
@@ -209,7 +210,7 @@ class ProjectX_Order(FVG_Order):
         }
 
         try:
-            response = requests.post(url, json=payload, headers=headers)
+            response = topstepx_post(url, headers=headers, payload=payload, timeout=30)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -282,7 +283,7 @@ class ProjectX_Strategy(FVG_Strategy):
             "live": False
         }
 
-        response = requests.post(url, json=payload, headers=headers)
+        response = topstepx_post(url, headers=headers, payload=payload, timeout=30)
         response.raise_for_status()
         
         return response.json()["contracts"]
@@ -493,7 +494,7 @@ class ProjectX_AccountRunner:
         token = init_api(self.api_config["username"], self.api_config["api_key"])
         v_thread = threading.Thread(
             target=validation_thread,
-            args=(token, self.strategies),
+            args=(token, self.strategies, self.api_config),
             daemon=True,
         )
         v_thread.start()
@@ -590,20 +591,42 @@ def run_strat(strat: ProjectX_Strategy, token):
     strat.init_api(token)
     strat.run()
 
-def validation_thread(auth_token, strategies: list[ProjectX_Strategy]):
+def validation_thread(
+    auth_token: str,
+    strategies: list[ProjectX_Strategy],
+    api_config: dict | None = None,
+    refresh_interval: int = 72000,
+):
     print("starting validation thread...")
     while True:
-        sleep(72000)
+        sleep(refresh_interval)
         res = validate_token(auth_token)
-        if res["success"] == False:
+        if not res or res.get("success") is False:
             print("token update failed, API connection might fail soon...")
-            print(res["message"])
-            return
+            if res:
+                print(res.get("message"))
+            if api_config:
+                try:
+                    auth_token = init_api(api_config["username"], api_config["api_key"])
+                    print("✅ Re-authenticated after validation failure.")
+                except Exception as exc:
+                    print(f"❌ Re-authentication failed: {exc}")
+                    continue
+            else:
+                continue
+        else:
+            new_token = (
+                res.get("newToken")
+                or res.get("new_token")
+                or res.get("token")
+                or auth_token
+            )
+            if new_token != auth_token:
+                auth_token = new_token
+                print("Sucessfully updated connection token")
 
-        new_token = res["newToken"]
-        print("Sucessfully updated connection token")
         for strat in strategies:
-            strat.set_token(new_token)
+            strat.set_token(auth_token)
 
 
 if __name__ == "__main__":
