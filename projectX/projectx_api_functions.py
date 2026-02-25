@@ -238,13 +238,13 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
         delta = timedelta(seconds=unit_number * num_bars*200)
 
     elif unit == 2:  # Minutes
-        delta = timedelta(minutes=unit_number * max([num_bars, 4320]))
+        delta = timedelta(minutes=unit_number * num_bars)
 
     elif unit == 3:  # Hours
-        delta = timedelta(hours=unit_number * max([num_bars, 72]))
+        delta = timedelta(hours=unit_number * num_bars)
 
     elif unit == 4:  # Days
-        delta = timedelta(days=unit_number * max([num_bars, 3]))
+        delta = timedelta(days=unit_number * num_bars)
 
     else:
         raise ValueError("Unsupported unit")
