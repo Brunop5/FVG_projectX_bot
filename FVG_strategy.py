@@ -38,7 +38,7 @@ APIS = {
         "assets_list": [
             ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
             ("CON.F.US.RTY.H26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.MCLE.H26", "15min", "50KTC-V2-252499-69493223"),
+            ("CON.F.US.MCLE.J26", "15min", "50KTC-V2-252499-69493223"),
             ("CON.F.US.M2K.H26", "15min", "50KTC-V2-252499-69493223"),
         ]
     },
@@ -51,7 +51,6 @@ APIS = {
             ("CON.F.US.SIL.H26", "15min", "50KTC-V2-498538-71564652"),
             ("CON.F.US.MYM.H26", "15min", "50KTC-V2-498538-71564652"),
             ("CON.F.US.MES.H26", "15min", "50KTC-V2-498538-71564652"),
-            ("CON.F.US.M2K.H26", "15min", "50KTC-V2-498538-71564652")
         ]
     }
 }
@@ -59,7 +58,7 @@ APIS = {
 
 # ====================
 # if true, updates contracts.csv - this should be done at least monthly
-UPDATE_CONTRACT_LIST = False
+UPDATE_CONTRACT_LIST = True
 
 # if true it will print the list of valid accounts for this api key
 SHOW_ACCOUNTS = False
@@ -796,20 +795,29 @@ class FVG_Strategy(Strategy):
                 self._intrabar_price = tick_price
                 self._intrabar_high = tick_high
                 self._intrabar_low = tick_low
-                # Update latest bar with intrabar values for live touch checks
+                # Use intrabar values for live checks without persisting them to history.
                 if self.data is not None and len(self.data) > 0:
                     last_index = self.data.index[-1]
-                    if "high" in self.data.columns:
-                        self.data.at[last_index, "high"] = max(
-                            float(self.data.at[last_index, "high"]), tick_high
-                        )
-                    if "low" in self.data.columns:
-                        self.data.at[last_index, "low"] = min(
-                            float(self.data.at[last_index, "low"]), tick_low
-                        )
-                    if "close" in self.data.columns:
-                        self.data.at[last_index, "close"] = tick_price
-                self.entry_logic()
+                    orig_high = self.data.at[last_index, "high"] if "high" in self.data.columns else None
+                    orig_low = self.data.at[last_index, "low"] if "low" in self.data.columns else None
+                    orig_close = self.data.at[last_index, "close"] if "close" in self.data.columns else None
+                    try:
+                        if "high" in self.data.columns:
+                            self.data.at[last_index, "high"] = tick_high
+                        if "low" in self.data.columns:
+                            self.data.at[last_index, "low"] = tick_low
+                        if "close" in self.data.columns:
+                            self.data.at[last_index, "close"] = tick_price
+                        self.entry_logic()
+                    finally:
+                        if orig_high is not None:
+                            self.data.at[last_index, "high"] = orig_high
+                        if orig_low is not None:
+                            self.data.at[last_index, "low"] = orig_low
+                        if orig_close is not None:
+                            self.data.at[last_index, "close"] = orig_close
+                else:
+                    self.entry_logic()
 
     def add_fvg_zones(self):
         # === FVG ZONE CREATION (equivalent to the box.new blocks) ===
