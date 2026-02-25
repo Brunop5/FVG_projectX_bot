@@ -25,6 +25,15 @@ TIMEFRAME_SECONDS = {
 TOPSTEPX_MAX_CONCURRENCY = int(os.getenv("TOPSTEPX_MAX_CONCURRENCY", "4"))
 _TOPSTEPX_SEMAPHORE = threading.BoundedSemaphore(TOPSTEPX_MAX_CONCURRENCY)
 DEFAULT_TOPSTEPX_TIMEOUT = (5, 30)
+_TOPSTEPX_SESSION = requests.Session()
+_TOPSTEPX_SESSION.mount(
+    "https://",
+    requests.adapters.HTTPAdapter(
+        pool_connections=TOPSTEPX_MAX_CONCURRENCY,
+        pool_maxsize=TOPSTEPX_MAX_CONCURRENCY,
+        max_retries=0,
+    ),
+)
 
 
 def _seconds_until_sunday_18_et(now_et: datetime | None = None) -> float:
@@ -68,7 +77,7 @@ def _compute_retry_delay(attempt: int, base_seconds: float = 5.0, max_seconds: f
 
 def topstepx_post(url: str, headers: dict, payload: dict, timeout=DEFAULT_TOPSTEPX_TIMEOUT):
     with _TOPSTEPX_SEMAPHORE:
-        return requests.post(url, headers=headers, json=payload, timeout=timeout)
+        return _TOPSTEPX_SESSION.post(url, headers=headers, json=payload, timeout=timeout)
 
 def login_to_api(user_name, api_key):
     url = "https://api.topstepx.com/api/Auth/loginKey"
@@ -335,10 +344,13 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
     
         except requests.exceptions.RequestException as e:
             status_code = getattr(getattr(e, "response", None), "status_code", None)
-            if status_code in retryable_statuses or "502" in str(e):
+            is_timeout = isinstance(e, requests.exceptions.Timeout)
+            is_conn_error = isinstance(e, requests.exceptions.ConnectionError)
+            if is_timeout or is_conn_error or status_code in retryable_statuses or "502" in str(e):
                 delay = _compute_retry_delay(attempt)
+                reason = "timeout" if is_timeout else "connection error" if is_conn_error else "request error"
                 print(
-                    f"⚠️  Request error from TopStepX: {e}. Retrying in {int(delay)}s "
+                    f"⚠️  TopStepX {reason}: {e}. Retrying in {int(delay)}s "
                     f"(attempt {attempt})."
                 )
                 _wait_before_retry_for_weekend(delay)
