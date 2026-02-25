@@ -4,6 +4,7 @@ import time
 import requests
 import random
 import threading
+import socket
 from datetime import datetime, timedelta, timezone
 import logging
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -34,6 +35,12 @@ _TOPSTEPX_SESSION.mount(
         max_retries=0,
     ),
 )
+
+# Force IPv4 if IPv6 DNS/resolution is unreliable (common on some VMs).
+try:
+    requests.packages.urllib3.util.connection.allowed_gai_family = lambda: socket.AF_INET
+except Exception:
+    pass
 
 
 def _seconds_until_sunday_18_et(now_et: datetime | None = None) -> float:
