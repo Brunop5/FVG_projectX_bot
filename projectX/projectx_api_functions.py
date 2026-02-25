@@ -273,15 +273,7 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
     while True:
         attempt += 1
         try:
-            req_start = time.monotonic()
             response = topstepx_post(url, headers=headers, payload=payload, timeout=DEFAULT_TOPSTEPX_TIMEOUT)
-            req_elapsed = time.monotonic() - req_start
-            print(
-                "🕒 TopStepX request completed in "
-                f"{req_elapsed:.2f}s "
-                f"(status {response.status_code}, "
-                f"asset {asset}, tf {timeframe}, limit {num_bars})"
-            )
             if response.status_code == 200:
                 try:
                     payload_json = response.json()
@@ -358,17 +350,15 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
             return None
     
         except requests.exceptions.RequestException as e:
-            req_elapsed = time.monotonic() - req_start if "req_start" in locals() else None
             status_code = getattr(getattr(e, "response", None), "status_code", None)
             is_timeout = isinstance(e, requests.exceptions.Timeout)
             is_conn_error = isinstance(e, requests.exceptions.ConnectionError)
             if is_timeout or is_conn_error or status_code in retryable_statuses or "502" in str(e):
                 delay = _compute_retry_delay(attempt)
                 reason = "timeout" if is_timeout else "connection error" if is_conn_error else "request error"
-                elapsed_msg = f"{req_elapsed:.2f}s" if req_elapsed is not None else "unknown"
                 print(
-                    f"⚠️  TopStepX {reason} after {elapsed_msg}: {e}. "
-                    f"Retrying in {int(delay)}s (attempt {attempt})."
+                    f"⚠️  TopStepX {reason}: {e}. Retrying in {int(delay)}s "
+                    f"(attempt {attempt})."
                 )
                 _wait_before_retry_for_weekend(delay)
                 continue
