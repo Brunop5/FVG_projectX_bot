@@ -26,6 +26,7 @@ TIMEFRAME_SECONDS = {
 TOPSTEPX_MAX_CONCURRENCY = int(os.getenv("TOPSTEPX_MAX_CONCURRENCY", "4"))
 _TOPSTEPX_SEMAPHORE = threading.BoundedSemaphore(TOPSTEPX_MAX_CONCURRENCY)
 DEFAULT_TOPSTEPX_TIMEOUT = (5, 30)
+TOPSTEPX_MAX_RETRY_SECONDS = int(os.getenv("TOPSTEPX_MAX_RETRY_SECONDS", "600"))
 _TOPSTEPX_SESSION = requests.Session()
 _TOPSTEPX_SESSION.mount(
     "https://",
@@ -60,7 +61,10 @@ def _seconds_until_sunday_18_et(now_et: datetime | None = None) -> float:
     return max(0.0, (target - now_et).total_seconds())
 
 
-def _wait_before_retry_for_weekend(fallback_seconds: float = 10.0) -> float:
+def _wait_before_retry_for_weekend(
+    fallback_seconds: float = 10.0,
+    max_wait_seconds: float | None = None,
+) -> float:
     wait_seconds = _seconds_until_sunday_18_et()
     if wait_seconds > 0:
         wait_minutes = int(wait_seconds // 60)
@@ -71,6 +75,10 @@ def _wait_before_retry_for_weekend(fallback_seconds: float = 10.0) -> float:
         )
     else:
         wait_seconds = fallback_seconds
+    if max_wait_seconds is not None:
+        wait_seconds = min(wait_seconds, max_wait_seconds)
+    if wait_seconds <= 0:
+        return 0.0
     time.sleep(wait_seconds)
     return wait_seconds
 
@@ -203,7 +211,15 @@ def _map_timeframe_to_unit(timeframe: str):
     # Fallback (minutes)
     return 2, number
 
-def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_partial_bar=False):
+def fetch_data(
+    asset,
+    timeframe,
+    num_bars,
+    auth_token=None,
+    live=False,
+    include_partial_bar=False,
+    max_retry_seconds: float | None = TOPSTEPX_MAX_RETRY_SECONDS,
+):
 
     """
     Fetch historical bar data from TopStepX API.
@@ -269,6 +285,20 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
     
     retryable_statuses = {429, 500, 502, 503, 504, 520, 522, 524}
     attempt = 0
+    retry_start = time.monotonic()
+    if max_retry_seconds is not None and max_retry_seconds <= 0:
+        max_retry_seconds = None
+
+    def _retry_budget_exhausted() -> bool:
+        if max_retry_seconds is None:
+            return False
+        return (time.monotonic() - retry_start) >= max_retry_seconds
+
+    def _remaining_retry_seconds() -> float | None:
+        if max_retry_seconds is None:
+            return None
+        remaining = max_retry_seconds - (time.monotonic() - retry_start)
+        return max(0.0, remaining)
 
     while True:
         attempt += 1
@@ -286,7 +316,14 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
                         f"⚠️  Invalid JSON from TopStepX. Retrying in {int(delay)}s "
                         f"(attempt {attempt}). Body: {body_preview}"
                     )
-                    _wait_before_retry_for_weekend(delay)
+                    if _retry_budget_exhausted():
+                        print(
+                            "⚠️  TopStepX retry budget exceeded; returning None to avoid hang."
+                        )
+                        return None
+                    _wait_before_retry_for_weekend(
+                        delay, max_wait_seconds=_remaining_retry_seconds()
+                    )
                     continue
 
                 # Parse response - assuming it returns JSON array of bars
@@ -300,7 +337,14 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
                         f"⚠️  Missing 'bars' in TopStepX response. Retrying in {int(delay)}s "
                         f"(attempt {attempt}). Body: {body_preview}"
                     )
-                    _wait_before_retry_for_weekend(delay)
+                    if _retry_budget_exhausted():
+                        print(
+                            "⚠️  TopStepX retry budget exceeded; returning None to avoid hang."
+                        )
+                        return None
+                    _wait_before_retry_for_weekend(
+                        delay, max_wait_seconds=_remaining_retry_seconds()
+                    )
                     continue
 
                 # Convert to DataFrame
@@ -344,7 +388,14 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
                     f"⚠️  {response.status_code} from TopStepX. Retrying in {int(delay)}s "
                     f"(attempt {attempt}). Body: {body_preview}"
                 )
-                _wait_before_retry_for_weekend(delay)
+                if _retry_budget_exhausted():
+                    print(
+                        "⚠️  TopStepX retry budget exceeded; returning None to avoid hang."
+                    )
+                    return None
+                _wait_before_retry_for_weekend(
+                    delay, max_wait_seconds=_remaining_retry_seconds()
+                )
                 continue
             print(f"Error fetching data: {response.status_code} - {response.text}")
             return None
@@ -360,7 +411,14 @@ def fetch_data(asset, timeframe, num_bars, auth_token=None, live=False, include_
                     f"⚠️  TopStepX {reason}: {e}. Retrying in {int(delay)}s "
                     f"(attempt {attempt})."
                 )
-                _wait_before_retry_for_weekend(delay)
+                if _retry_budget_exhausted():
+                    print(
+                        "⚠️  TopStepX retry budget exceeded; returning None to avoid hang."
+                    )
+                    return None
+                _wait_before_retry_for_weekend(
+                    delay, max_wait_seconds=_remaining_retry_seconds()
+                )
                 continue
             print(f"Request error: {str(e)}")
             return None
