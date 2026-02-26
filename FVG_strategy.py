@@ -821,6 +821,64 @@ class FVG_Strategy(Strategy):
 
     def add_fvg_zones(self):
         # === FVG ZONE CREATION (equivalent to the box.new blocks) ===
+        gap_close = self.data["close"].iloc[-3]
+        bull_power_pct = (
+            (self.data["low"].iloc[-1] - self.data["high"].iloc[-3])
+            / gap_close
+            * 100
+        )
+        bear_power_pct = (
+            (self.data["low"].iloc[-3] - self.data["high"].iloc[-1])
+            / gap_close
+            * 100
+        )
+
+        if self.lastBullFvg and not (
+            self.bullishPowerOK and self.isBullishHTF and self.marketOK
+        ):
+            reasons = []
+            if not self.bullishPowerOK:
+                reasons.append("power<min")
+            if not self.isBullishHTF:
+                reasons.append("HTF not bullish")
+            if not self.marketOK:
+                reasons.append("marketOK false")
+            reason_text = ", ".join(reasons) if reasons else "unknown"
+            print("🚨 FVG FOUND BUT ZONE NOT CREATED (BULL)")
+            print(f"Reason(s): {reason_text}")
+            print(
+                "Criteria: "
+                f"lastBullFvg={self.lastBullFvg} "
+                f"powerPct={bull_power_pct:.5f} "
+                f"minPowerPct={MIN_FVG_POWER_PCT:.5f} "
+                f"bullishPowerOK={self.bullishPowerOK} "
+                f"isBullishHTF={self.isBullishHTF} "
+                f"marketOK={self.marketOK}"
+            )
+
+        if self.lastBearFvg and not (
+            self.bearishPowerOK and self.isBearishHTF and self.marketOK
+        ):
+            reasons = []
+            if not self.bearishPowerOK:
+                reasons.append("power<min")
+            if not self.isBearishHTF:
+                reasons.append("HTF not bearish")
+            if not self.marketOK:
+                reasons.append("marketOK false")
+            reason_text = ", ".join(reasons) if reasons else "unknown"
+            print("🚨 FVG FOUND BUT ZONE NOT CREATED (BEAR)")
+            print(f"Reason(s): {reason_text}")
+            print(
+                "Criteria: "
+                f"lastBearFvg={self.lastBearFvg} "
+                f"powerPct={bear_power_pct:.5f} "
+                f"minPowerPct={MIN_FVG_POWER_PCT:.5f} "
+                f"bearishPowerOK={self.bearishPowerOK} "
+                f"isBearishHTF={self.isBearishHTF} "
+                f"marketOK={self.marketOK}"
+            )
+
         if self.bullishPowerOK and self.isBullishHTF and self.marketOK:
             # Bullish FVG uses low[1] as top and high[3] as bottom in Pine
             self.fvg_zones.append(
@@ -1041,7 +1099,6 @@ class FVG_Strategy(Strategy):
                 else:
                     self._partial_groups.pop(group_id, None)
                 break
-
 
 
             elif (
