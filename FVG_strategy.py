@@ -924,14 +924,35 @@ class FVG_Strategy(Strategy):
         atrVal = get_atr(self.data, ATR_PERIOD)
         atr_sma = sma(atrVal, 20) if len(atrVal) > 0 else None
         atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
+        atr_last = atrVal.iloc[-1] if len(atrVal) > 0 else None
         
         if USE_VOLUME_CHECK:
             vol_sma = sma(self.data["volume"], 20)
             volOK = self.cur_volume > vol_sma * VOLUME_MULTIPLIER if vol_sma is not None else False
             self.marketOK = volOK and atrOK
+            print(
+                "🧪 marketOK layers: "
+                f"USE_VOLUME_CHECK={USE_VOLUME_CHECK} "
+                f"atr={atr_last} "
+                f"atr_sma={atr_sma} "
+                f"atrOK={atrOK} "
+                f"cur_volume={self.cur_volume} "
+                f"vol_sma={vol_sma} "
+                f"vol_mult={VOLUME_MULTIPLIER} "
+                f"volOK={volOK} "
+                f"marketOK={self.marketOK}"
+            )
         else:
             # Skip volume check, only use ATR
             self.marketOK = atrOK
+            print(
+                "🧪 marketOK layers: "
+                f"USE_VOLUME_CHECK={USE_VOLUME_CHECK} "
+                f"atr={atr_last} "
+                f"atr_sma={atr_sma} "
+                f"atrOK={atrOK} "
+                f"marketOK={self.marketOK}"
+            )
 
 
         self.lastBullFvg = self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
