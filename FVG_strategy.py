@@ -924,7 +924,7 @@ class FVG_Strategy(Strategy):
         print(len(self.data), ATR_PERIOD)
         atrVal = get_atr(self.data, ATR_PERIOD)
         print(len(atrVal))
-        atr_sma = sma(atrVal, 20) if len(atrVal) > 0 else None
+        atr_sma = sma(atrVal, min(20, len(atrVal))) if len(atrVal) > 0 else None
         print(atr_sma)
         atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
         atr_last = atrVal.iloc[-1] if len(atrVal) > 0 else None
