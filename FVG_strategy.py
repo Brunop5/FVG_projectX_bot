@@ -833,6 +833,29 @@ class FVG_Strategy(Strategy):
             * 100
         )
 
+        def _print_marketok_layers(tag: str) -> None:
+            dbg = getattr(self, "_marketok_debug", None)
+            if not isinstance(dbg, dict):
+                return
+            print(
+                f"🧪 marketOK layers ({tag}): "
+                f"USE_VOLUME_CHECK={dbg.get('use_volume_check')} "
+                f"atr={dbg.get('atr')} "
+                f"atr_sma={dbg.get('atr_sma')} "
+                f"atrOK={dbg.get('atr_ok')} "
+                f"cur_volume={dbg.get('cur_volume')} "
+                f"vol_sma={dbg.get('vol_sma')} "
+                f"vol_mult={dbg.get('vol_mult')} "
+                f"volOK={dbg.get('vol_ok')} "
+                f"marketOK={dbg.get('market_ok')}"
+            )
+
+        if self.lastBullFvg and self.bullishPowerOK and self.isBullishHTF:
+            _print_marketok_layers("BULL")
+
+        if self.lastBearFvg and self.bearishPowerOK and self.isBearishHTF:
+            _print_marketok_layers("BEAR")
+
         if self.lastBullFvg and not (
             self.bullishPowerOK and self.isBullishHTF and self.marketOK
         ):
@@ -921,41 +944,32 @@ class FVG_Strategy(Strategy):
             self.isBullishHTF = self.cur_close > htfEMA
             self.isBearishHTF = self.cur_close < htfEMA
 
-        print(len(self.data), ATR_PERIOD)
         atrVal = get_atr(self.data, ATR_PERIOD)
-        print(len(atrVal))
         atr_sma = sma(atrVal, min(20, len(atrVal))) if len(atrVal) > 0 else None
-        print(atr_sma)
         atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
         atr_last = atrVal.iloc[-1] if len(atrVal) > 0 else None
-        
+        vol_sma = None
+        volOK = None
+
         if USE_VOLUME_CHECK:
             vol_sma = sma(self.data["volume"], 20)
             volOK = self.cur_volume > vol_sma * VOLUME_MULTIPLIER if vol_sma is not None else False
             self.marketOK = volOK and atrOK
-            print(
-                "🧪 marketOK layers: "
-                f"USE_VOLUME_CHECK={USE_VOLUME_CHECK} "
-                f"atr={atr_last} "
-                f"atr_sma={atr_sma} "
-                f"atrOK={atrOK} "
-                f"cur_volume={self.cur_volume} "
-                f"vol_sma={vol_sma} "
-                f"vol_mult={VOLUME_MULTIPLIER} "
-                f"volOK={volOK} "
-                f"marketOK={self.marketOK}"
-            )
         else:
             # Skip volume check, only use ATR
             self.marketOK = atrOK
-            print(
-                "🧪 marketOK layers: "
-                f"USE_VOLUME_CHECK={USE_VOLUME_CHECK} "
-                f"atr={atr_last} "
-                f"atr_sma={atr_sma} "
-                f"atrOK={atrOK} "
-                f"marketOK={self.marketOK}"
-            )
+
+        self._marketok_debug = {
+            "use_volume_check": USE_VOLUME_CHECK,
+            "atr": atr_last,
+            "atr_sma": atr_sma,
+            "atr_ok": atrOK,
+            "cur_volume": self.cur_volume,
+            "vol_sma": vol_sma,
+            "vol_mult": VOLUME_MULTIPLIER,
+            "vol_ok": volOK,
+            "market_ok": self.marketOK,
+        }
 
 
         self.lastBullFvg = self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
