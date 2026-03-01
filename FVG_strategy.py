@@ -32,27 +32,27 @@ from strategyTemplate import Strategy, Order
 # if "username", "api_key", "assets_list" or even the actual ones are spelled wrong, it wont work
 
 APIS = {
-    "Personal account": {
-        "username": "Marrove",
-        "api_key": "z8Xnx8AJQyciYe/q/+NXTKZoTYZhSiLj/C52ka2vKzM=",
-        "assets_list": [
-            ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.RTY.H26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.MCLE.J26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.M2K.H26", "15min", "50KTC-V2-252499-69493223"),
-        ]
-    },
-
-    # "Wifes account": {
-    #     "username": "afribuymoz@gmail.com",
-    #     "api_key": "NEV2P9zTW7+cTNDi/yW8rcjn22EAPH8/t6SgxObrVvM=",
+    # "Personal account": {
+    #     "username": "Marrove",
+    #     "api_key": "z8Xnx8AJQyciYe/q/+NXTKZoTYZhSiLj/C52ka2vKzM=",
     #     "assets_list": [
-    #         ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-498538-71564652"),
-    #         ("CON.F.US.SIL.H26", "15min", "50KTC-V2-498538-71564652"),
-    #         ("CON.F.US.MYM.H26", "15min", "50KTC-V2-498538-71564652"),
-    #         ("CON.F.US.MES.H26", "15min", "50KTC-V2-498538-71564652"),
+    #         ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
+    #         ("CON.F.US.RTY.H26", "15min", "50KTC-V2-252499-69493223"),
+    #         ("CON.F.US.MCLE.J26", "15min", "50KTC-V2-252499-69493223"),
+    #         ("CON.F.US.M2K.H26", "15min", "50KTC-V2-252499-69493223"),
     #     ]
-    # }
+    # },
+
+    "Wifes account": {
+        "username": "afribuymoz@gmail.com",
+        "api_key": "NEV2P9zTW7+cTNDi/yW8rcjn22EAPH8/t6SgxObrVvM=",
+        "assets_list": [
+            ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-498538-71564652"),
+            ("CON.F.US.SIL.H26", "15min", "50KTC-V2-498538-71564652"),
+            ("CON.F.US.MYM.H26", "15min", "50KTC-V2-498538-71564652"),
+            ("CON.F.US.MES.H26", "15min", "50KTC-V2-498538-71564652"),
+        ]
+    }
 }
 
 
