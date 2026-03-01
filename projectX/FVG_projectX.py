@@ -72,6 +72,7 @@ def setup_global_logging(log_path: str) -> None:
 def init_api(username, api_key):
     res = login_to_api(username, api_key)
     if not res["success"]:
+        print(username, api_key)
         raise RuntimeError("❌ API login failed")
 
     global_token = res["token"]
