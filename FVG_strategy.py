@@ -43,16 +43,16 @@ APIS = {
         ]
     },
 
-    "Wifes account": {
-        "username": "afribuymoz@gmail.com",
-        "api_key": "NEV2P9zTW7+cTNDi/yW8rcjn22EAPH8/t6SgxObrVvM=",
-        "assets_list": [
-            ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-498538-71564652"),
-            ("CON.F.US.SIL.H26", "15min", "50KTC-V2-498538-71564652"),
-            ("CON.F.US.MYM.H26", "15min", "50KTC-V2-498538-71564652"),
-            ("CON.F.US.MES.H26", "15min", "50KTC-V2-498538-71564652"),
-        ]
-    }
+    # "Wifes account": {
+    #     "username": "afribuymoz@gmail.com",
+    #     "api_key": "NEV2P9zTW7+cTNDi/yW8rcjn22EAPH8/t6SgxObrVvM=",
+    #     "assets_list": [
+    #         ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-498538-71564652"),
+    #         ("CON.F.US.SIL.H26", "15min", "50KTC-V2-498538-71564652"),
+    #         ("CON.F.US.MYM.H26", "15min", "50KTC-V2-498538-71564652"),
+    #         ("CON.F.US.MES.H26", "15min", "50KTC-V2-498538-71564652"),
+    #     ]
+    # }
 }
 
 
