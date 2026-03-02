@@ -68,25 +68,25 @@ SHOW_ACCOUNTS = False
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 9              # Number of FVGs to work with
+FVG_HISTORY_NBR = 1              # Number of FVGs to work with
 MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 100                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.3
+HTF_TF = "30"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 15                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.2
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 18                    # ATR Period (min 1)
-SL_MULTIPLIER = 5.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 20               # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 23                    # ATR Period (min 1)
+SL_MULTIPLIER = 6.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 7                # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 1            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+TRAIL_OFFSET_MULT = 4            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
@@ -98,18 +98,18 @@ RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPer
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
 # Partial close sizing and ATR steps
-SPLIT_ORDERS_ENABLED = False        # If False, place a single order with FIXED_LOT
+SPLIT_ORDERS_ENABLED = True        # If False, place a single order with FIXED_LOT
 EACH_TRADE_SIZE = 1                # Size per child order when splitting FIXED_LOT
 PARTIAL_TP_ATR_STEP = 1  # ATR step size for favorable partial closes
 PARTIAL_SL_ATR_STEP = 2  # ATR step size for adverse partial closes
 PARTIAL_TP_CLOSE_SIZE = 1  # Size to close per favorable step (multiple of EACH_TRADE_SIZE)
 PARTIAL_SL_CLOSE_SIZE = 2  # Size to close per adverse step (multiple of EACH_TRADE_SIZE)
-ENABLE_PARTIAL_TP = False
-ENABLE_PARTIAL_SL = False
+ENABLE_PARTIAL_TP = True
+ENABLE_PARTIAL_SL = True
 
 # Daily Trading Limits
 MAX_DAILY_TRADES = 3
-ENABLE_DAILY_PNL_LIMITS = False
+ENABLE_DAILY_PNL_LIMITS = True
 MAX_DAILY_GAIN = 1480
 MAX_DAILY_LOSS = 1000
 
@@ -120,7 +120,7 @@ DEBUG_FVG = True
 STARTING_PNL = 500.0
 
 # Max drawdown protection (per strategy instance)
-MAX_DRAWDOWN_ENABLED = False
+MAX_DRAWDOWN_ENABLED = True
 MAX_DRAWDOWN_PCT = 50.0
 
 # Pyramiding (client mode)
