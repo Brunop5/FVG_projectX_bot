@@ -377,6 +377,7 @@ class Tradovate_Strategy(FVG_Strategy):
             raise RuntimeError("Missing Tradovate account ID.")
         self.account_balance = self._client.get_account_balance(self.account_id)
         super().__init__()
+        self.require_intrabar_entry = True
 
     def api_order_kwargs(self) -> dict:
         return {

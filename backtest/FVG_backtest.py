@@ -15,31 +15,31 @@ PARENT_DIR = Path(__file__).parents[1]
 CURRENT_DIR = Path(__file__).parent / "GOLD_BACKTEST_NEW"
 
 # ==================== USER CONFIG ====================
-ASSET = "MGCJ6"
+ASSET = "BTC"
 TIMEFRAME = "15m"
-INITIAL_BALANCE = 50000.0
-DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "MGCG6" / "IC_markets_15min.csv")
+INITIAL_BALANCE = 50
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
 START_TIMESTAMP = "1755528300000"
 
 # Pyramiding mode: "none", "client_atr", or "max_orders"
-PYRAMIDING_MODE = "client_atr" # remake to str enum
+PYRAMIDING_MODE = "none" # remake to str enum
 MAX_PYRAMID_ORDERS = 3
 
 # Backtest data window (bars)
 BACKTEST_WINDOW_BARS = None
 
 # Contract / fee inputs
-USE_CONTRACTS_CSV = True
+USE_CONTRACTS_CSV = False
 CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
-USE_ROUND_TURN_FEE = True
+USE_ROUND_TURN_FEE = False
 ROUND_TURN_FEE_USD = 3.5
 
 # Margin trading inputs
-USE_MARGIN_PRICING = False  # If False, use ROUND_TURN_FEE_USD (if enabled)
+USE_MARGIN_PRICING = True  # If False, use ROUND_TURN_FEE_USD (if enabled)
 FEE_PCT = 0.001  # Round-turn fee as % of notional
 LEVERAGE = 50
 # Position sizing inputs (backtest only)
-USE_MARGIN_PER_TRADE = False
+USE_MARGIN_PER_TRADE = True
 MARGIN_PER_TRADE_USD = 10
 
 # CSV output options
@@ -210,6 +210,7 @@ class FVG_Backtest(FVG_Strategy):
             self._load_contract_info()
         self._configure_pyramiding(pyramiding_mode)
         super().__init__()
+        self.require_intrabar_entry = True
 
     def api_order_kwargs(self) -> dict:
         return {}
@@ -367,19 +368,25 @@ class FVG_Backtest(FVG_Strategy):
         if "close" in df.columns:
             df["htf_ema"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
 
-        # === Precompute ATR and its SMA ===
+        # === Precompute ATR (full series) and its SMA ===
         try:
-            atr_series = get_atr(df, ATR_PERIOD)
-        except Exception:
-            atr_series = None
-
-        if atr_series is not None and len(atr_series) > 0:
-            # Align ATR series back to full DataFrame index
+            high = df["high"]
+            low = df["low"]
+            close = df["close"]
+            tr1 = high - low
+            tr2 = (high - close.shift(1)).abs()
+            tr3 = (low - close.shift(1)).abs()
+            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             full_atr = pd.Series(index=df.index, dtype=float)
-            start_idx = ATR_PERIOD - 1
-            full_atr.iloc[start_idx:] = atr_series.values
+            if len(true_range) >= ATR_PERIOD:
+                full_atr.iloc[ATR_PERIOD - 1] = true_range.iloc[:ATR_PERIOD].mean()
+                for i in range(ATR_PERIOD, len(true_range)):
+                    prev_atr = full_atr.iloc[i - 1]
+                    full_atr.iloc[i] = (prev_atr * (ATR_PERIOD - 1) + true_range.iloc[i]) / ATR_PERIOD
             df["atr"] = full_atr
             df["atr_sma"] = full_atr.rolling(20, min_periods=1).mean()
+        except Exception:
+            pass
 
         # === Precompute volume SMA used for volume check ===
         if "volume" in df.columns:
@@ -474,8 +481,6 @@ class FVG_Backtest(FVG_Strategy):
 
     def gather_data(self) -> pd.DataFrame:
         self._full_data = self._load_data()
-        # Precompute heavy indicators once, to speed up per-bar loop
-        self._precompute_indicators()
         warmup = self._warmup_bars or self._infer_warmup()
         if len(self._full_data) < warmup:
             raise ValueError("Not enough bars for warmup/backtest.")
@@ -578,16 +583,13 @@ class FVG_Backtest(FVG_Strategy):
             self.isBullishHTF = self.cur_close > htfEMA
             self.isBearishHTF = self.cur_close < htfEMA
 
-        atr_val = None
+        atr_val = get_atr(self.data, ATR_PERIOD)
+        atr_val = atr_val.iloc[-1] if (atr_val is not None and len(atr_val) > 0) else None
         atr_sma = None
-        if (
-            self._full_data is not None
-            and "atr" in self._full_data.columns
-            and "atr_sma" in self._full_data.columns
-            and self._current_index is not None
-        ):
-            atr_val = self._full_data["atr"].iloc[self._current_index]
-            atr_sma = self._full_data["atr_sma"].iloc[self._current_index]
+        if atr_val is not None:
+            atr_series = get_atr(self.data, ATR_PERIOD)
+            if atr_series is not None and len(atr_series) > 0:
+                atr_sma = sma(atr_series, min(20, len(atr_series)))
         atrOK = (
             atr_val > atr_sma
             if (atr_val is not None and atr_sma is not None and pd.notna(atr_val) and pd.notna(atr_sma))
@@ -595,21 +597,26 @@ class FVG_Backtest(FVG_Strategy):
         )
 
         if USE_VOLUME_CHECK:
-            vol_sma = None
-            if (
-                self._full_data is not None
-                and "vol_sma" in self._full_data.columns
-                and self._current_index is not None
-            ):
-                vol_sma = self._full_data["vol_sma"].iloc[self._current_index]
-            volOK = (
-                self.cur_volume > vol_sma * VOLUME_MULTIPLIER
-                if (vol_sma is not None and pd.notna(vol_sma))
-                else False
-            )
+            vol_sma = sma(self.data["volume"], 20)
+            volOK = self.cur_volume > vol_sma * VOLUME_MULTIPLIER if vol_sma is not None else False
             self.marketOK = volOK and atrOK
         else:
             self.marketOK = atrOK
+
+        if not self.marketOK:
+            print(
+                f"🧪 marketOK layers: "
+                f"USE_VOLUME_CHECK={USE_VOLUME_CHECK} "
+                f"atr={atr_val} "
+                f"atr_sma={atr_sma} "
+                f"atrOK={atrOK} "
+                f"cur_volume={self.cur_volume} "
+                f"vol_sma={vol_sma if USE_VOLUME_CHECK else None} "
+                f"vol_mult={VOLUME_MULTIPLIER} "
+                f"volOK={volOK if USE_VOLUME_CHECK else None} "
+                f"marketOK={self.marketOK}",
+                flush=True,
+            )
 
         self.lastBullFvg = (
             self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
@@ -853,46 +860,6 @@ class FVG_Backtest(FVG_Strategy):
             self.last_trade_date = str(today)
         return self.daily_trades_count < MAX_DAILY_TRADES
 
-    def _update_trend_indicators(self):
-        bars = self.fetch_htf_data()
-        htfEMA = ema(bars, EMA_PERIOD)
-        last_ts_raw = None
-        current_ts = None
-        full_ts_min = None
-        full_ts_max = None
-        if self.data is not None and len(self.data) > 0 and "timestamp" in self.data.columns:
-            last_ts_raw = self.data["timestamp"].iloc[-1]
-            current_ts = self._extract_bar_time(self.data.iloc[[-1]])
-        if self._full_data is not None and "timestamp" in self._full_data.columns:
-            full_ts_min = self._full_data["timestamp"].iloc[0]
-            full_ts_max = self._full_data["timestamp"].iloc[-1]
-
-        if htfEMA is None:
-            self.isBullishHTF = False
-            self.isBearishHTF = False
-        else:
-            self.isBullishHTF = self.cur_close > htfEMA
-            self.isBearishHTF = self.cur_close < htfEMA
-
-        atrVal = get_atr(self.data, ATR_PERIOD)
-        atr_sma = sma(atrVal, 20) if len(atrVal) > 0 else None
-        atrOK = atrVal.iloc[-1] > atr_sma if (len(atrVal) > 0 and atr_sma is not None) else False
-
-        if USE_VOLUME_CHECK:
-            vol_sma = sma(self.data["volume"], 20)
-            volOK = self.cur_volume > vol_sma * VOLUME_MULTIPLIER if vol_sma is not None else False
-            self.marketOK = volOK and atrOK
-        else:
-            # Skip volume check, only use ATR
-            self.marketOK = atrOK
-
-        self.lastBullFvg = (
-            self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
-        )
-        self.lastBearFvg = (
-            self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
-        )
-
     def calculate_order_size(self, atr, sl_mult):
         if USE_FIXED_LOT:
             return FIXED_LOT
@@ -1070,7 +1037,9 @@ class FVG_Backtest(FVG_Strategy):
                 continue
 
             self.update_indicators()
+            prev_zone_count = len(self.fvg_zones)
             self.add_fvg_zones()
+            created_new_zone = len(self.fvg_zones) > prev_zone_count
 
 
             if len(self.active_orders) > 0:
@@ -1167,6 +1136,9 @@ class FVG_Backtest(FVG_Strategy):
                 if self.account_balance <= 0:
                     self._stopped = True
                     break
+                if getattr(self, "require_intrabar_entry", False) and created_new_zone:
+                    self._cursor += 1
+                    continue
                 last_index = self.data.index[-1]
                 orig_high = self.data.at[last_index, "high"]
                 orig_low = self.data.at[last_index, "low"]
@@ -1174,8 +1146,12 @@ class FVG_Backtest(FVG_Strategy):
                     self.data.at[last_index, "high"] = self.cur_close
                     self.data.at[last_index, "low"] = self.cur_close
                 try:
+                    if getattr(self, "require_intrabar_entry", False):
+                        self._intrabar_mode = True
                     self.entry_logic()
                 finally:
+                    if getattr(self, "require_intrabar_entry", False):
+                        self._intrabar_mode = False
                     if not ALLOW_INTRACANDLE_ENTRY:
                         self.data.at[last_index, "high"] = orig_high
                         self.data.at[last_index, "low"] = orig_low
