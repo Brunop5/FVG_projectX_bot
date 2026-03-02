@@ -262,6 +262,7 @@ class ProjectX_Strategy(FVG_Strategy):
         self.account_balance = get_account_balance(self.account_id, self.auth_token)
 
         super().__init__()
+        self.require_intrabar_entry = True
         print("strat initializeds")
 
     
@@ -463,6 +464,14 @@ class ProjectX_Strategy(FVG_Strategy):
         print(f"{'='*60}")
         print(f"Timeframe: {self.timeframe}")
         print(f"HTF Bias: {HTF_TF}min | EMA Period: {EMA_PERIOD}")
+        tick_size, tick_value = self._get_contract_tick_info(self.asset)
+        if tick_size is not None and tick_value is not None:
+            print(
+                f"✅ Tick data loaded: size={tick_size} value={tick_value} "
+                f"for {self.asset}"
+            )
+        else:
+            print(f"⚠️  Tick data not available for {self.asset}")
 
 
         t1 = threading.Thread(target=self.start_bar_iterations)

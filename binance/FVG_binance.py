@@ -317,6 +317,7 @@ class Binance_Strategy(FVG_Strategy):
         self._sync_client_time()
         self.account_balance = self.get_account_balance()
         super().__init__()
+        self.require_intrabar_entry = True
 
     def api_order_kwargs(self) -> dict:
         return {"symbol": self.asset, "client": self._client}

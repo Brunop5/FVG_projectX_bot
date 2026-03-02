@@ -1,4 +1,5 @@
 import math
+import csv
 import pandas as pd
 import threading
 
@@ -67,25 +68,25 @@ SHOW_ACCOUNTS = False
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 1              # Number of FVGs to work with
+FVG_HISTORY_NBR = 9              # Number of FVGs to work with
 MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "30"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 15                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.2
+HTF_TF = "120"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 100                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.3
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 23                    # ATR Period (min 1)
-SL_MULTIPLIER = 6.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 7                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 18                    # ATR Period (min 1)
+SL_MULTIPLIER = 5.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 20               # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 4            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+TRAIL_OFFSET_MULT = 1            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
@@ -97,18 +98,18 @@ RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPer
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
 # Partial close sizing and ATR steps
-SPLIT_ORDERS_ENABLED = True        # If False, place a single order with FIXED_LOT
+SPLIT_ORDERS_ENABLED = False        # If False, place a single order with FIXED_LOT
 EACH_TRADE_SIZE = 1                # Size per child order when splitting FIXED_LOT
 PARTIAL_TP_ATR_STEP = 1  # ATR step size for favorable partial closes
 PARTIAL_SL_ATR_STEP = 2  # ATR step size for adverse partial closes
 PARTIAL_TP_CLOSE_SIZE = 1  # Size to close per favorable step (multiple of EACH_TRADE_SIZE)
 PARTIAL_SL_CLOSE_SIZE = 2  # Size to close per adverse step (multiple of EACH_TRADE_SIZE)
-ENABLE_PARTIAL_TP = True
-ENABLE_PARTIAL_SL = True
+ENABLE_PARTIAL_TP = False
+ENABLE_PARTIAL_SL = False
 
 # Daily Trading Limits
 MAX_DAILY_TRADES = 3
-ENABLE_DAILY_PNL_LIMITS = True
+ENABLE_DAILY_PNL_LIMITS = False
 MAX_DAILY_GAIN = 1480
 MAX_DAILY_LOSS = 1000
 
@@ -119,7 +120,7 @@ DEBUG_FVG = True
 STARTING_PNL = 500.0
 
 # Max drawdown protection (per strategy instance)
-MAX_DRAWDOWN_ENABLED = True
+MAX_DRAWDOWN_ENABLED = False
 MAX_DRAWDOWN_PCT = 50.0
 
 # Pyramiding (client mode)
@@ -306,6 +307,8 @@ class FVG_Strategy(Strategy):
         self._partial_groups = {}
         self._partial_group_counter = 0
         self._split_order_count = self._validate_split_config()
+        self.require_intrabar_entry = False
+        self._intrabar_mode = False
         self._partial_tp_close_count = (
             self._validate_partial_close_size(
                 PARTIAL_TP_CLOSE_SIZE,
@@ -333,6 +336,10 @@ class FVG_Strategy(Strategy):
         if not hasattr(self, "lockout_start_pnl"):
             self.lockout_start_pnl = None
         self.max_dd_triggered_until = None
+
+        if not hasattr(self, "trade_log_filename"):
+            base = os.path.splitext(self.csv_filename)[0] if getattr(self, "csv_filename", None) else "trade_log"
+            self.trade_log_filename = f"{base}_trades.csv"
 
         super().__init__()
         if not hasattr(self, "daily_realized_pnl"):
@@ -531,7 +538,68 @@ class FVG_Strategy(Strategy):
         self.daily_realized_pnl += pnl
         if hasattr(order, "realized_pnl"):
             order.realized_pnl = pnl
+        self._append_trade_log(order, exit_price, pnl, exit_timestamp)
         return pnl
+
+    def _append_trade_log(
+        self,
+        order: Order,
+        exit_price: float | None,
+        pnl: float,
+        exit_timestamp: datetime | None,
+    ) -> None:
+        try:
+            entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
+            if entry_price is None or exit_price is None:
+                return
+            entry_price = float(entry_price)
+            exit_price = float(exit_price)
+            size = float(order.order_size or 0.0)
+        except (TypeError, ValueError):
+            return
+        if size <= 0:
+            return
+        reason = getattr(order, "exit_reason", None) or ""
+        side = getattr(order, "side", None) or ""
+        asset = getattr(order, "asset_id", None) or getattr(self, "asset", "")
+        timestamp = exit_timestamp or self._get_current_timestamp()
+        if isinstance(timestamp, datetime):
+            timestamp = timestamp.isoformat()
+
+        log_path = getattr(self, "trade_log_filename", None)
+        if not log_path:
+            return
+        write_header = not os.path.exists(log_path)
+        try:
+            with open(log_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(
+                        [
+                            "timestamp",
+                            "asset",
+                            "side",
+                            "size",
+                            "entry_price",
+                            "exit_price",
+                            "reason",
+                            "pnl",
+                        ]
+                    )
+                writer.writerow(
+                    [
+                        timestamp,
+                        asset,
+                        side,
+                        size,
+                        entry_price,
+                        exit_price,
+                        reason,
+                        pnl,
+                    ]
+                )
+        except Exception:
+            return
 
     def _get_unrealized_pnl(self, current_price: float | None) -> float:
         if not self.active_orders:
@@ -849,7 +917,11 @@ class FVG_Strategy(Strategy):
                             self.data.at[last_index, "low"] = tick_low
                         if "close" in self.data.columns:
                             self.data.at[last_index, "close"] = tick_price
-                        self.entry_logic()
+                        self._intrabar_mode = True
+                        try:
+                            self.entry_logic()
+                        finally:
+                            self._intrabar_mode = False
                     finally:
                         if orig_high is not None:
                             self.data.at[last_index, "high"] = orig_high
@@ -858,7 +930,11 @@ class FVG_Strategy(Strategy):
                         if orig_close is not None:
                             self.data.at[last_index, "close"] = orig_close
                 else:
-                    self.entry_logic()
+                    self._intrabar_mode = True
+                    try:
+                        self.entry_logic()
+                    finally:
+                        self._intrabar_mode = False
 
     def add_fvg_zones(self):
         # === FVG ZONE CREATION (equivalent to the box.new blocks) ===
@@ -874,41 +950,10 @@ class FVG_Strategy(Strategy):
             * 100
         )
 
-        if DEBUG_FVG:
-            try:
-                h_m3 = float(self.data["high"].iloc[-3])
-                l_m1 = float(self.data["low"].iloc[-1])
-                l_m3 = float(self.data["low"].iloc[-3])
-                h_m1 = float(self.data["high"].iloc[-1])
-            except Exception:
-                h_m3 = l_m1 = l_m3 = h_m1 = float("nan")
-
-            print(
-                "🧪 FVG debug base: "
-                f"h[-3]={h_m3:.5f} l[-1]={l_m1:.5f} "
-                f"l[-3]={l_m3:.5f} h[-1]={h_m1:.5f} "
-                f"bull_flag={self.lastBullFvg} bear_flag={self.lastBearFvg} "
-                f"bullPowerPct={bull_power_pct:.5f} bearPowerPct={bear_power_pct:.5f} "
-                f"isBullishHTF={self.isBullishHTF} isBearishHTF={self.isBearishHTF} "
-                f"marketOK={self.marketOK}"
-            )
-
         def _print_marketok_layers(tag: str) -> None:
             dbg = getattr(self, "_marketok_debug", None)
             if not isinstance(dbg, dict):
                 return
-            print(
-                f"🧪 marketOK layers ({tag}): "
-                f"USE_VOLUME_CHECK={dbg.get('use_volume_check')} "
-                f"atr={dbg.get('atr')} "
-                f"atr_sma={dbg.get('atr_sma')} "
-                f"atrOK={dbg.get('atr_ok')} "
-                f"cur_volume={dbg.get('cur_volume')} "
-                f"vol_sma={dbg.get('vol_sma')} "
-                f"vol_mult={dbg.get('vol_mult')} "
-                f"volOK={dbg.get('vol_ok')} "
-                f"marketOK={dbg.get('market_ok')}"
-            )
 
         if self.lastBullFvg and self.bullishPowerOK and self.isBullishHTF:
             _print_marketok_layers("BULL")
@@ -1088,6 +1133,9 @@ class FVG_Strategy(Strategy):
 
 
         allow_intracandle = ALLOW_INTRACANDLE_ENTRY
+        if allow_intracandle and getattr(self, "require_intrabar_entry", False):
+            if not getattr(self, "_intrabar_mode", False):
+                return
         current_high = self.data["high"].iloc[-1]
         current_low = self.data["low"].iloc[-1]
         if allow_intracandle and hasattr(self, "_intrabar_high") and hasattr(self, "_intrabar_low"):
