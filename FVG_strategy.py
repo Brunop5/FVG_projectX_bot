@@ -328,6 +328,7 @@ class FVG_Strategy(Strategy):
                 base_realized = float(getattr(self, "daily_realized_pnl", 0.0) or 0.0)
             except (TypeError, ValueError):
                 base_realized = 0.0
+            base_realized += STARTING_PNL
             self.peak_total_pnl = max(STARTING_PNL, base_realized)
         if not hasattr(self, "lockout_start_pnl"):
             self.lockout_start_pnl = None
@@ -335,7 +336,7 @@ class FVG_Strategy(Strategy):
 
         super().__init__()
         if not hasattr(self, "daily_realized_pnl"):
-            self.daily_realized_pnl = 500
+            self.daily_realized_pnl = 0.0
         if not hasattr(self, "last_pnl_date"):
             self.last_pnl_date = None
 
@@ -481,6 +482,10 @@ class FVG_Strategy(Strategy):
             if pd.isna(ts):
                 return datetime.now()
             try:
+                if isinstance(ts, (int, float)) or hasattr(ts, "item"):
+                    ts_val = ts.item() if hasattr(ts, "item") else ts
+                    if isinstance(ts_val, (int, float)) and ts_val > 1e12:
+                        return pd.to_datetime(ts_val, unit="ms", utc=True).to_pydatetime(warn=False)
                 return pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
             except Exception:
                 return datetime.now()
@@ -610,7 +615,7 @@ class FVG_Strategy(Strategy):
             realized_pnl = float(getattr(self, "daily_realized_pnl", 0.0) or 0.0)
         except (TypeError, ValueError):
             realized_pnl = 0.0
-        total_pnl = realized_pnl + unrealized_pnl
+        total_pnl = STARTING_PNL + realized_pnl + unrealized_pnl
 
         peak_total = getattr(self, "peak_total_pnl", None)
         if peak_total is None:
