@@ -115,6 +115,7 @@ MAX_DAILY_LOSS = 1000
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
 DEBUG_PYRAMIDING = False
+DEBUG_FVG = True
 
 # Max drawdown protection (per strategy instance)
 MAX_DRAWDOWN_ENABLED = True
@@ -832,6 +833,25 @@ class FVG_Strategy(Strategy):
             / gap_close
             * 100
         )
+
+        if DEBUG_FVG:
+            try:
+                h_m3 = float(self.data["high"].iloc[-3])
+                l_m1 = float(self.data["low"].iloc[-1])
+                l_m3 = float(self.data["low"].iloc[-3])
+                h_m1 = float(self.data["high"].iloc[-1])
+            except Exception:
+                h_m3 = l_m1 = l_m3 = h_m1 = float("nan")
+
+            print(
+                "🧪 FVG debug base: "
+                f"h[-3]={h_m3:.5f} l[-1]={l_m1:.5f} "
+                f"l[-3]={l_m3:.5f} h[-1]={h_m1:.5f} "
+                f"bull_flag={self.lastBullFvg} bear_flag={self.lastBearFvg} "
+                f"bullPowerPct={bull_power_pct:.5f} bearPowerPct={bear_power_pct:.5f} "
+                f"isBullishHTF={self.isBullishHTF} isBearishHTF={self.isBearishHTF} "
+                f"marketOK={self.marketOK}"
+            )
 
         def _print_marketok_layers(tag: str) -> None:
             dbg = getattr(self, "_marketok_debug", None)
