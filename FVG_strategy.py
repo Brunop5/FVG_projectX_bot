@@ -116,6 +116,7 @@ ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
 DEBUG_PYRAMIDING = False
 DEBUG_FVG = True
+STARTING_PNL = 500.0
 
 # Max drawdown protection (per strategy instance)
 MAX_DRAWDOWN_ENABLED = True
@@ -321,7 +322,15 @@ class FVG_Strategy(Strategy):
             if ENABLE_PARTIAL_SL
             else 0
         )
-        self.peak_unrealized_pnl = 500
+        self.peak_unrealized_pnl = STARTING_PNL
+        if not hasattr(self, "peak_total_pnl"):
+            try:
+                base_realized = float(getattr(self, "daily_realized_pnl", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                base_realized = 0.0
+            self.peak_total_pnl = max(STARTING_PNL, base_realized)
+        if not hasattr(self, "lockout_start_pnl"):
+            self.lockout_start_pnl = None
         self.max_dd_triggered_until = None
 
         super().__init__()
@@ -559,6 +568,15 @@ class FVG_Strategy(Strategy):
         if current_timestamp.date() >= lockout_date:
             self.max_dd_triggered_until = None
             self.peak_unrealized_pnl = 0.0
+            lockout_pnl = getattr(self, "lockout_start_pnl", None)
+            if lockout_pnl is None:
+                lockout_pnl = STARTING_PNL
+            try:
+                lockout_pnl = float(lockout_pnl)
+            except (TypeError, ValueError):
+                lockout_pnl = STARTING_PNL
+            self.peak_total_pnl = max(STARTING_PNL, lockout_pnl)
+            self.lockout_start_pnl = None
             return False
         return True
 
@@ -586,17 +604,34 @@ class FVG_Strategy(Strategy):
         if self._is_drawdown_lockout(current_timestamp):
             return True
 
+        self._reset_daily_pnl_if_needed(current_timestamp)
         unrealized_pnl = self._get_unrealized_pnl(current_price)
-        if unrealized_pnl > self.peak_unrealized_pnl:
-            self.peak_unrealized_pnl = unrealized_pnl
+        try:
+            realized_pnl = float(getattr(self, "daily_realized_pnl", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            realized_pnl = 0.0
+        total_pnl = realized_pnl + unrealized_pnl
+
+        peak_total = getattr(self, "peak_total_pnl", None)
+        if peak_total is None:
+            peak_total = max(STARTING_PNL, total_pnl)
+        if total_pnl > peak_total:
+            self.peak_total_pnl = total_pnl
             return False
-        if self.peak_unrealized_pnl <= 0:
+        if peak_total <= 0:
             return False
 
-        drawdown_pct = ((self.peak_unrealized_pnl - unrealized_pnl) / self.peak_unrealized_pnl) * 100.0
+        drawdown_pct = ((peak_total - total_pnl) / peak_total) * 100.0
         if drawdown_pct >= MAX_DRAWDOWN_PCT:
             self._close_all_positions(current_price, current_timestamp, "max_drawdown")
             self.max_dd_triggered_until = current_timestamp.date() + timedelta(days=1)
+            self.lockout_start_pnl = total_pnl
+            print(
+                "🛑 Max drawdown hit: "
+                f"peak_total={peak_total:.2f} total={total_pnl:.2f} "
+                f"realized={realized_pnl:.2f} unrealized={unrealized_pnl:.2f} "
+                f"dd={drawdown_pct:.2f}% lockout_until={self.max_dd_triggered_until}"
+            )
             return True
         return False
 
