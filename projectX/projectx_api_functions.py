@@ -513,6 +513,63 @@ def get_account_balance(account_id, auth_token):
     
     return float([acc for acc in accounts if acc["id"] == account_id][0]["balance"])
 
+
+def search_trades(
+    auth_token: str,
+    account_id: int | str,
+    start_timestamp,
+    end_timestamp=None,
+):
+    """
+    Call ProjectX Gateway trade search endpoint.
+
+    Docs: https://gateway.docs.projectx.com/docs/api-reference/trade/trade-search
+
+    Args:
+        auth_token: Bearer token from login_to_api / init_api.
+        account_id: Account ID (int or string convertible to int).
+        start_timestamp: Start of timestamp filter (datetime or ISO 8601 string).
+        end_timestamp: Optional end of timestamp filter (datetime or ISO 8601 string).
+
+    Returns:
+        Parsed JSON response. On success this will contain a "trades" list:
+            {
+                "trades": [...],
+                "success": true,
+                "errorCode": 0,
+                "errorMessage": null
+            }
+    """
+    url = "https://api.topstepx.com/api/Trade/search"
+
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "accept": "text/plain",
+        "Content-Type": "application/json",
+    }
+
+    def _to_iso(ts):
+        if ts is None:
+            return None
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                # Assume UTC if naive
+                return ts.replace(tzinfo=timezone.utc).isoformat()
+            return ts.isoformat()
+        return str(ts)
+
+    payload = {
+        "accountId": int(account_id),
+        "startTimestamp": _to_iso(start_timestamp),
+    }
+    et = _to_iso(end_timestamp)
+    if et is not None:
+        payload["endTimestamp"] = et
+
+    response = topstepx_post(url, headers=headers, payload=payload, timeout=DEFAULT_TOPSTEPX_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
 def validate_token(auth_token: str):
     url = "https://api.topstepx.com/api/Auth/validate"
 
