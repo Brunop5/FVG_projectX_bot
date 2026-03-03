@@ -30,8 +30,6 @@ from strategyTemplate import Strategy, Order
 # if "username", "api_key", "assets_list" or even the actual ones are spelled wrong, it wont work
 
 
-# if "username", "api_key", "assets_list" or even the actual ones are spelled wrong, it wont work
-
 APIS = {
     "Personal account": {
         "username": "REDACTED_USERNAME",
@@ -63,6 +61,8 @@ UPDATE_CONTRACT_LIST = False
 
 # if true it will print the list of valid accounts for this api key
 SHOW_ACCOUNTS = False
+
+SHOW_TRADES = True
 # ======== if any of those two is true, it will run the option, but not the strategy
 
 
@@ -115,7 +115,6 @@ MAX_DAILY_LOSS = 1000
 
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
-DEBUG_PYRAMIDING = False
 DEBUG_FVG = True
 STARTING_PNL = 500.0
 
@@ -292,8 +291,6 @@ class FVG_Strategy(Strategy):
         self._lock = threading.Lock()  # Protects shared state when bar thread and price-update thread run concurrently
 
         self.fvg_zones = []
-        if not hasattr(self, "debug_pyramiding"):
-            self.debug_pyramiding = DEBUG_PYRAMIDING
         if not hasattr(self, "pyramiding") or self.pyramiding is None:
             if ALLOW_PYRAMIDING:
                 self.pyramiding = ClientAtrPyramidingPolicy(
@@ -309,6 +306,7 @@ class FVG_Strategy(Strategy):
         self._split_order_count = self._validate_split_config()
         self.require_intrabar_entry = False
         self._intrabar_mode = False
+
         self._partial_tp_close_count = (
             self._validate_partial_close_size(
                 PARTIAL_TP_CLOSE_SIZE,
@@ -325,6 +323,7 @@ class FVG_Strategy(Strategy):
             if ENABLE_PARTIAL_SL
             else 0
         )
+
         self.peak_unrealized_pnl = STARTING_PNL
         if not hasattr(self, "peak_total_pnl"):
             try:
@@ -484,16 +483,24 @@ class FVG_Strategy(Strategy):
     def _get_current_timestamp(self) -> datetime:
         if hasattr(self, "_current_dt") and self._current_dt is not None:
             return self._current_dt
-        if isinstance(getattr(self, "data", None), pd.DataFrame) and "timestamp" in self.data.columns:
-            ts = self.data["timestamp"].iloc[-1]
+        data_obj = getattr(self, "data", None)
+        if isinstance(data_obj, pd.DataFrame) and "timestamp" in data_obj.columns:
+            ts = data_obj["timestamp"].iloc[-1]
             if pd.isna(ts):
                 return datetime.now()
             try:
+                # Handle numeric epoch values robustly (seconds vs milliseconds)
                 if isinstance(ts, (int, float)) or hasattr(ts, "item"):
                     ts_val = ts.item() if hasattr(ts, "item") else ts
-                    if isinstance(ts_val, (int, float)) and ts_val > 1e12:
-                        return pd.to_datetime(ts_val, unit="ms", utc=True).to_pydatetime(warn=False)
-                return pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
+                    if isinstance(ts_val, (int, float)) and not isinstance(ts_val, bool):
+                        val = float(ts_val)
+                        # Heuristic: >1e12 ⇒ milliseconds, >1e9 ⇒ seconds
+                        if val > 1e12:
+                            return pd.to_datetime(val, unit="ms", utc=True).to_pydatetime()
+                        if val > 1e9:
+                            return pd.to_datetime(val, unit="s", utc=True).to_pydatetime()
+                # Fallback for strings / pandas Timestamps / other types
+                return pd.to_datetime(ts, utc=True).to_pydatetime()
             except Exception:
                 return datetime.now()
         return datetime.now()

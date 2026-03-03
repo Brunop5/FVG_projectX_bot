@@ -4,7 +4,7 @@ import logging
 import warnings
 import requests
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from time import sleep
 import threading
 
@@ -17,6 +17,7 @@ from .projectx_api_functions import login_to_api
 from .projectx_api_functions import validate_token
 from .projectx_api_functions import sleep_until_next_boundary
 from .projectx_api_functions import topstepx_post
+from .projectx_api_functions import search_trades
 
 PROJECTX_LOG_PATH = os.path.join(os.getcwd(), "projectx_run.log")
 
@@ -214,6 +215,7 @@ class ProjectX_Order(FVG_Order):
         try:
             response = topstepx_post(url, headers=headers, payload=payload, timeout=30)
             response.raise_for_status()
+            print(f"🛑 Order closed")
             return response.json()
         except Exception as e:
             print(f"❌ Failed to close position: {e}")
@@ -656,6 +658,30 @@ if __name__ == "__main__":
             strat = ProjectX_Strategy(api["assets_list"][0])
             strat.set_token(global_token)
             print(get_account_id(strat.auth_token, show=True))
+        elif SHOW_TRADES:
+            # Fetch and print recent trades for the first account in this API config
+            first_asset = api["assets_list"][0]
+            account_name = first_asset[2]
+            account_id = get_account_id(global_token, account_name=account_name)
+
+            # Default to last 7 days of trades
+            now_utc = datetime.utcnow()
+            start_ts = now_utc - timedelta(days=7)
+            end_ts = now_utc
+
+            print(f"Fetching trades for account {account_name} (ID {account_id}) "
+                  f"from {start_ts.isoformat()} to {end_ts.isoformat()}...")
+            try:
+                res = search_trades(
+                    auth_token=global_token,
+                    account_id=account_id,
+                    start_timestamp=start_ts,
+                    end_timestamp=end_ts,
+                )
+                print("Trade search result:")
+                print(res)
+            except Exception as exc:
+                print(f"❌ Failed to fetch trades: {exc}")
 
         else:
             runner = ProjectX_AccountRunner(api)
