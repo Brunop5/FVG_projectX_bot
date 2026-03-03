@@ -114,8 +114,10 @@ MAX_DAILY_GAIN = 1480
 MAX_DAILY_LOSS = 1000
 
 # Session time controls (UTC)
-# - No new entries after 20:30 UTC
-# - Force-close all open positions at 21:00 UTC
+# - If ENABLE_SESSION_TIME_GUARDS is True:
+#   - No new entries after 20:30 UTC
+#   - Force-close all open positions at 21:00 UTC
+ENABLE_SESSION_TIME_GUARDS = True
 MARKET_ENTRY_CUTOFF_UTC = dt_time(20, 30)
 MARKET_CLOSE_UTC = dt_time(21, 0)
 
@@ -731,6 +733,8 @@ class FVG_Strategy(Strategy):
         - Block new entries after MARKET_ENTRY_CUTOFF_UTC
         - Close all open positions at MARKET_CLOSE_UTC
         """
+        if not ENABLE_SESSION_TIME_GUARDS:
+            return
         current_timestamp = self._get_current_timestamp()
         current_time = current_timestamp.time()
 
@@ -1174,17 +1178,18 @@ class FVG_Strategy(Strategy):
             return
 
         # Block new entries after the configured UTC cutoff time
-        current_timestamp = self._get_current_timestamp()
-        current_time = current_timestamp.time()
-        if current_time >= MARKET_ENTRY_CUTOFF_UTC:
-            current_date = current_timestamp.date()
-            if self._entry_cutoff_notified_date != current_date:
-                print(
-                    f"🕒 Entry cutoff reached at {current_timestamp.isoformat()} (UTC). "
-                    f"No new trades after {MARKET_ENTRY_CUTOFF_UTC.strftime('%H:%M')} UTC."
-                )
-                self._entry_cutoff_notified_date = current_date
-            return
+        if ENABLE_SESSION_TIME_GUARDS:
+            current_timestamp = self._get_current_timestamp()
+            current_time = current_timestamp.time()
+            if current_time >= MARKET_ENTRY_CUTOFF_UTC:
+                current_date = current_timestamp.date()
+                if self._entry_cutoff_notified_date != current_date:
+                    print(
+                        f"🕒 Entry cutoff reached at {current_timestamp.isoformat()} (UTC). "
+                        f"No new trades after {MARKET_ENTRY_CUTOFF_UTC.strftime('%H:%M')} UTC."
+                    )
+                    self._entry_cutoff_notified_date = current_date
+                return
 
 
         if not self.check_daily_trade_limit():
