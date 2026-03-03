@@ -4,7 +4,7 @@ import pandas as pd
 import threading
 
 from abc import abstractmethod
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 import os
 
 from .helping_functions.indicators import get_atr
@@ -62,7 +62,7 @@ UPDATE_CONTRACT_LIST = False
 # if true it will print the list of valid accounts for this api key
 SHOW_ACCOUNTS = False
 
-SHOW_TRADES = True
+SHOW_TRADES = False
 # ======== if any of those two is true, it will run the option, but not the strategy
 
 
@@ -112,6 +112,12 @@ MAX_DAILY_TRADES = 3
 ENABLE_DAILY_PNL_LIMITS = True
 MAX_DAILY_GAIN = 1480
 MAX_DAILY_LOSS = 1000
+
+# Session time controls (UTC)
+# - No new entries after 20:30 UTC
+# - Force-close all open positions at 21:00 UTC
+MARKET_ENTRY_CUTOFF_UTC = dt_time(20, 30)
+MARKET_CLOSE_UTC = dt_time(21, 0)
 
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
@@ -335,6 +341,10 @@ class FVG_Strategy(Strategy):
         if not hasattr(self, "lockout_start_pnl"):
             self.lockout_start_pnl = None
         self.max_dd_triggered_until = None
+
+        # Session time control state (per day, in UTC)
+        self._entry_cutoff_notified_date = None
+        self._session_close_executed_date = None
 
         if not hasattr(self, "trade_log_filename"):
             base = os.path.splitext(self.csv_filename)[0] if getattr(self, "csv_filename", None) else "trade_log"
@@ -714,6 +724,36 @@ class FVG_Strategy(Strategy):
             )
             return True
         return False
+
+    def _apply_session_time_guards(self) -> None:
+        """
+        Enforce session time rules in UTC:
+        - Block new entries after MARKET_ENTRY_CUTOFF_UTC
+        - Close all open positions at MARKET_CLOSE_UTC
+        """
+        current_timestamp = self._get_current_timestamp()
+        current_time = current_timestamp.time()
+
+        # Force-close all positions at/after MARKET_CLOSE_UTC, once per day
+        if current_time >= MARKET_CLOSE_UTC:
+            current_date = current_timestamp.date()
+            if self._session_close_executed_date != current_date:
+                try:
+                    current_price = float(getattr(self, "cur_close", None) or 0.0)
+                except (TypeError, ValueError):
+                    current_price = 0.0
+                if self.active_orders:
+                    print(
+                        f"🕒 Session close reached at {current_timestamp.isoformat()} (UTC). "
+                        f"Closing all open positions."
+                    )
+                    self._close_all_positions(current_price, current_timestamp, "session_close")
+                else:
+                    print(
+                        f"🕒 Session close reached at {current_timestamp.isoformat()} (UTC). "
+                        "No open positions to close."
+                    )
+                self._session_close_executed_date = current_date
 
 
     @abstractmethod
@@ -1133,6 +1173,19 @@ class FVG_Strategy(Strategy):
         if MAX_DRAWDOWN_ENABLED and self._is_drawdown_lockout(self._get_current_timestamp()):
             return
 
+        # Block new entries after the configured UTC cutoff time
+        current_timestamp = self._get_current_timestamp()
+        current_time = current_timestamp.time()
+        if current_time >= MARKET_ENTRY_CUTOFF_UTC:
+            current_date = current_timestamp.date()
+            if self._entry_cutoff_notified_date != current_date:
+                print(
+                    f"🕒 Entry cutoff reached at {current_timestamp.isoformat()} (UTC). "
+                    f"No new trades after {MARKET_ENTRY_CUTOFF_UTC.strftime('%H:%M')} UTC."
+                )
+                self._entry_cutoff_notified_date = current_date
+            return
+
 
         if not self.check_daily_trade_limit():
             print(f"⚠️ Daily trade limit reached ({MAX_DAILY_TRADES}). No new trades today.")
@@ -1423,6 +1476,8 @@ class FVG_Strategy(Strategy):
             if self._check_max_drawdown(self._get_current_timestamp(), float(self.cur_close)):
                 self.save_data()
                 return
+            # Enforce session-based time rules (entry cutoff and forced close)
+            self._apply_session_time_guards()
             self.update_indicators()
             self.add_fvg_zones()
             self.entry_logic()
