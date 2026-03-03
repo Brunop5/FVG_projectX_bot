@@ -191,7 +191,7 @@ class FVG_Order(Order):
         isCHOCH = kwargs["isCHOCH"]
         current_high = kwargs.get("current_high")
         current_low = kwargs.get("current_low")
-        if True:
+        if DEBUG_STOPS:
             log(
                 f"🧪 check_close_conditions: side={self.side} "
                 f"price={current_price} tsl={self.trailing_stop_loss} "
