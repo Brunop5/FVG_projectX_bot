@@ -603,21 +603,6 @@ class FVG_Backtest(FVG_Strategy):
         else:
             self.marketOK = atrOK
 
-        if not self.marketOK:
-            print(
-                f"🧪 marketOK layers: "
-                f"USE_VOLUME_CHECK={USE_VOLUME_CHECK} "
-                f"atr={atr_val} "
-                f"atr_sma={atr_sma} "
-                f"atrOK={atrOK} "
-                f"cur_volume={self.cur_volume} "
-                f"vol_sma={vol_sma if USE_VOLUME_CHECK else None} "
-                f"vol_mult={VOLUME_MULTIPLIER} "
-                f"volOK={volOK if USE_VOLUME_CHECK else None} "
-                f"marketOK={self.marketOK}",
-                flush=True,
-            )
-
         self.lastBullFvg = (
             self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
         )

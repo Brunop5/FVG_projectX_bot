@@ -362,9 +362,23 @@ def fetch_data(
                         'v': 'volume'
                     })
                     
-                    # Convert timestamp to datetime if needed
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-                    df['timestamp'] = df['timestamp'].astype('int64') // 1_000_000
+                    # Convert timestamp to milliseconds since epoch (robust to s/ms inputs)
+                    ts_series = df["timestamp"]
+                    if pd.api.types.is_numeric_dtype(ts_series):
+                        max_val = pd.Series(ts_series).max()
+                        unit = "ms" if max_val > 1e12 else "s"
+                        df["timestamp"] = pd.to_datetime(ts_series, unit=unit, utc=True)
+                    else:
+                        numeric_ts = pd.to_numeric(ts_series, errors="coerce")
+                        if numeric_ts.notna().any():
+                            max_val = numeric_ts.max()
+                            unit = "ms" if max_val > 1e12 else "s"
+                            df["timestamp"] = pd.to_datetime(numeric_ts, unit=unit, utc=True)
+                        else:
+                            df["timestamp"] = pd.to_datetime(ts_series, utc=True, errors="coerce")
+                    df["timestamp"] = (df["timestamp"].astype("int64") // 1_000_000).where(
+                        df["timestamp"].notna()
+                    )
                     
                     # Optional: reorder columns
                     df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
