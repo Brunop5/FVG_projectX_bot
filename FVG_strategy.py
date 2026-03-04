@@ -36,7 +36,7 @@ APIS = {
         "api_key": "REDACTED_API_KEY=",
         "assets_list": [
             ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.RTY.H26", "15min", "50KTC-V2-252499-69493223"),
+            ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-252499-69493223"),
             ("CON.F.US.MCLE.J26", "15min", "50KTC-V2-252499-69493223"),
             ("CON.F.US.M2K.H26", "15min", "50KTC-V2-252499-69493223"),
         ]
