@@ -945,6 +945,14 @@ class FVG_Strategy(Strategy):
                     self.save_data()
 
             elif ALLOW_INTRACANDLE_ENTRY:
+                is_final = False
+                if "is_final" in new_row.columns:
+                    try:
+                        is_final = bool(new_row["is_final"].iloc[-1])
+                    except Exception:
+                        is_final = False
+                if is_final:
+                    return
                 tick_price = float(self.cur_close)
                 tick_high = tick_price
                 tick_low = tick_price
