@@ -446,8 +446,15 @@ class Binance_Strategy(FVG_Strategy):
                 high = float(kline.get("h", close))
                 low = float(kline.get("l", close))
                 volume = float(kline.get("v", 0))
+                is_final = bool(kline.get("x", False))
                 new_row = pd.DataFrame(
-                    [{"close": close, "high": high, "low": low, "volume": volume}]
+                    [{
+                        "close": close,
+                        "high": high,
+                        "low": low,
+                        "volume": volume,
+                        "is_final": is_final,
+                    }]
                 )
                 self.update_price(new_row)
             except Exception as exc:
