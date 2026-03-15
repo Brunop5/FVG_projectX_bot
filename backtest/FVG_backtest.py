@@ -12,13 +12,13 @@ from FVG_projectX_bot.helping_functions.pyramiding import MaxOrdersPolicy
 
 
 PARENT_DIR = Path(__file__).parents[1]
-CURRENT_DIR = Path(__file__).parent / "GOLD_BACKTEST_NEW"
+CURRENT_DIR = Path(__file__).parent / "ETH_BACKTEST"
 
 # ==================== USER CONFIG ====================
-ASSET = "BTC"
+ASSET = "ETH"
 TIMEFRAME = "15m"
 INITIAL_BALANCE = 50
-DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "ETHUSDT_PERP_15m.csv")
 START_TIMESTAMP = "1755528300000"
 
 # Pyramiding mode: "none", "client_atr", or "max_orders"
@@ -27,6 +27,7 @@ MAX_PYRAMID_ORDERS = 3
 
 # Backtest data window (bars)
 BACKTEST_WINDOW_BARS = None
+USE_LAST_QUARTER_DATA = True  # If True, only use the last 25% of rows
 
 # Contract / fee inputs
 USE_CONTRACTS_CSV = False
@@ -274,6 +275,9 @@ class FVG_Backtest(FVG_Strategy):
             data["volume"] = data["tickvol"]
         if "timestamp" in data.columns:
             data = data.sort_values("timestamp").reset_index(drop=True)
+        if USE_LAST_QUARTER_DATA and not data.empty:
+            start_idx = int(len(data) * 0.75)
+            data = data.iloc[start_idx:].reset_index(drop=True)
         return data
 
     def _load_contract_info(self) -> None:

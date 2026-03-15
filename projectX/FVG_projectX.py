@@ -260,12 +260,22 @@ class ProjectX_Strategy(FVG_Strategy):
 
     def init_api(self, auth_token):
         self.set_token(auth_token)
-        self.account_id = get_account_id(self.auth_token, self.account_name)
-        self.account_balance = get_account_balance(self.account_id, self.auth_token)
-
         super().__init__()
         self.require_intrabar_entry = True
-        print("strat initializeds")
+        # Reload token after metadata load (metadata may override auth_token).
+        self.set_token(auth_token)
+        self.account_id = get_account_id(self.auth_token, self.account_name)
+        self.account_balance = get_account_balance(self.account_id, self.auth_token)
+        token_state = "set" if self.auth_token else "missing"
+        print(f"strat initializeds (auth_token {token_state})")
+
+    def save_data(self) -> None:
+        token = getattr(self, "auth_token", None)
+        try:
+            self.auth_token = None
+            super().save_data()
+        finally:
+            self.auth_token = token
 
     
     def set_token(self, token):
@@ -441,6 +451,40 @@ class ProjectX_Strategy(FVG_Strategy):
         fee = 3.5 * size
         return gross - fee
 
+    def _get_unrealized_pnl(self, current_price: float | None) -> float:
+        if not self.active_orders or current_price is None:
+            return 0.0
+        try:
+            cur_price = float(current_price)
+        except (TypeError, ValueError):
+            return 0.0
+        total = 0.0
+        for order in list(self.active_orders):
+            entry_price = getattr(order, "avg_entry_price", None) or order.entry_price
+            if entry_price is None:
+                continue
+            try:
+                entry_price = float(entry_price)
+                size = float(order.order_size or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if size <= 0:
+                continue
+            contract_id = getattr(order, "asset_id", None) or self.asset
+            tick_size, tick_value = self._get_contract_tick_info(contract_id)
+            if tick_size is None or tick_value is None:
+                if order.side == "BUY":
+                    total += (cur_price - entry_price) * size
+                else:
+                    total += (entry_price - cur_price) * size
+                continue
+            price_move = cur_price - entry_price
+            ticks = price_move / tick_size
+            if order.side == "SELL":
+                ticks = -ticks
+            total += ticks * tick_value * size
+        return total
+
     def subscribe_to_price_updates(self):
         print("subscribed")
         while True:
@@ -500,6 +544,8 @@ class ProjectX_AccountRunner:
             ProjectX_Strategy(asset_tuple)
             for asset_tuple in api_config.get("assets_list", [])
         ]
+        for strat in self.strategies:
+            strat.username = api_config.get("username")
         self._limit_triggered = False
         self._limit_triggered_date = None
 
@@ -608,7 +654,7 @@ def validation_thread(
     auth_token: str,
     strategies: list[ProjectX_Strategy],
     api_config: dict | None = None,
-    refresh_interval: int = 72000,
+    refresh_interval: int = 50000,
 ):
     print("starting validation thread...")
     while True:
@@ -649,6 +695,7 @@ if __name__ == "__main__":
 
         if UPDATE_CONTRACT_LIST:
             strat = ProjectX_Strategy(api["assets_list"][0])
+            strat.username = api.get("username")
             strat.init_api(global_token)
             data = strat.get_assets()
             data = pd.DataFrame(data)
@@ -656,6 +703,7 @@ if __name__ == "__main__":
             print("Contract list updated successfully!!")
         elif SHOW_ACCOUNTS:
             strat = ProjectX_Strategy(api["assets_list"][0])
+            strat.username = api.get("username")
             strat.set_token(global_token)
             print(get_account_id(strat.auth_token, show=True))
         elif SHOW_TRADES:

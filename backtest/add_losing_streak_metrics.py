@@ -9,10 +9,10 @@ import os
 from datetime import datetime, timezone
 
 # ===== CONFIGURATION =====
-TRADES_CSV = "FVG_projectX_bot/backtest/BTC_BACKTEST/backtest_trades.csv"
+TRADES_CSV = "FVG_projectX_bot/backtest/BTC_BACKTEST_NEW/backtest_trades.csv"
 PRICE_CSV = "FVG_projectX_bot/backtest/data/BTCUSDT_PERP_15m.csv"
-OUTPUT_METRICS_CSV = "FVG_projectX_bot/backtest/BTC_BACKTEST/backtest_trades_metrics.csv"
-OUTPUT_MONTHLY_CSV = "FVG_projectX_bot/backtest/BTC_BACKTEST/backtest_trades_monthly_pnl.csv"
+OUTPUT_METRICS_CSV = "FVG_projectX_bot/backtest/BTC_BACKTEST_NEW/backtest_trades_metrics.csv"
+OUTPUT_MONTHLY_CSV = "FVG_projectX_bot/backtest/BTC_BACKTEST_NEW/backtest_trades_monthly_pnl.csv"
 START_EQUITY = 50.0
 # =========================
 
@@ -429,6 +429,19 @@ def _compute_monthly_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def _infer_bar_seconds(price_df: pd.DataFrame) -> float:
+    if price_df.empty or "timestamp" not in price_df.columns:
+        return 900.0
+    ts = price_df["timestamp"].sort_values()
+    if len(ts) < 2:
+        return 900.0
+    deltas = ts.diff().dropna()
+    median_delta = deltas.median()
+    if pd.isna(median_delta):
+        return 900.0
+    return float(median_delta.total_seconds())
 
 
 def process_trades():
