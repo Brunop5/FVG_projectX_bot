@@ -4,7 +4,7 @@ import pandas as pd
 import threading
 
 from abc import abstractmethod
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 import os
 
 from .helping_functions.indicators import get_atr
@@ -31,16 +31,16 @@ from strategyTemplate import Strategy, Order
 
 
 APIS = {
-    "Personal account": {
-        "username": "Marrove",
-        "api_key": "z8Xnx8AJQyciYe/q/+NXTKZoTYZhSiLj/C52ka2vKzM=",
-        "assets_list": [
-            ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.MCLE.J26", "15min", "50KTC-V2-252499-69493223"),
-            ("CON.F.US.M2K.H26", "15min", "50KTC-V2-252499-69493223"),
-        ]
-    },
+    # "Personal account": {
+    #     "username": "Marrove",
+    #     "api_key": "z8Xnx8AJQyciYe/q/+NXTKZoTYZhSiLj/C52ka2vKzM=",
+    #     "assets_list": [
+    #         ("CON.F.US.MGC.J26", "15min", "50KTC-V2-252499-69493223"),
+    #         ("CON.F.US.MNQ.H26", "15min", "50KTC-V2-252499-69493223"),
+    #         ("CON.F.US.MCLE.J26", "15min", "50KTC-V2-252499-69493223"),
+    #         ("CON.F.US.M2K.H26", "15min", "50KTC-V2-252499-69493223"),
+    #     ]
+    # },
 
     # "Wifes account": {
     #     "username": "afribuymoz@gmail.com",
@@ -52,6 +52,21 @@ APIS = {
     #         ("CON.F.US.MES.H26", "15min", "50KTC-V2-498538-71564652"),
     #     ]
     # }
+    "Bruno": {
+        "username": "bruno@platek.sk",
+        "api_key": "xS9c0el16xOwmGu33Y8J5b0qCdDjqO4rV/judAac9d4=",
+        "assets_list": [
+            ("CON.F.US.MGC.J26", "15min", "50KTC-V2-546152-16615340"),
+        ]
+    }
+}
+
+# Optional per-username overrides (applies to global constants at init time).
+# Example:
+# USERNAME_OVERRIDES = {
+#     "Marrove": {"MAX_DAILY_TRADES": 2, "USE_VOLUME_CHECK": False},
+# }
+USERNAME_OVERRIDES: dict[str, dict[str, object]] = {
 }
 
 
@@ -93,19 +108,19 @@ HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
 
 # Lot Size and Risk Settings
 USE_FIXED_LOT = True        # Use fixed lot size (formerly UseFixedLot)
-FIXED_LOT = 6                   # Fixed lot size (formerly FixedLot)
+FIXED_LOT = 1                   # Fixed lot size (formerly FixedLot)
 RISK_PERCENT = 1.0                 # Risk percentage per trade (formerly RiskPercent)
 ORDER_SIZE = 1                     # Default order size (overridden by risk calculation if not USE_FIXED_LOT)
 
 # Partial close sizing and ATR steps
-SPLIT_ORDERS_ENABLED = True        # If False, place a single order with FIXED_LOT
+SPLIT_ORDERS_ENABLED = False        # If False, place a single order with FIXED_LOT
 EACH_TRADE_SIZE = 1                # Size per child order when splitting FIXED_LOT
 PARTIAL_TP_ATR_STEP = 1  # ATR step size for favorable partial closes
 PARTIAL_SL_ATR_STEP = 2  # ATR step size for adverse partial closes
 PARTIAL_TP_CLOSE_SIZE = 1  # Size to close per favorable step (multiple of EACH_TRADE_SIZE)
 PARTIAL_SL_CLOSE_SIZE = 2  # Size to close per adverse step (multiple of EACH_TRADE_SIZE)
-ENABLE_PARTIAL_TP = True
-ENABLE_PARTIAL_SL = True
+ENABLE_PARTIAL_TP = False
+ENABLE_PARTIAL_SL = False
 
 # Daily Trading Limits
 MAX_DAILY_TRADES = 3
@@ -113,31 +128,40 @@ ENABLE_DAILY_PNL_LIMITS = True
 MAX_DAILY_GAIN = 1480
 MAX_DAILY_LOSS = 1000
 
-# Session time controls (UTC)
-# - If ENABLE_SESSION_TIME_GUARDS is True:
-#   - No new entries after 20:30 UTC
-#   - Force-close all open positions at 21:00 UTC
+
 ENABLE_SESSION_TIME_GUARDS = True
-MARKET_ENTRY_CUTOFF_UTC = dt_time(20, 30)
-MARKET_CLOSE_UTC = dt_time(21, 0)
+MARKET_ENTRY_CUTOFF_UTC = dt_time(19, 30)
+MARKET_CLOSE_UTC = dt_time(20, 0)
+MARKET_REOPEN_UTC = dt_time(22, 0)
 
 ALLOW_INTRACANDLE_ENTRY = True
 DEBUG_STOPS = False
 DEBUG_FVG = True
-STARTING_PNL = 500.0
+STARTING_PNL = 1000.0
 
 # Max drawdown protection (per strategy instance)
 MAX_DRAWDOWN_ENABLED = True
 MAX_DRAWDOWN_PCT = 50.0
 
 # Pyramiding (client mode)
-ALLOW_PYRAMIDING = True
+ALLOW_PYRAMIDING = False
 PYR_ATR_STEP = 1.0
 PYR_ADD_ON_SIZE = 1
 PYR_MAX_ADDS = 10
 
 def quiet_log(msg):
     pass
+
+
+def _apply_username_overrides(username: str | None) -> None:
+    if not username:
+        return
+    overrides = USERNAME_OVERRIDES.get(username)
+    if not overrides:
+        return
+    for key, value in overrides.items():
+        if key in globals():
+            globals()[key] = value
 
 
 class FVG_Order(Order):
@@ -286,6 +310,7 @@ class FVG_Strategy(Strategy):
     
     def __init__(self):
         print("layer 2 init")
+        _apply_username_overrides(getattr(self, "username", None))
         self.isBOS = False
         self.isCHOCH = False
 
@@ -297,6 +322,7 @@ class FVG_Strategy(Strategy):
         self.daily_trades_count = 0
         self.last_trade_date = None
         self._lock = threading.Lock()  # Protects shared state when bar thread and price-update thread run concurrently
+        self._entry_reopen_notified_date = None
 
         self.fvg_zones = []
         if not hasattr(self, "pyramiding") or self.pyramiding is None:
@@ -501,15 +527,19 @@ class FVG_Strategy(Strategy):
             if pd.isna(ts):
                 return datetime.now()
             try:
-                # Handle numeric epoch values robustly (seconds vs milliseconds)
+                # Handle numeric epoch values robustly (s/ms/us/ns)
                 if isinstance(ts, (int, float)) or hasattr(ts, "item"):
                     ts_val = ts.item() if hasattr(ts, "item") else ts
                     if isinstance(ts_val, (int, float)) and not isinstance(ts_val, bool):
                         val = float(ts_val)
-                        # Heuristic: >1e12 ⇒ milliseconds, >1e9 ⇒ seconds
-                        if val > 1e12:
+                        # Heuristic thresholds by magnitude
+                        if val > 1e17:  # nanoseconds
+                            return pd.to_datetime(val, unit="ns", utc=True).to_pydatetime()
+                        if val > 1e14:  # microseconds
+                            return pd.to_datetime(val, unit="us", utc=True).to_pydatetime()
+                        if val > 1e11:  # milliseconds
                             return pd.to_datetime(val, unit="ms", utc=True).to_pydatetime()
-                        if val > 1e9:
+                        if val > 1e8:  # seconds
                             return pd.to_datetime(val, unit="s", utc=True).to_pydatetime()
                 # Fallback for strings / pandas Timestamps / other types
                 return pd.to_datetime(ts, utc=True).to_pydatetime()
@@ -657,7 +687,8 @@ class FVG_Strategy(Strategy):
         if lockout_date is None:
             self.max_dd_triggered_until = None
             return False
-        if current_timestamp.date() >= lockout_date:
+        lockout_end_dt = datetime.combine(lockout_date, MARKET_REOPEN_UTC, tzinfo=timezone.utc)
+        if current_timestamp >= lockout_end_dt:
             self.max_dd_triggered_until = None
             self.peak_unrealized_pnl = 0.0
             lockout_pnl = getattr(self, "lockout_start_pnl", None)
@@ -717,7 +748,14 @@ class FVG_Strategy(Strategy):
         if drawdown_pct >= MAX_DRAWDOWN_PCT:
             self._close_all_positions(current_price, current_timestamp, "max_drawdown")
             self.max_dd_triggered_until = current_timestamp.date() + timedelta(days=1)
-            self.lockout_start_pnl = total_pnl
+            try:
+                realized_after_close = float(getattr(self, "daily_realized_pnl", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                realized_after_close = 0.0
+            lockout_pnl = STARTING_PNL + realized_after_close
+            if lockout_pnl < STARTING_PNL:
+                lockout_pnl = STARTING_PNL
+            self.lockout_start_pnl = lockout_pnl
             print(
                 "🛑 Max drawdown hit: "
                 f"peak_total={peak_total:.2f} total={total_pnl:.2f} "
@@ -823,6 +861,8 @@ class FVG_Strategy(Strategy):
         """
         if new_row is None or len(new_row) == 0:
             return  # Skip this iteration if no data, but keep running
+
+        print(new_row)
         
         # Check if 'close' column exists
         if 'close' not in new_row.columns:
@@ -843,7 +883,18 @@ class FVG_Strategy(Strategy):
             )
             ts = new_row["timestamp"].iloc[-1] if "timestamp" in new_row.columns else None
             try:
-                self._current_dt = pd.to_datetime(ts, utc=True).to_pydatetime(warn=False) if ts is not None else None
+                if ts is None or pd.isna(ts):
+                    self._current_dt = None
+                elif isinstance(ts, (int, float)) or hasattr(ts, "item"):
+                    ts_val = ts.item() if hasattr(ts, "item") else ts
+                    if isinstance(ts_val, (int, float)) and not isinstance(ts_val, bool):
+                        val = float(ts_val)
+                        unit = "ms" if val > 1e12 else "s"
+                        self._current_dt = pd.to_datetime(val, unit=unit, utc=True).to_pydatetime(warn=False)
+                    else:
+                        self._current_dt = pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
+                else:
+                    self._current_dt = pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
             except Exception:
                 self._current_dt = None
             if DEBUG_STOPS:
@@ -1189,14 +1240,24 @@ class FVG_Strategy(Strategy):
         if ENABLE_SESSION_TIME_GUARDS:
             current_timestamp = self._get_current_timestamp()
             current_time = current_timestamp.time()
-            if current_time >= MARKET_ENTRY_CUTOFF_UTC:
+            if MARKET_ENTRY_CUTOFF_UTC <= current_time < MARKET_CLOSE_UTC:
                 current_date = current_timestamp.date()
                 if self._entry_cutoff_notified_date != current_date:
                     print(
                         f"🕒 Entry cutoff reached at {current_timestamp.isoformat()} (UTC). "
-                        f"No new trades after {MARKET_ENTRY_CUTOFF_UTC.strftime('%H:%M')} UTC."
+                        f"No new trades after {MARKET_ENTRY_CUTOFF_UTC.strftime('%H:%M')} UTC "
+                        f"until {MARKET_REOPEN_UTC.strftime('%H:%M')} UTC."
                     )
                     self._entry_cutoff_notified_date = current_date
+                return
+            if MARKET_CLOSE_UTC <= current_time < MARKET_REOPEN_UTC:
+                current_date = current_timestamp.date()
+                if self._entry_reopen_notified_date != current_date:
+                    print(
+                        f"🕒 Market closed at {MARKET_CLOSE_UTC.strftime('%H:%M')} UTC. "
+                        f"Entries resume at {MARKET_REOPEN_UTC.strftime('%H:%M')} UTC."
+                    )
+                    self._entry_reopen_notified_date = current_date
                 return
 
 
@@ -1228,7 +1289,7 @@ class FVG_Strategy(Strategy):
             fvg_top = zone["top"]
 
             # Full touch: current bar's high/low overlaps the FVG zone
-            touchesFVG = current_high >= fvg_bottom and current_low <= fvg_top
+            touchesFVG = current_high > fvg_bottom and current_low < fvg_top
 
             if (
                 zone["direction"] == "bull"
