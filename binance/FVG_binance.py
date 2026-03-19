@@ -426,10 +426,12 @@ class Binance_Strategy(FVG_Strategy):
         return ORDER_SIZE
 
     def subscribe_to_price_updates(self):
-        interval = _binance_interval_from_timeframe(self.timeframe)
+        # Use 1-minute candles for TP/SL evaluation to avoid false closes caused by
+        # the previous/parent candle's high/low being built before an order opens.
+        interval = _binance_interval_from_timeframe("1min")
         symbol = self.asset.lower()
         reconnect_delay = 5
-        idle_timeout = max(60, _timeframe_to_seconds(self.timeframe) * 2)
+        idle_timeout = max(60, _timeframe_to_seconds("1min") * 2)
 
         connected_ok = False
 
@@ -447,6 +449,9 @@ class Binance_Strategy(FVG_Strategy):
                 low = float(kline.get("l", close))
                 volume = float(kline.get("v", 0))
                 is_final = bool(kline.get("x", False))
+                # Kline open time (ms since epoch). Used by the strategy for minute-bucket gating.
+                t_open = kline.get("t")
+                timestamp = int(t_open) if t_open is not None else None
                 new_row = pd.DataFrame(
                     [{
                         "close": close,
@@ -454,6 +459,7 @@ class Binance_Strategy(FVG_Strategy):
                         "low": low,
                         "volume": volume,
                         "is_final": is_final,
+                        "timestamp": timestamp,
                     }]
                 )
                 self.update_price(new_row)
