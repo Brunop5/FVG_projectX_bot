@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from time import sleep
 import threading
+import time
 
 from ..FVG_strategy import *
 from .projectx_api_functions import get_account_id
@@ -235,6 +236,10 @@ class ProjectX_Strategy(FVG_Strategy):
         self.auth_token = None
         self.account_id = None
         self._contract_specs = None
+        self.username = None
+        self.api_key = None
+        self._fetch_failures = 0
+        self._last_reauth_ts = 0.0
 
         self.asset = asset_tuple[0]
         self.timeframe = asset_tuple[1]
@@ -268,6 +273,13 @@ class ProjectX_Strategy(FVG_Strategy):
         self.account_balance = get_account_balance(self.account_id, self.auth_token)
         token_state = "set" if self.auth_token else "missing"
         print(f"strat initializeds (auth_token {token_state})")
+
+    def load_metadata(self) -> bool:
+        ok = super().load_metadata()
+        if ok:
+            # Never trust persisted tokens; always re-authenticate.
+            self.auth_token = None
+        return ok
 
     def save_data(self) -> None:
         token = getattr(self, "auth_token", None)
@@ -316,12 +328,44 @@ class ProjectX_Strategy(FVG_Strategy):
     def fetch_new_data(self):
         new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token)
         if new_row is None:
-            print("now new data")
-            return
+            print("⚠️  No new data available; waiting for next bar.")
+            self._fetch_failures += 1
+            if self._fetch_failures >= 3 and self.username and self.api_key:
+                now = time.time()
+                if now - self._last_reauth_ts > 300:
+                    try:
+                        print("🔄 Re-authenticating after repeated fetch failures...")
+                        new_token = init_api(self.username, self.api_key)
+                        self.set_token(new_token)
+                        self._last_reauth_ts = now
+                        self._fetch_failures = 0
+                    except Exception as exc:
+                        print(f"⚠️ Re-auth failed: {exc}")
+            return False
+        self._fetch_failures = 0
         if new_row["timestamp"].iloc[-1] > self.data["timestamp"].iloc[-1]:
             self.cur_close = new_row["close"].iloc[-1]
             self.cur_volume = new_row["volume"].iloc[-1]
             self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:] # last 100
+            return True
+        return False
+
+    def bar_iteration(self):
+        with self._lock:
+            if not self.fetch_new_data():
+                return
+            if self.data is None or len(self.data) < 5:
+                return
+            if self._check_max_drawdown(self._get_current_timestamp(), float(self.cur_close)):
+                self.save_data()
+                return
+            # Enforce session-based time rules (entry cutoff and forced close)
+            self._apply_session_time_guards()
+            self.update_indicators()
+            self.add_fvg_zones()
+            self.entry_logic()
+            self.update_stops()
+            self.save_data()
             print(f"\n⏰ New bar - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} close: {self.cur_close}")
 
 
@@ -489,7 +533,7 @@ class ProjectX_Strategy(FVG_Strategy):
         print("subscribed")
         while True:
             sleep(10)
-            new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token, include_partial_bar=True)
+            new_row = fetch_data(self.asset, "1min", 1, self.auth_token, include_partial_bar=True)
             self.update_price(new_row)
 
     def start_bar_iterations(self):
@@ -546,6 +590,7 @@ class ProjectX_AccountRunner:
         ]
         for strat in self.strategies:
             strat.username = api_config.get("username")
+            strat.api_key = api_config.get("api_key")
         self._limit_triggered = False
         self._limit_triggered_date = None
 

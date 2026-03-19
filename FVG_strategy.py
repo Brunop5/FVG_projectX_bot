@@ -83,25 +83,25 @@ SHOW_TRADES = False
 
 # ==================== CONFIGURATION PARAMETERS ====================
 # Display Settings
-FVG_HISTORY_NBR = 1              # Number of FVGs to work with
+FVG_HISTORY_NBR = 14              # Number of FVGs to work with
 MIN_FVG_POWER_PCT = 0.01          # Min FVG Power % (formerly MinFVGPowerPct)
 
 # Timeframe and Trend Settings
-HTF_TF = "30"                     # HTF Bias (4H) - PERIOD_H4
-EMA_PERIOD = 15                    # EMA Period for trend detection
-VOLUME_MULTIPLIER = 1.2
+HTF_TF = "240"                     # HTF Bias (4H) - PERIOD_H4
+EMA_PERIOD = 100                    # EMA Period for trend detection
+VOLUME_MULTIPLIER = 1.25
 USE_VOLUME_CHECK = True            # If False, volume check is skipped in marketOK calculation
 VOLUME_DATA_START_TIMESTAMP = 1755464400000  # Timestamp where reliable volume data starts (ms)
 START_FROM_VOLUME_TIMESTAMP = False  # None = auto (True if USE_VOLUME_CHECK, False otherwise). Set to True/False to override
 
 # ATR and Risk Management
-ATR_PERIOD = 23                    # ATR Period (min 1)
-SL_MULTIPLIER = 6.5               # SL ATR Multiplier (formerly SL_ATR_Mult)
-TP_MULTIPLIER = 7                # TP ATR Multiplier (formerly TP_ATR_Mult)
+ATR_PERIOD = 22                    # ATR Period (min 1)
+SL_MULTIPLIER = 6.0               # SL ATR Multiplier (formerly SL_ATR_Mult)
+TP_MULTIPLIER = 1               # TP ATR Multiplier (formerly TP_ATR_Mult)
 
 # Trailing Stop Settings
 USE_TRAILING = True                # use trailing stop (formerly UseTrailing)
-TRAIL_OFFSET_MULT = 4            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
+TRAIL_OFFSET_MULT = 10            # Trailing Offset ATR Multiplier (formerly TrailATRMult)
 
 # Position Management
 HOLD_UNTIL_OPPOSITE = True         # Hold Until Opposite BOS/CHoCH
@@ -169,6 +169,9 @@ class FVG_Order(Order):
     pyramid_count: int
     next_add_price: float | None
     avg_entry_price: float | None
+    # Minute-bucket timestamp (epoch ms) used for TP/SL evaluation gating in live mode.
+    # This prevents evaluating the same candle bucket that the order was opened in.
+    opened_eval_ts_ms: int | None
 
     def __init__(
         self, entry_atr, **kwargs):
@@ -181,6 +184,7 @@ class FVG_Order(Order):
         self.group_id = None
         self.group_seq = None
         self.entry_reference_price = self.entry_price
+        self.opened_eval_ts_ms = None
 
     def add_to_position(self, add_size: float, log=print):
         if add_size is None or add_size <= 0:
@@ -324,6 +328,10 @@ class FVG_Strategy(Strategy):
         self._lock = threading.Lock()  # Protects shared state when bar thread and price-update thread run concurrently
         self._entry_reopen_notified_date = None
 
+        # Used by live runners: timestamp of the most recently received frequent price update candle.
+        # Truncated to minute-bucket (epoch ms) inside `update_price()`.
+        self._last_price_update_ts_ms: int | None = None
+
         self.fvg_zones = []
         if not hasattr(self, "pyramiding") or self.pyramiding is None:
             if ALLOW_PYRAMIDING:
@@ -384,12 +392,14 @@ class FVG_Strategy(Strategy):
         if not hasattr(self, "last_pnl_date"):
             self.last_pnl_date = None
 
-        self.cur_close = self.data["close"].iloc[-1]
-        self.cur_volume = self.data["volume"].iloc[-1]
-        
-
-        self.update_indicators()
-        self.add_fvg_zones()
+        if isinstance(self.data, pd.DataFrame) and not self.data.empty:
+            self.cur_close = self.data["close"].iloc[-1]
+            self.cur_volume = self.data["volume"].iloc[-1]
+            self.update_indicators()
+            self.add_fvg_zones()
+        else:
+            self.cur_close = 0.0
+            self.cur_volume = 0.0
 
     def _validate_split_config(self) -> int:
         if not SPLIT_ORDERS_ENABLED:
@@ -862,7 +872,6 @@ class FVG_Strategy(Strategy):
         if new_row is None or len(new_row) == 0:
             return  # Skip this iteration if no data, but keep running
 
-        print(new_row)
         
         # Check if 'close' column exists
         if 'close' not in new_row.columns:
@@ -897,6 +906,13 @@ class FVG_Strategy(Strategy):
                     self._current_dt = pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
             except Exception:
                 self._current_dt = None
+
+            # Truncate current timestamp to minute-bucket (epoch ms) for TP/SL gating.
+            if self._current_dt is not None:
+                epoch_ms = int(self._current_dt.timestamp() * 1000)
+                self._last_price_update_ts_ms = (epoch_ms // 60_000) * 60_000
+            else:
+                self._last_price_update_ts_ms = None
             if DEBUG_STOPS:
                 print(
                     f"🧪 update_price: close={self.cur_close} "
@@ -911,6 +927,7 @@ class FVG_Strategy(Strategy):
                 return
 
             if len(self.active_orders) > 0:
+                eval_bucket_ts_ms = self._last_price_update_ts_ms
                 high_changed = False
                 low_changed = False
                 if hasattr(self, "_last_kline_high") and hasattr(self, "_last_kline_low"):
@@ -931,6 +948,7 @@ class FVG_Strategy(Strategy):
                     current_low=current_low,
                     high_changed=high_changed,
                     low_changed=low_changed,
+                    eval_bucket_ts_ms=eval_bucket_ts_ms,
                 )
                 allow_partial_closes = SPLIT_ORDERS_ENABLED and (
                     ENABLE_PARTIAL_TP or ENABLE_PARTIAL_SL
@@ -944,6 +962,17 @@ class FVG_Strategy(Strategy):
                 closed_any = False
                 for order in list(self.active_orders):
                     recorded_trade = False
+
+                    # Skip TP/SL evaluation for the minute-bucket the order was opened in.
+                    opened_eval_ts_ms = getattr(order, "opened_eval_ts_ms", None)
+                    if (
+                        eval_bucket_ts_ms is not None
+                        and opened_eval_ts_ms is not None
+                        and opened_eval_ts_ms == eval_bucket_ts_ms
+                    ):
+                        remaining.append(order)
+                        continue
+
                     closed = order.check_close_conditions(
                         current_price=self.cur_close,
                         current_high=current_high,
@@ -1340,6 +1369,15 @@ class FVG_Strategy(Strategy):
                             success = True
                         if success:
                             self.active_orders.append(active_order)
+                            opened_bucket_ts_ms = self._last_price_update_ts_ms
+                            if opened_bucket_ts_ms is None:
+                                try:
+                                    cur_dt = self._get_current_timestamp()
+                                    epoch_ms = int(cur_dt.timestamp() * 1000)
+                                    opened_bucket_ts_ms = (epoch_ms // 60_000) * 60_000
+                                except Exception:
+                                    opened_bucket_ts_ms = None
+                            active_order.opened_eval_ts_ms = opened_bucket_ts_ms
                             any_success = True
                             self.pyramiding.on_position_opened(active_order, self)
                 else:
@@ -1366,6 +1404,15 @@ class FVG_Strategy(Strategy):
                         success = True
                     if success:
                         self.active_orders.append(active_order)
+                        opened_bucket_ts_ms = self._last_price_update_ts_ms
+                        if opened_bucket_ts_ms is None:
+                            try:
+                                cur_dt = self._get_current_timestamp()
+                                epoch_ms = int(cur_dt.timestamp() * 1000)
+                                opened_bucket_ts_ms = (epoch_ms // 60_000) * 60_000
+                            except Exception:
+                                opened_bucket_ts_ms = None
+                        active_order.opened_eval_ts_ms = opened_bucket_ts_ms
                         any_success = True
                         self.pyramiding.on_position_opened(active_order, self)
 
@@ -1430,6 +1477,15 @@ class FVG_Strategy(Strategy):
                             success = True
                         if success:
                             self.active_orders.append(active_order)
+                            opened_bucket_ts_ms = self._last_price_update_ts_ms
+                            if opened_bucket_ts_ms is None:
+                                try:
+                                    cur_dt = self._get_current_timestamp()
+                                    epoch_ms = int(cur_dt.timestamp() * 1000)
+                                    opened_bucket_ts_ms = (epoch_ms // 60_000) * 60_000
+                                except Exception:
+                                    opened_bucket_ts_ms = None
+                            active_order.opened_eval_ts_ms = opened_bucket_ts_ms
                             any_success = True
                             self.pyramiding.on_position_opened(active_order, self)
                 else:
@@ -1456,6 +1512,15 @@ class FVG_Strategy(Strategy):
                         success = True
                     if success:
                         self.active_orders.append(active_order)
+                        opened_bucket_ts_ms = self._last_price_update_ts_ms
+                        if opened_bucket_ts_ms is None:
+                            try:
+                                cur_dt = self._get_current_timestamp()
+                                epoch_ms = int(cur_dt.timestamp() * 1000)
+                                opened_bucket_ts_ms = (epoch_ms // 60_000) * 60_000
+                            except Exception:
+                                opened_bucket_ts_ms = None
+                        active_order.opened_eval_ts_ms = opened_bucket_ts_ms
                         any_success = True
                         self.pyramiding.on_position_opened(active_order, self)
 
@@ -1477,6 +1542,7 @@ class FVG_Strategy(Strategy):
         current_low: float | None = None,
         high_changed: bool = True,
         low_changed: bool = True,
+        eval_bucket_ts_ms: int | None = None,
     ):
         if len(self.active_orders) == 0:
             return
@@ -1489,6 +1555,15 @@ class FVG_Strategy(Strategy):
 
         # === UPDATE TRAILING STOPS ===
         for pos in list(self.active_orders):
+            # Skip trailing updates for the minute-bucket the order was opened in.
+            opened_eval_ts_ms = getattr(pos, "opened_eval_ts_ms", None)
+            if (
+                eval_bucket_ts_ms is not None
+                and opened_eval_ts_ms is not None
+                and opened_eval_ts_ms == eval_bucket_ts_ms
+            ):
+                continue
+
             if DEBUG_STOPS:
                 print(
                     f"🧪 update_stops: side={pos.side} high={current_high} low={current_low} "
@@ -1555,5 +1630,5 @@ class FVG_Strategy(Strategy):
             self.update_indicators()
             self.add_fvg_zones()
             self.entry_logic()
-            self.update_stops()
+            self.update_stops(eval_bucket_ts_ms=self._last_price_update_ts_ms)
             self.save_data()

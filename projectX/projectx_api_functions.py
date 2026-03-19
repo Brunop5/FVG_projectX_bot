@@ -265,6 +265,9 @@ def fetch_data(
     else:
         raise ValueError("Unsupported unit")
 
+    # Extend window on Mondays to cover weekend gaps.
+    if end_time.weekday() == 6 or end_time.weekday() == 0:
+        delta = delta + timedelta(days=2)
     start_time = end_time - delta
 
     
