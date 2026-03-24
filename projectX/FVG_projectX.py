@@ -2,12 +2,17 @@ import os
 import sys
 import logging
 import warnings
+import math
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from time import sleep
 import threading
 import time
+
+# Load projectX-local inputs before importing FVG strategy globals.
+PROJECTX_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("FVG_INPUTS_JSON", os.path.join(PROJECTX_DIR, "inputs.json"))
 
 from ..FVG_strategy import *
 from .projectx_api_functions import get_account_id
@@ -20,7 +25,11 @@ from .projectx_api_functions import sleep_until_next_boundary
 from .projectx_api_functions import topstepx_post
 from .projectx_api_functions import search_trades
 
-PROJECTX_LOG_PATH = os.path.join(os.getcwd(), "projectx_run.log")
+PROJECTX_RUNTIME_DIR = os.path.join(PROJECTX_DIR, INPUTS.RUNTIME_SUBDIR)
+PROJECTX_LOG_PATH = os.path.join(
+    PROJECTX_RUNTIME_DIR,
+    INPUTS.LOG_FILE_NAMES.get("projectx", "projectx_run.log"),
+)
 
 
 def setup_global_logging(log_path: str) -> None:
@@ -233,6 +242,7 @@ class ProjectX_Strategy(FVG_Strategy):
 
     def __init__(self, asset_tuple):
         print("layer 3 init ran!")
+        os.makedirs(PROJECTX_RUNTIME_DIR, exist_ok=True)
         self.auth_token = None
         self.account_id = None
         self._contract_specs = None
@@ -246,8 +256,8 @@ class ProjectX_Strategy(FVG_Strategy):
         self.account_name = asset_tuple[2]
 
         filename = self._safe_filename(f"{self.asset}-{self.timeframe}-{self.account_name}")
-        self.csv_filename = f"{filename}.csv"
-        self.metadata_filename = f"{filename}.json"
+        self.csv_filename = os.path.join(PROJECTX_RUNTIME_DIR, f"{filename}.csv")
+        self.metadata_filename = os.path.join(PROJECTX_RUNTIME_DIR, f"{filename}.json")
 
     def _safe_filename(self, name: str) -> str:
         # Avoid Windows reserved device names like CON, PRN, AUX, NUL, COM1, LPT1
@@ -316,7 +326,7 @@ class ProjectX_Strategy(FVG_Strategy):
         return response.json()["contracts"]
 
     def gather_data(self) -> pd.DataFrame:
-        data = load_data(self.asset, self.timeframe)
+        data = load_data(self.asset, self.timeframe, data_dir=PROJECTX_RUNTIME_DIR)
         if data is not None:
             return data
         data = fetch_data(self.asset, self.timeframe, 100, self.auth_token)
@@ -370,13 +380,13 @@ class ProjectX_Strategy(FVG_Strategy):
 
 
     def fetch_htf_data(self) -> pd.DataFrame:
-        htf_tf = str(HTF_TF)
+        htf_tf = str(INPUTS.HTF_TF)
         if htf_tf.isdigit():
             htf_tf = f"{htf_tf}min"
 
-        num_bars = max(EMA_PERIOD + 51, 101)
+        num_bars = max(INPUTS.EMA_PERIOD + 51, 101)
 
-        data = load_data(self.asset, htf_tf)
+        data = load_data(self.asset, htf_tf, data_dir=PROJECTX_RUNTIME_DIR)
         if data is None or len(data) == 0:
             data = fetch_data(self.asset, htf_tf, num_bars, self.auth_token)
 
@@ -399,16 +409,16 @@ class ProjectX_Strategy(FVG_Strategy):
             self.daily_trades_count = 0
             self.last_trade_date = str(today)
         
-        return self.daily_trades_count < MAX_DAILY_TRADES
+        return self.daily_trades_count < INPUTS.MAX_DAILY_TRADES
 
     def calculate_order_size(self, atr, stop_distance_atr_mult):
         """Calculate position size based on risk management"""
-        if USE_FIXED_LOT:
-            return FIXED_LOT
+        if INPUTS.USE_FIXED_LOT:
+            return INPUTS.FIXED_LOT
         
         # Calculate lot size based on risk percentage
         # This is a simplified calculation - adjust based on your broker's requirements
-        risk_amount = self.account_balance * (RISK_PERCENT / 100)
+        risk_amount = self.account_balance * (INPUTS.RISK_PERCENT / 100)
         stop_distance = atr * stop_distance_atr_mult
         
         if stop_distance > 0:
@@ -417,10 +427,11 @@ class ProjectX_Strategy(FVG_Strategy):
             lot_size = round(lot_size, 2)
             return max(0.01, min(lot_size, 100))  # Ensure reasonable bounds
         
-        return ORDER_SIZE
+        return INPUTS.ORDER_SIZE
 
     def _contracts_csv_path(self) -> str | None:
         candidates = [
+            os.path.join(PROJECTX_RUNTIME_DIR, "contracts.csv"),
             os.path.join(os.getcwd(), "contracts.csv"),
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "contracts.csv")),
         ]
@@ -553,7 +564,7 @@ class ProjectX_Strategy(FVG_Strategy):
         print(f"🤖 Trading Bot Started for {self.asset}")
         print(f"{'='*60}")
         print(f"Timeframe: {self.timeframe}")
-        print(f"HTF Bias: {HTF_TF}min | EMA Period: {EMA_PERIOD}")
+        print(f"HTF Bias: {INPUTS.HTF_TF}min | EMA Period: {INPUTS.EMA_PERIOD}")
         tick_size, tick_value = self._get_contract_tick_info(self.asset)
         if tick_size is not None and tick_value is not None:
             print(
@@ -575,9 +586,9 @@ class ProjectX_AccountRunner:
         self,
         api_config: dict,
         check_interval: int = 5,
-        enable_limits: bool = ENABLE_DAILY_PNL_LIMITS,
-        max_daily_gain: float = MAX_DAILY_GAIN,
-        max_daily_loss: float = MAX_DAILY_LOSS,
+        enable_limits: bool = INPUTS.ENABLE_DAILY_PNL_LIMITS,
+        max_daily_gain: float = INPUTS.MAX_DAILY_GAIN,
+        max_daily_loss: float = INPUTS.MAX_DAILY_LOSS,
     ):
         self.api_config = api_config
         self.check_interval = check_interval
@@ -735,23 +746,23 @@ def validation_thread(
 
 if __name__ == "__main__":
     setup_global_logging(PROJECTX_LOG_PATH)
-    for api in APIS.values():
+    for api in INPUTS.APIS.values():
         global_token = init_api(api["username"], api["api_key"])
 
-        if UPDATE_CONTRACT_LIST:
+        if INPUTS.UPDATE_CONTRACT_LIST:
             strat = ProjectX_Strategy(api["assets_list"][0])
             strat.username = api.get("username")
             strat.init_api(global_token)
             data = strat.get_assets()
             data = pd.DataFrame(data)
-            data.to_csv("contracts.csv")
+            data.to_csv(os.path.join(PROJECTX_RUNTIME_DIR, "contracts.csv"), index=False)
             print("Contract list updated successfully!!")
-        elif SHOW_ACCOUNTS:
+        elif INPUTS.SHOW_ACCOUNTS:
             strat = ProjectX_Strategy(api["assets_list"][0])
             strat.username = api.get("username")
             strat.set_token(global_token)
             print(get_account_id(strat.auth_token, show=True))
-        elif SHOW_TRADES:
+        elif INPUTS.SHOW_TRADES:
             # Fetch and print recent trades for the first account in this API config
             first_asset = api["assets_list"][0]
             account_name = first_asset[2]
