@@ -49,14 +49,14 @@ def load_existing_csv(path: Path) -> pd.DataFrame | None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download ETHUSDT perpetual futures OHLCV 15m data from Binance."
+        description="Download BTCUSDT perpetual futures OHLCV 15m data from Binance."
     )
-    parser.add_argument("--pair", default="ETHUSDT")
+    parser.add_argument("--pair", default="BTCUSDT")
     parser.add_argument("--interval", default="15m")
     parser.add_argument("--contract-type", default="PERPETUAL")
     parser.add_argument(
         "--output",
-        default="data/ETHUSDT_PERP_15m.csv",
+        default="data/BTCUSDT_PERP_15m.csv",
         help="Output CSV path",
     )
     parser.add_argument("--sleep", type=float, default=0.25, help="Sleep seconds between requests")

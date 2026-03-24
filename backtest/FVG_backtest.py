@@ -1,25 +1,39 @@
 import os
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from tkinter.constants import FALSE
-from numpy import True_
 import pandas as pd
+
+BACKTEST_DIR = Path(__file__).resolve().parent
+os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs.json"))
 
 from FVG_projectX_bot.FVG_strategy import *
 from FVG_projectX_bot.helping_functions.indicators import get_atr, ema
-from FVG_projectX_bot.helping_functions.pyramiding import MaxOrdersPolicy
+from FVG_projectX_bot.helping_functions.partial_close import (
+    cleanup_partial_groups,
+    get_partial_close_targets,
+    next_partial_group_id,
+)
+from FVG_projectX_bot.helping_functions.pyramiding import (
+    MaxOrdersPolicy,
+    apply_pyramiding_add_on,
+)
 
 
 PARENT_DIR = Path(__file__).parents[1]
-CURRENT_DIR = Path(__file__).parent / "ETH_BACKTEST"
+BACKTEST_RUNTIME_DIR = BACKTEST_DIR / INPUTS.RUNTIME_SUBDIR
+BACKTEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==================== USER CONFIG ====================
-ASSET = "ETH"
+ASSET = "BTC"
 TIMEFRAME = "15m"
 INITIAL_BALANCE = 50
-DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "ETHUSDT_PERP_15m.csv")
-START_TIMESTAMP = "1755528300000"
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
+# Optional 1min data for entry/close TP/SL (matches live behavior). If None, use 15m bar high/low.
+DATA_1M_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_1m.csv")
+START_TIMESTAMP = str(
+    int((datetime.now(timezone.utc) - timedelta(days=182)).timestamp() * 1000)
+)
 
 # Pyramiding mode: "none", "client_atr", or "max_orders"
 PYRAMIDING_MODE = "none" # remake to str enum
@@ -45,6 +59,30 @@ MARGIN_PER_TRADE_USD = 10
 
 # CSV output options
 TRADE_CSV_WRITE_MODE = "append"  # "prepend" (newest first) or "append" (faster)
+
+# Local aliases for strategy inputs used throughout this module.
+HTF_TF = INPUTS.HTF_TF
+EMA_PERIOD = INPUTS.EMA_PERIOD
+ATR_PERIOD = INPUTS.ATR_PERIOD
+USE_VOLUME_CHECK = INPUTS.USE_VOLUME_CHECK
+VOLUME_MULTIPLIER = INPUTS.VOLUME_MULTIPLIER
+MAX_DRAWDOWN_ENABLED = INPUTS.MAX_DRAWDOWN_ENABLED
+MAX_DAILY_TRADES = INPUTS.MAX_DAILY_TRADES
+ALLOW_INTRACANDLE_ENTRY = INPUTS.ALLOW_INTRACANDLE_ENTRY
+SL_MULTIPLIER = INPUTS.SL_MULTIPLIER
+TP_MULTIPLIER = INPUTS.TP_MULTIPLIER
+USE_TRAILING = INPUTS.USE_TRAILING
+TRAIL_OFFSET_MULT = INPUTS.TRAIL_OFFSET_MULT
+FVG_HISTORY_NBR = INPUTS.FVG_HISTORY_NBR
+SPLIT_ORDERS_ENABLED = INPUTS.SPLIT_ORDERS_ENABLED
+EACH_TRADE_SIZE = INPUTS.EACH_TRADE_SIZE
+USE_FIXED_LOT = INPUTS.USE_FIXED_LOT
+FIXED_LOT = INPUTS.FIXED_LOT
+RISK_PERCENT = INPUTS.RISK_PERCENT
+ORDER_SIZE = INPUTS.ORDER_SIZE
+PYR_ATR_STEP = INPUTS.PYR_ATR_STEP
+PYR_ADD_ON_SIZE = INPUTS.PYR_ADD_ON_SIZE
+PYR_MAX_ADDS = INPUTS.PYR_MAX_ADDS
 
 
 _ACTIVE_BACKTEST = None
@@ -184,6 +222,7 @@ class FVG_Backtest(FVG_Strategy):
         warmup_bars: int | None = None,
         start_timestamp=None,
         pyramiding_mode: str | None = None,
+        data_path_1m: str | None = None,
     ):
         global _ACTIVE_BACKTEST
         _ACTIVE_BACKTEST = self
@@ -192,17 +231,19 @@ class FVG_Backtest(FVG_Strategy):
         self.account_balance = float(initial_balance)
         self.used_margin = 0.0
         self.data_path = data_path
-        self.metadata_filename = os.path.join(CURRENT_DIR, "backtest_metadata.json")
-        self.csv_filename = os.path.join(CURRENT_DIR, "backtest_data.csv")
+        self.data_path_1m = data_path_1m
+        self.metadata_filename = os.path.join(BACKTEST_RUNTIME_DIR, "backtest_metadata.json")
+        self.csv_filename = os.path.join(BACKTEST_RUNTIME_DIR, "backtest_data.csv")
         self._warmup_bars = warmup_bars
         self._full_data = None
+        self._full_data_1m = None
         self._htf_resampled = None
         self._current_index = None
         self._cursor = 0
         self._current_dt = None
         self.trades = []
         self._stopped = False
-        self.trades_csv_path = os.path.join(CURRENT_DIR, "backtest_trades.csv")
+        self.trades_csv_path = os.path.join(BACKTEST_RUNTIME_DIR, "backtest_trades.csv")
         self._start_from_dt = self._parse_start_timestamp(start_timestamp) if start_timestamp is not None else None
         self.tick_size = None
         self.tick_value = None
@@ -212,6 +253,39 @@ class FVG_Backtest(FVG_Strategy):
         self._configure_pyramiding(pyramiding_mode)
         super().__init__()
         self.require_intrabar_entry = True
+
+    def _next_partial_group_id(self) -> int:
+        return next_partial_group_id(self, INPUTS)
+
+    def _get_partial_close_targets(self, current_price: float) -> dict:
+        return get_partial_close_targets(
+            active_orders=list(self.active_orders),
+            partial_groups=self._partial_groups,
+            current_price=current_price,
+            enable_partial_tp=INPUTS.ENABLE_PARTIAL_TP,
+            enable_partial_sl=INPUTS.ENABLE_PARTIAL_SL,
+            partial_tp_atr_step=INPUTS.PARTIAL_TP_ATR_STEP,
+            partial_sl_atr_step=INPUTS.PARTIAL_SL_ATR_STEP,
+            partial_tp_close_count=self._partial_tp_close_count,
+            partial_sl_close_count=self._partial_sl_close_count,
+        )
+
+    def _cleanup_partial_groups(self) -> None:
+        cleanup_partial_groups(self.active_orders, self._partial_groups)
+
+    def _apply_pyramiding_add_on(
+        self,
+        current_price: float,
+        current_high: float | None = None,
+        current_low: float | None = None,
+    ) -> None:
+        apply_pyramiding_add_on(
+            self,
+            INPUTS,
+            current_price,
+            current_high,
+            current_low,
+        )
 
     def api_order_kwargs(self) -> dict:
         return {}
@@ -235,18 +309,18 @@ class FVG_Backtest(FVG_Strategy):
             )
         print(f"📐 Backtest pyramiding mode: {selected}")
 
-    def _load_data(self) -> pd.DataFrame:
-        if not os.path.exists(self.data_path):
-            raise FileNotFoundError(f"Data file not found: {self.data_path}")
+    def _load_data_from_path(self, path: str) -> pd.DataFrame:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Data file not found: {path}")
         sep = ","
         try:
-            with open(self.data_path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 header_line = f.readline()
             if "\t" in header_line and "," not in header_line:
                 sep = "\t"
         except Exception:
             sep = ","
-        data = pd.read_csv(self.data_path, sep=sep)
+        data = pd.read_csv(path, sep=sep)
         normalized = []
         for col in data.columns:
             name = str(col).strip().lower()
@@ -275,10 +349,44 @@ class FVG_Backtest(FVG_Strategy):
             data["volume"] = data["tickvol"]
         if "timestamp" in data.columns:
             data = data.sort_values("timestamp").reset_index(drop=True)
+        return data
+
+    def _load_data(self) -> pd.DataFrame:
+        data = self._load_data_from_path(self.data_path)
         if USE_LAST_QUARTER_DATA and not data.empty:
             start_idx = int(len(data) * 0.75)
             data = data.iloc[start_idx:].reset_index(drop=True)
         return data
+
+    def _load_data_1m(self) -> pd.DataFrame | None:
+        if not self.data_path_1m:
+            return None
+        try:
+            return self._load_data_from_path(self.data_path_1m)
+        except FileNotFoundError as e:
+            print(f"⚠️ 1min data not found: {e}. Using 15m bar high/low for TP/SL.")
+            return None
+
+    def _get_1m_bars_for_15m_bar(self, bar_ts_ms: int) -> pd.DataFrame:
+        """Return 1m bars whose open time falls in the 15m bar [bar_ts_ms, bar_ts_ms + 15*60*1000)."""
+        if self._full_data_1m is None:
+            return pd.DataFrame()
+        ts_col = "timestamp"
+        if ts_col not in self._full_data_1m.columns:
+            return pd.DataFrame()
+        end_ms = bar_ts_ms + 15 * 60 * 1000
+        mask = (self._full_data_1m[ts_col] >= bar_ts_ms) & (self._full_data_1m[ts_col] < end_ms)
+        return self._full_data_1m.loc[mask].copy()
+
+    def _get_opened_eval_ts_ms_for_current_bar(self) -> int | None:
+        """Last 1m bar timestamp in current 15m bar (for opened_eval_ts_ms). None if no 1m data."""
+        if self._full_data_1m is None or self._current_dt is None:
+            return None
+        bar_ts_ms = int(self._current_dt.timestamp() * 1000)
+        one_min = self._get_1m_bars_for_15m_bar(bar_ts_ms)
+        if one_min.empty:
+            return None
+        return int(one_min["timestamp"].iloc[-1])
 
     def _load_contract_info(self) -> None:
         if not os.path.exists(CONTRACTS_CSV_PATH):
@@ -485,6 +593,10 @@ class FVG_Backtest(FVG_Strategy):
 
     def gather_data(self) -> pd.DataFrame:
         self._full_data = self._load_data()
+        self._full_data_1m = self._load_data_1m()
+        if self._full_data_1m is not None:
+            self._full_data_1m = self._full_data_1m.sort_values("timestamp").reset_index(drop=True)
+            print(f"📊 Loaded {len(self._full_data_1m)} 1min bars for TP/SL (matches live)")
         warmup = self._warmup_bars or self._infer_warmup()
         if len(self._full_data) < warmup:
             raise ValueError("Not enough bars for warmup/backtest.")
@@ -699,6 +811,7 @@ class FVG_Backtest(FVG_Strategy):
                             # Backtest or non-API mode: treat as success
                             success = True
                         if success:
+                            active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
                             self.active_orders.append(active_order)
                             any_success = True
                             self.pyramiding.on_position_opened(active_order, self)
@@ -728,6 +841,7 @@ class FVG_Backtest(FVG_Strategy):
                         # Backtest or non-API mode: treat as success
                         success = True
                     if success:
+                        active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
                         self.active_orders.append(active_order)
                         any_success = True
                         self.pyramiding.on_position_opened(active_order, self)
@@ -796,6 +910,7 @@ class FVG_Backtest(FVG_Strategy):
                             # Backtest or non-API mode: treat as success
                             success = True
                         if success:
+                            active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
                             self.active_orders.append(active_order)
                             any_success = True
                             self.pyramiding.on_position_opened(active_order, self)
@@ -822,9 +937,9 @@ class FVG_Backtest(FVG_Strategy):
                     result = active_order.place_order()
                     success = isinstance(result, dict) and result.get("success", False)
                     if result is None:
-                        # Backtest or non-API mode: treat as success
                         success = True
                     if success:
+                        active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
                         self.active_orders.append(active_order)
                         any_success = True
                         self.pyramiding.on_position_opened(active_order, self)
@@ -1008,6 +1123,91 @@ class FVG_Backtest(FVG_Strategy):
                 self.account_balance += order.pnl
             self._record_trade(order)
 
+    def _process_order_closes(
+        self,
+        current_high: float,
+        current_low: float,
+        current_close: float,
+        current_dt: datetime | None,
+        use_1m: bool = False,
+        eval_bucket_ts_ms: int | None = None,
+    ) -> None:
+        """Check TP/SL on each order; close if hit. Respects opened_eval_ts_ms when use_1m."""
+        self._closed_any_this_bar = False
+        partial_close_map = self._get_partial_close_targets(current_close)
+        remaining = []
+        for order in list(self.active_orders):
+            if use_1m and eval_bucket_ts_ms is not None:
+                opened_ms = getattr(order, "opened_eval_ts_ms", None)
+                if opened_ms is not None and opened_ms == eval_bucket_ts_ms:
+                    remaining.append(order)
+                    continue
+            closed = False
+            if order.side == "BUY":
+                if order.trailing_stop_loss is not None and current_low <= order.trailing_stop_loss:
+                    order._last_price = float(order.trailing_stop_loss)
+                    order._last_timestamp = current_dt
+                    order.exit_reason = "trailing_stop"
+                    order.close_order()
+                    closed = True
+                elif order.stop_loss is not None and current_low <= order.stop_loss:
+                    order._last_price = float(order.stop_loss)
+                    order._last_timestamp = current_dt
+                    order.exit_reason = "stop_loss"
+                    order.close_order()
+                    closed = True
+                elif order.take_profit is not None and current_high >= order.take_profit:
+                    order._last_price = float(order.take_profit)
+                    order._last_timestamp = current_dt
+                    order.exit_reason = "take_profit"
+                    order.close_order()
+                    closed = True
+            else:
+                if order.trailing_stop_loss is not None and current_high >= order.trailing_stop_loss:
+                    order._last_price = float(order.trailing_stop_loss)
+                    order._last_timestamp = current_dt
+                    order.exit_reason = "trailing_stop"
+                    order.close_order()
+                    closed = True
+                elif order.stop_loss is not None and current_high >= order.stop_loss:
+                    order._last_price = float(order.stop_loss)
+                    order._last_timestamp = current_dt
+                    order.exit_reason = "stop_loss"
+                    order.close_order()
+                    closed = True
+                elif order.take_profit is not None and current_low <= order.take_profit:
+                    order._last_price = float(order.take_profit)
+                    order._last_timestamp = current_dt
+                    order.exit_reason = "take_profit"
+                    order.close_order()
+                    closed = True
+            if not closed and order in partial_close_map:
+                order._last_price = current_close
+                order._last_timestamp = current_dt
+                order.exit_reason = partial_close_map[order]
+                order.close_order()
+                closed = True
+            if not closed:
+                closed = order.check_close_conditions(
+                    current_price=current_close,
+                    current_high=current_high,
+                    current_low=current_low,
+                    last_long=order.side == "BUY",
+                    last_short=order.side == "SELL",
+                    isBOS=self.isBOS,
+                    isCHOCH=self.isCHOCH,
+                    timestamp=current_dt,
+                )
+            if closed:
+                self._closed_any_this_bar = True
+                self.pyramiding.on_position_closed(order, self)
+                if order.pnl is not None:
+                    self.account_balance += order.pnl
+                self._record_trade(order)
+            else:
+                remaining.append(order)
+        self.active_orders = remaining
+
     def run(self):
         total_bars = len(self._full_data)
         while self._cursor < total_bars:
@@ -1032,89 +1232,59 @@ class FVG_Backtest(FVG_Strategy):
 
 
             if len(self.active_orders) > 0:
-                self.update_stops()
+                self._closed_any_this_bar = False
+                ts_val = new_row["timestamp"].iloc[-1]
+                try:
+                    bar_ts_ms = int(float(ts_val))
+                    if bar_ts_ms < 10**12:
+                        bar_ts_ms = int(bar_ts_ms * 1000)
+                except (TypeError, ValueError):
+                    bar_ts = self._extract_bar_time(new_row)
+                    bar_ts_ms = int(bar_ts.timestamp() * 1000) if bar_ts else 0
+                one_min_bars = self._get_1m_bars_for_15m_bar(bar_ts_ms)
+
+                if one_min_bars.empty:
+                    current_high = float(new_row["high"].iloc[-1])
+                    current_low = float(new_row["low"].iloc[-1])
+                    self._process_order_closes(
+                        current_high, current_low, self.cur_close, self._current_dt,
+                        use_1m=False,
+                    )
+                else:
+                    for _, row_1m in one_min_bars.iterrows():
+                        if not self.active_orders:
+                            break
+                        ts_val = row_1m["timestamp"]
+                        try:
+                            ts_val = int(float(ts_val))
+                        except (TypeError, ValueError):
+                            ts_val = 0
+                        eval_bucket_ms = ts_val if ts_val > 10**12 else ts_val * 1000
+                        h_1m = float(row_1m["high"]) if "high" in row_1m else self.cur_close
+                        l_1m = float(row_1m["low"]) if "low" in row_1m else self.cur_close
+                        c_1m = float(row_1m["close"]) if "close" in row_1m else self.cur_close
+                        dt_1m = self._parse_start_timestamp(ts_val) if ts_val else self._current_dt
+                        self.update_stops(
+                            current_high=h_1m,
+                            current_low=l_1m,
+                            high_changed=True,
+                            low_changed=True,
+                            eval_bucket_ts_ms=eval_bucket_ms,
+                        )
+                        self._process_order_closes(
+                            h_1m, l_1m, c_1m, dt_1m,
+                            use_1m=True,
+                            eval_bucket_ts_ms=eval_bucket_ms,
+                        )
                 current_high = float(new_row["high"].iloc[-1])
                 current_low = float(new_row["low"].iloc[-1])
-                partial_close_map = self._get_partial_close_targets(self.cur_close)
-                remaining = []
-                closed_any = False
-                for order in list(self.active_orders):
-                    intrabar_closed = False
-                    if order.side == "BUY":
-                        if order.trailing_stop_loss is not None and current_low <= order.trailing_stop_loss:
-                            order._last_price = float(order.trailing_stop_loss)
-                            order._last_timestamp = self._current_dt
-                            order.exit_reason = "trailing_stop"
-                            order.close_order()
-                            intrabar_closed = True
-                        elif order.stop_loss is not None and current_low <= order.stop_loss:
-                            order._last_price = float(order.stop_loss)
-                            order._last_timestamp = self._current_dt
-                            order.exit_reason = "stop_loss"
-                            order.close_order()
-                            intrabar_closed = True
-                        elif order.take_profit is not None and current_high >= order.take_profit:
-                            order._last_price = float(order.take_profit)
-                            order._last_timestamp = self._current_dt
-                            order.exit_reason = "take_profit"
-                            order.close_order()
-                            intrabar_closed = True
-                    else:
-                        if order.trailing_stop_loss is not None and current_high >= order.trailing_stop_loss:
-                            order._last_price = float(order.trailing_stop_loss)
-                            order._last_timestamp = self._current_dt
-                            order.exit_reason = "trailing_stop"
-                            order.close_order()
-                            intrabar_closed = True
-                        elif order.stop_loss is not None and current_high >= order.stop_loss:
-                            order._last_price = float(order.stop_loss)
-                            order._last_timestamp = self._current_dt
-                            order.exit_reason = "stop_loss"
-                            order.close_order()
-                            intrabar_closed = True
-                        elif order.take_profit is not None and current_low <= order.take_profit:
-                            order._last_price = float(order.take_profit)
-                            order._last_timestamp = self._current_dt
-                            order.exit_reason = "take_profit"
-                            order.close_order()
-                            intrabar_closed = True
-
-                    if intrabar_closed:
-                        closed = True
-                    elif order in partial_close_map:
-                        if hasattr(order, "_last_price"):
-                            order._last_price = self.cur_close
-                        if hasattr(order, "_last_timestamp"):
-                            order._last_timestamp = self._current_dt
-                        if hasattr(order, "exit_reason"):
-                            order.exit_reason = partial_close_map[order]
-                        order.close_order()
-                        closed = True
-                    else:
-                        closed = order.check_close_conditions(
-                            current_price=self.cur_close,
-                            last_long=order.side == "BUY",
-                            last_short=order.side == "SELL",
-                            isBOS=self.isBOS,
-                            isCHOCH=self.isCHOCH,
-                            timestamp=self._current_dt,
-                        )
-                    if closed:
-                        closed_any = True
-                        self.pyramiding.on_position_closed(order, self)
-                        if order.pnl is not None:
-                            self.account_balance += order.pnl
-                        self._record_trade(order)
-                    else:
-                        remaining.append(order)
-                self.active_orders = remaining
                 if self.active_orders:
                     self._apply_pyramiding_add_on(
                         self.cur_close,
                         current_high=current_high,
                         current_low=current_low,
                     )
-                if closed_any:
+                if getattr(self, "_closed_any_this_bar", False):
                     self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
                     self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
                     self._cleanup_partial_groups()
@@ -1162,7 +1332,19 @@ if __name__ == "__main__":
         timeframe=TIMEFRAME,
         initial_balance=INITIAL_BALANCE,
         data_path=data_path,
+        start_timestamp=START_TIMESTAMP,
         pyramiding_mode=PYRAMIDING_MODE,
+        data_path_1m=DATA_1M_CSV_PATH,
     )
     trades = backtest.run()
     print(f"✅ Backtest finished. Trades: {len(trades)}")
+    try:
+        from FVG_projectX_bot.backtest.evaluate_backtest import evaluate_backtest
+
+        evaluate_backtest(
+            trades_csv=Path(backtest.trades_csv_path),
+            price_csv=Path(backtest.data_path),
+            start_equity=INITIAL_BALANCE,
+        )
+    except Exception as exc:
+        print(f"⚠️ Backtest evaluation failed: {exc}")

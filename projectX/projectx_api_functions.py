@@ -476,12 +476,14 @@ def fetch_data_(ugh, eeehm, lol, tok=None, l=False):
     #df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
     
-def load_data(asset, timeframe):
+def load_data(asset, timeframe, data_dir=None):
     """
     If asset data exist and are not older than 35 seconds, it returns them as pandas df.
     otherwise returns None
     """
     path = f"{asset[3:]}-{timeframe}.csv"
+    if data_dir:
+        path = os.path.join(data_dir, path)
     if os.path.exists(path):
         df = pd.read_csv(path)
         if int(time.time() * 1000) - df["timestamp"].iloc[-1] > 35 * 1000: # if "timestamp" column is in ms

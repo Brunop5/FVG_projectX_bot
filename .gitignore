@@ -1,12 +1,11 @@
-backtest/GOLD_BACKTEST
-backtest/BTC_BACKTEST
-backtest/BTC_BACKTEST_NEW
-backtest/ETH_BACKTEST
+backtest/results
+backtest/data
+pyrightconfig.json
+*/runtime_data
 
 venv/
 __pycache__/
 .env
-data/
+*.log
 *.csv
 *.png
-!gold_results/final_result.csv

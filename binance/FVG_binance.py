@@ -1,5 +1,8 @@
 import json
 import os
+import sys
+import logging
+import warnings
 import threading
 import time
 from datetime import datetime, timezone
@@ -10,9 +13,10 @@ import pandas as pd
 from binance.um_futures import UMFutures
 from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 
-from ..FVG_strategy import USE_TRAILING, FVG_Order, FVG_Strategy, HTF_TF, EMA_PERIOD
-from ..FVG_strategy import USE_FIXED_LOT, FIXED_LOT, MAX_DAILY_TRADES
-from ..FVG_strategy import RISK_PERCENT, ORDER_SIZE, DEBUG_STOPS
+BINANCE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("FVG_INPUTS_JSON", os.path.join(BINANCE_DIR, "inputs.json"))
+
+from ..FVG_strategy import INPUTS, FVG_Order, FVG_Strategy
 from ..helping_functions.pyramiding import MaxOrdersPolicy
 
 from ..projectX.projectx_api_functions import sleep_until_next_boundary
@@ -33,6 +37,60 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 USE_TESTNET = os.getenv("BINANCE_TESTNET", "0").lower() in {"1", "true", "yes"}
+
+BINANCE_RUNTIME_DIR = os.path.join(BINANCE_DIR, INPUTS.RUNTIME_SUBDIR)
+BINANCE_LOG_PATH = os.path.join(
+    BINANCE_RUNTIME_DIR,
+    INPUTS.LOG_FILE_NAMES.get("binance", "binance_run.log"),
+)
+
+
+def setup_global_logging(log_path: str) -> None:
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.FileHandler(log_path, mode="a", encoding="utf-8")],
+    )
+
+    class _StreamToLogger:
+        def __init__(self, logger: logging.Logger, level: int):
+            self.logger = logger
+            self.level = level
+
+        def write(self, message: str) -> None:
+            message = message.rstrip()
+            if message:
+                self.logger.log(self.level, message)
+
+        def flush(self) -> None:
+            pass
+
+    stdout_logger = logging.getLogger("stdout")
+    stderr_logger = logging.getLogger("stderr")
+    sys.stdout = _StreamToLogger(stdout_logger, logging.INFO)
+    sys.stderr = _StreamToLogger(stderr_logger, logging.ERROR)
+
+    def _showwarning(message, category, filename, lineno, file=None, line=None):
+        warn_logger = logging.getLogger("warnings")
+        warn_logger.warning(
+            "%s:%s: %s: %s",
+            filename,
+            lineno,
+            category.__name__,
+            message,
+        )
+
+    warnings.showwarning = _showwarning
+
+    def _excepthook(exc_type, exc_value, exc_traceback):
+        logger = logging.getLogger("exceptions")
+        logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = _excepthook
 
 
 TIMEFRAME_MAP = {
@@ -174,7 +232,6 @@ class Binance_Order(FVG_Order):
         self.symbol = symbol
         self._client = client
         self._position_side = None
-        self.use_trailing = USE_TRAILING
 
         if self._client is not None:
             try:
@@ -296,6 +353,7 @@ class Binance_Strategy(FVG_Strategy):
     _ws_client: UMFuturesWebsocketClient | None
 
     def __init__(self, asset_tuple: tuple[str, str]):
+        os.makedirs(BINANCE_RUNTIME_DIR, exist_ok=True)
         self.api_key = ""
         self.api_secret = ""
         self.asset = asset_tuple[0]
@@ -307,8 +365,8 @@ class Binance_Strategy(FVG_Strategy):
 
         suffix = f"-{CONTRACT_TYPE.lower()}" if USE_CONTINUOUS_KLINES else ""
         filename = f"{self.asset}-{self.timeframe}{suffix}"
-        self.csv_filename = f"{filename}.csv"
-        self.metadata_filename = f"{filename}.json"
+        self.csv_filename = os.path.join(BINANCE_RUNTIME_DIR, f"{filename}.csv")
+        self.metadata_filename = os.path.join(BINANCE_RUNTIME_DIR, f"{filename}.json")
 
     def init_api(self, api_key: str, api_secret: str):
         self.api_key = api_key
@@ -385,7 +443,7 @@ class Binance_Strategy(FVG_Strategy):
             print(f"\n⏰ New bar - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} close: {self.cur_close}")
 
     def fetch_htf_data(self) -> pd.DataFrame:
-        htf_tf = str(HTF_TF)
+        htf_tf = str(INPUTS.HTF_TF)
         if htf_tf.isdigit():
             if int(htf_tf) % 60 == 0:
                 htf_tf = f"{int(htf_tf) // 60}h"
@@ -393,7 +451,7 @@ class Binance_Strategy(FVG_Strategy):
                 htf_tf = f"{htf_tf}m"
 
         interval = _binance_interval_from_timeframe(htf_tf)
-        num_bars = max(EMA_PERIOD + 51, 101)
+        num_bars = max(INPUTS.EMA_PERIOD + 51, 101)
         if self._client is None:
             return pd.DataFrame()
         data = fetch_klines(self._client, self.asset, interval, limit=num_bars)
@@ -410,20 +468,20 @@ class Binance_Strategy(FVG_Strategy):
         if self.last_trade_date != str(today):
             self.daily_trades_count = 0
             self.last_trade_date = str(today)
-        return self.daily_trades_count < MAX_DAILY_TRADES
+        return self.daily_trades_count < INPUTS.MAX_DAILY_TRADES
 
     def calculate_order_size(self, atr, sl_mult):
-        if USE_FIXED_LOT:
-            return FIXED_LOT
+        if INPUTS.USE_FIXED_LOT:
+            return INPUTS.FIXED_LOT
 
-        risk_amount = self.account_balance * (RISK_PERCENT / 100)
+        risk_amount = self.account_balance * (INPUTS.RISK_PERCENT / 100)
         stop_distance = atr * sl_mult
 
         if stop_distance > 0:
             lot_size = risk_amount / stop_distance
             lot_size = round(lot_size, 3)
             return max(0.001, min(lot_size, 100))
-        return ORDER_SIZE
+        return INPUTS.ORDER_SIZE
 
     def subscribe_to_price_updates(self):
         # Use 1-minute candles for TP/SL evaluation to avoid false closes caused by
@@ -535,7 +593,7 @@ class Binance_Strategy(FVG_Strategy):
         print(f"🤖 Trading Bot Started for {self.asset}")
         print(f"{'='*60}")
         print(f"Timeframe: {self.timeframe}")
-        print(f"HTF Bias: {HTF_TF} | EMA Period: {EMA_PERIOD}")
+        print(f"HTF Bias: {INPUTS.HTF_TF} | EMA Period: {INPUTS.EMA_PERIOD}")
 
         t1 = threading.Thread(target=self.start_bar_iterations)
         t2 = threading.Thread(target=self.subscribe_to_price_updates)
@@ -550,6 +608,7 @@ def run_strat(strat: Binance_Strategy, api_key: str, api_secret: str):
 
 
 if __name__ == "__main__":
+    setup_global_logging(BINANCE_LOG_PATH)
     print("main?")
     import threading
 
