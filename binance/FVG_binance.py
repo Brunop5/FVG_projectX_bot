@@ -22,10 +22,10 @@ from ..helping_functions.pyramiding import MaxOrdersPolicy
 from ..projectX.projectx_api_functions import sleep_until_next_boundary
 
 
-ASSETS = [("BTCUSDT", "1min")]  # BTCUSDT perpetual (USDT-margined)
+ASSETS = [("BTCUSDT", "15min")]  # BTCUSDT perpetual (USDT-margined)
 USE_CONTINUOUS_KLINES = False
 CONTRACT_TYPE = "PERPETUAL"
-MAX_OPEN_ORDERS = 1
+MAX_OPEN_ORDERS = 3
 
 BINANCE_BASE_URL = "https://fapi.binance.com"
 BINANCE_TESTNET_URL = "https://testnet.binancefuture.com"
