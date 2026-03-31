@@ -9,7 +9,7 @@
     }
   },
   "USERNAME_OVERRIDES": {},
-  "UPDATE_CONTRACT_LIST": false,
+  "UPDATE_CONTRACT_LIST": true,
   "SHOW_ACCOUNTS": false,
   "SHOW_TRADES": false,
   "FVG_HISTORY_NBR": 14,
