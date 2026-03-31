@@ -5,10 +5,9 @@ from pathlib import Path
 import pandas as pd
 
 BACKTEST_DIR = Path(__file__).resolve().parent
-os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs.json"))
+os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs_backtest_gold.json"))
 
 from FVG_projectX_bot.FVG_strategy import *
-from FVG_projectX_bot.helping_functions.indicators import get_atr, ema
 from FVG_projectX_bot.helping_functions.partial_close import (
     cleanup_partial_groups,
     get_partial_close_targets,
@@ -25,15 +24,13 @@ BACKTEST_RUNTIME_DIR = BACKTEST_DIR / INPUTS.RUNTIME_SUBDIR
 BACKTEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==================== USER CONFIG ====================
-ASSET = "BTC"
+ASSET = "MGCJ6"
 TIMEFRAME = "15m"
-INITIAL_BALANCE = 50
-DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
+INITIAL_BALANCE = 50000
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "MGCG6" / "IC_markets_15min.csv")
 # Optional 1min data for entry/close TP/SL (matches live behavior). If None, use 15m bar high/low.
-DATA_1M_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_1m.csv")
-START_TIMESTAMP = str(
-    int((datetime.now(timezone.utc) - timedelta(days=182)).timestamp() * 1000)
-)
+DATA_1M_CSV_PATH = None
+START_TIMESTAMP = None
 
 # Pyramiding mode: "none", "client_atr", or "max_orders"
 PYRAMIDING_MODE = "none" # remake to str enum
@@ -41,20 +38,20 @@ MAX_PYRAMID_ORDERS = 3
 
 # Backtest data window (bars)
 BACKTEST_WINDOW_BARS = None
-USE_LAST_QUARTER_DATA = True  # If True, only use the last 25% of rows
+USE_LAST_QUARTER_DATA = False  # If True, only use the last 25% of rows
 
 # Contract / fee inputs
-USE_CONTRACTS_CSV = False
+USE_CONTRACTS_CSV = True
 CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
-USE_ROUND_TURN_FEE = False
+USE_ROUND_TURN_FEE = True
 ROUND_TURN_FEE_USD = 3.5
 
 # Margin trading inputs
-USE_MARGIN_PRICING = True  # If False, use ROUND_TURN_FEE_USD (if enabled)
+USE_MARGIN_PRICING = False  # If False, use ROUND_TURN_FEE_USD (if enabled)
 FEE_PCT = 0.001  # Round-turn fee as % of notional
 LEVERAGE = 50
 # Position sizing inputs (backtest only)
-USE_MARGIN_PER_TRADE = True
+USE_MARGIN_PER_TRADE = False
 MARGIN_PER_TRADE_USD = 10
 
 # CSV output options
@@ -273,6 +270,23 @@ class FVG_Backtest(FVG_Strategy):
     def _cleanup_partial_groups(self) -> None:
         cleanup_partial_groups(self.active_orders, self._partial_groups)
 
+    def _close_all_positions(self, current_price: float, current_timestamp: datetime, reason: str):
+        """
+        Backtest-specific forced close path (session close / max drawdown).
+        Ensures forced exits are recorded in backtest_trades.csv and account balance is updated.
+        """
+        for order in list(self.active_orders):
+            self._set_order_exit_context(order, current_price, current_timestamp, reason=reason)
+            order.close_order()
+            self.pyramiding.on_position_closed(order, self)
+            if order.pnl is not None:
+                self.account_balance += order.pnl
+            self._record_trade(order)
+        self.active_orders = []
+        self.lastPositionWasLong = False
+        self.lastPositionWasShort = False
+        self._cleanup_partial_groups()
+
     def _apply_pyramiding_add_on(
         self,
         current_price: float,
@@ -466,98 +480,6 @@ class FVG_Backtest(FVG_Strategy):
         )
         return htf_resampled
 
-    def _precompute_indicators(self) -> None:
-        """
-        Precompute heavy, fully-vectorizable indicators once over the full dataset
-        so we don't recompute them on every bar in the backtest loop.
-        """
-        if self._full_data is None:
-            return
-
-        df = self._full_data
-
-        # === Precompute HTF EMA on close prices (matches ema(..., EMA_PERIOD)) ===
-        if "close" in df.columns:
-            df["htf_ema"] = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
-
-        # === Precompute ATR (full series) and its SMA ===
-        try:
-            high = df["high"]
-            low = df["low"]
-            close = df["close"]
-            tr1 = high - low
-            tr2 = (high - close.shift(1)).abs()
-            tr3 = (low - close.shift(1)).abs()
-            true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            full_atr = pd.Series(index=df.index, dtype=float)
-            if len(true_range) >= ATR_PERIOD:
-                full_atr.iloc[ATR_PERIOD - 1] = true_range.iloc[:ATR_PERIOD].mean()
-                for i in range(ATR_PERIOD, len(true_range)):
-                    prev_atr = full_atr.iloc[i - 1]
-                    full_atr.iloc[i] = (prev_atr * (ATR_PERIOD - 1) + true_range.iloc[i]) / ATR_PERIOD
-            df["atr"] = full_atr
-            df["atr_sma"] = full_atr.rolling(20, min_periods=1).mean()
-        except Exception:
-            pass
-
-        # === Precompute volume SMA used for volume check ===
-        if "volume" in df.columns:
-            df["vol_sma"] = df["volume"].rolling(20, min_periods=1).mean()
-        self._precompute_htf_resample()
-
-    def _precompute_htf_resample(self) -> None:
-        if self._full_data is None or "timestamp" not in self._full_data.columns:
-            self._htf_resampled = None
-            return
-        htf_data = self._full_data.copy()
-        ts_series = htf_data["timestamp"]
-        if pd.api.types.is_numeric_dtype(ts_series):
-            max_val = pd.Series(ts_series).max()
-            unit = "ms" if max_val > 10**12 else "s"
-            htf_data["timestamp"] = pd.to_datetime(ts_series, unit=unit, utc=True)
-        else:
-            numeric_ts = pd.to_numeric(ts_series, errors="coerce")
-            if numeric_ts.notna().any():
-                max_val = numeric_ts.max()
-                unit = "ms" if max_val > 10**12 else "s"
-                htf_data["timestamp"] = pd.to_datetime(numeric_ts, unit=unit, utc=True)
-            else:
-                htf_data["timestamp"] = pd.to_datetime(ts_series, utc=True, errors="coerce")
-        htf_data = htf_data[htf_data["timestamp"].notna()]
-        if htf_data.empty:
-            self._htf_resampled = None
-            return
-        htf_data = htf_data.set_index("timestamp")
-
-        htf_minutes = int(HTF_TF)
-        if htf_minutes == 240:
-            resample_period = "4h"
-        elif htf_minutes == 120:
-            resample_period = "2h"
-        elif htf_minutes == 60:
-            resample_period = "1h"
-        elif htf_minutes == 1440:
-            resample_period = "1d"
-        elif htf_minutes >= 1440:
-            resample_period = f"{htf_minutes // 1440}d"
-        elif htf_minutes >= 60:
-            resample_period = f"{htf_minutes // 60}h"
-        else:
-            resample_period = f"{htf_minutes}min"
-
-        agg_dict = {"open": "first", "high": "max", "low": "min", "close": "last"}
-        if "volume" in htf_data.columns:
-            agg_dict["volume"] = "sum"
-
-        self._htf_resampled = (
-            htf_data.resample(
-                resample_period, label="right", closed="right", origin="epoch"
-            )
-            .agg(agg_dict)
-            .dropna()
-            .reset_index()
-        )
-
     def _parse_start_timestamp(self, ts) -> datetime | None:
         """
         Accepts a timestamp as:
@@ -670,290 +592,11 @@ class FVG_Backtest(FVG_Strategy):
         start_idx = max(0, len(htf_resampled) - bars_needed)
         return htf_resampled.iloc[start_idx:].copy()
 
-    def _get_current_atr_value(self):
-        if (
-            self._full_data is not None
-            and "atr" in self._full_data.columns
-            and self._current_index is not None
-        ):
-            val = self._full_data["atr"].iloc[self._current_index]
-            if pd.notna(val):
-                return float(val)
-        atr_series = get_atr(self.data, ATR_PERIOD)
-        return atr_series.iloc[-1] if len(atr_series) > 0 else None
-
     def _calc_order_size_from_margin(self, entry_price: float) -> float:
         if entry_price <= 0:
             return 0.0
         notional = float(MARGIN_PER_TRADE_USD) * float(LEVERAGE)
         return notional / float(entry_price)
-
-    def _update_trend_indicators(self):
-        bars = self.fetch_htf_data()
-        htfEMA = ema(bars, EMA_PERIOD)
-
-        if htfEMA is None:
-            self.isBullishHTF = False
-            self.isBearishHTF = False
-        else:
-            self.isBullishHTF = self.cur_close > htfEMA
-            self.isBearishHTF = self.cur_close < htfEMA
-
-        atr_val = get_atr(self.data, ATR_PERIOD)
-        atr_val = atr_val.iloc[-1] if (atr_val is not None and len(atr_val) > 0) else None
-        atr_sma = None
-        if atr_val is not None:
-            atr_series = get_atr(self.data, ATR_PERIOD)
-            if atr_series is not None and len(atr_series) > 0:
-                atr_sma = sma(atr_series, min(20, len(atr_series)))
-        atrOK = (
-            atr_val > atr_sma
-            if (atr_val is not None and atr_sma is not None and pd.notna(atr_val) and pd.notna(atr_sma))
-            else False
-        )
-
-        if USE_VOLUME_CHECK:
-            vol_sma = sma(self.data["volume"], 20)
-            volOK = self.cur_volume > vol_sma * VOLUME_MULTIPLIER if vol_sma is not None else False
-            self.marketOK = volOK and atrOK
-        else:
-            self.marketOK = atrOK
-
-        self.lastBullFvg = (
-            self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
-        )
-        self.lastBearFvg = (
-            self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
-        )
-
-    def entry_logic(self):
-        if len(self.fvg_zones) == 0:
-            return
-
-        if MAX_DRAWDOWN_ENABLED and self._is_drawdown_lockout(self._get_current_timestamp()):
-            return
-
-        if not self.check_daily_trade_limit():
-            print(f"⚠️ Daily trade limit reached ({MAX_DAILY_TRADES}). No new trades today.")
-            return
-
-        allow_intracandle = ALLOW_INTRACANDLE_ENTRY
-        current_high = self.data["high"].iloc[-1]
-        current_low = self.data["low"].iloc[-1]
-        if allow_intracandle and hasattr(self, "_intrabar_high") and hasattr(self, "_intrabar_low"):
-            current_high = self._intrabar_high
-            current_low = self._intrabar_low
-
-        atr = self._get_current_atr_value()
-
-        for zone in self.fvg_zones[-FVG_HISTORY_NBR:]:
-            if not self.pyramiding.should_allow_entry(self, zone):
-                continue
-            if zone["mitigated"]:
-                continue
-
-            fvg_bottom = zone["bottom"]
-            fvg_top = zone["top"]
-
-            # Full touch: current bar's high/low overlaps the FVG zone
-            touchesFVG = current_high >= fvg_bottom and current_low <= fvg_top
-
-            if (
-                zone["direction"] == "bull"
-                and touchesFVG
-                and self.isBullishHTF
-                and self.marketOK
-            ):
-                entry_price = self.cur_close
-                if allow_intracandle:
-                    entry_price = fvg_top
-                stop_loss = entry_price - atr * SL_MULTIPLIER
-                if USE_TRAILING:
-                    trail_stop = entry_price - atr * TRAIL_OFFSET_MULT
-                else:
-                    trail_stop = None
-
-                tp = entry_price + atr * TP_MULTIPLIER
-                entryAtr = atr
-                group_id = self._next_partial_group_id()
-                self._partial_groups[group_id] = {
-                    "entry_price": entry_price,
-                    "entry_atr": entryAtr,
-                    "side": "BUY",
-                    "tp_steps_closed": 0,
-                    "sl_steps_closed": 0,
-                }
-                any_success = False
-                if SPLIT_ORDERS_ENABLED:
-                    if USE_MARGIN_PER_TRADE:
-                        total_size = self._calc_order_size_from_margin(entry_price)
-                        per_order_size = total_size / float(self._split_order_count)
-                    else:
-                        per_order_size = EACH_TRADE_SIZE
-                    for idx in range(self._split_order_count):
-                        active_order = self.Order(
-                            entry_atr=entryAtr,
-                            side="BUY",
-                            entry_price=entry_price,
-                            take_profit=tp,
-                            stop_loss=stop_loss,
-                            trailing_stop_loss=trail_stop,
-                            order_size=per_order_size,
-                            **self.api_order_kwargs(),
-                        )
-                        active_order.group_id = group_id
-                        active_order.group_seq = idx + 1
-                        active_order.entry_reference_price = entry_price
-                        result = active_order.place_order()
-
-                        success = isinstance(result, dict) and result.get("success", False)
-                        if result is None:
-                            # Backtest or non-API mode: treat as success
-                            success = True
-                        if success:
-                            active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
-                            self.active_orders.append(active_order)
-                            any_success = True
-                            self.pyramiding.on_position_opened(active_order, self)
-                else:
-                    if USE_MARGIN_PER_TRADE:
-                        order_size = self._calc_order_size_from_margin(entry_price)
-                    else:
-                        order_size = FIXED_LOT if USE_FIXED_LOT else self.calculate_order_size(
-                            atr=atr, sl_mult=SL_MULTIPLIER
-                        )
-                    active_order = self.Order(
-                        entry_atr=entryAtr,
-                        side="BUY",
-                        entry_price=entry_price,
-                        take_profit=tp,
-                        stop_loss=stop_loss,
-                        trailing_stop_loss=trail_stop,
-                        order_size=order_size,
-                        **self.api_order_kwargs(),
-                    )
-                    active_order.group_id = group_id
-                    active_order.group_seq = 1
-                    active_order.entry_reference_price = entry_price
-                    result = active_order.place_order()
-                    success = isinstance(result, dict) and result.get("success", False)
-                    if result is None:
-                        # Backtest or non-API mode: treat as success
-                        success = True
-                    if success:
-                        active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
-                        self.active_orders.append(active_order)
-                        any_success = True
-                        self.pyramiding.on_position_opened(active_order, self)
-
-                if any_success:
-                    zone["mitigated"] = True
-                    self.lastPositionWasLong = True
-                    self.lastPositionWasShort = False
-                    self.daily_trades_count += 1
-                    self.last_trade_date = str(datetime.now().date())
-                    print(f"📈 LONG position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
-                else:
-                    self._partial_groups.pop(group_id, None)
-                break
-
-            elif (
-                zone["direction"] == "bear"
-                and touchesFVG
-                and self.isBearishHTF
-                and self.marketOK
-            ):
-                entry_price = self.cur_close
-                if allow_intracandle:
-                    entry_price = fvg_bottom
-                stop_loss = entry_price + atr * SL_MULTIPLIER
-                if USE_TRAILING:
-                    trail_stop = entry_price + atr * TRAIL_OFFSET_MULT
-                else:
-                    trail_stop = None
-
-                tp = entry_price - atr * TP_MULTIPLIER
-                entryAtr = atr
-                group_id = self._next_partial_group_id()
-                self._partial_groups[group_id] = {
-                    "entry_price": entry_price,
-                    "entry_atr": entryAtr,
-                    "side": "SELL",
-                    "tp_steps_closed": 0,
-                    "sl_steps_closed": 0,
-                }
-                any_success = False
-                if SPLIT_ORDERS_ENABLED:
-                    if USE_MARGIN_PER_TRADE:
-                        total_size = self._calc_order_size_from_margin(entry_price)
-                        per_order_size = total_size / float(self._split_order_count)
-                    else:
-                        per_order_size = EACH_TRADE_SIZE
-                    for idx in range(self._split_order_count):
-                        active_order = self.Order(
-                            entry_atr=entryAtr,
-                            side="SELL",
-                            entry_price=entry_price,
-                            take_profit=tp,
-                            trailing_stop_loss=trail_stop,
-                            stop_loss=stop_loss,
-                            order_size=per_order_size,
-                            **self.api_order_kwargs(),
-                        )
-                        active_order.group_id = group_id
-                        active_order.group_seq = idx + 1
-                        active_order.entry_reference_price = entry_price
-                        result = active_order.place_order()
-
-                        success = isinstance(result, dict) and result.get("success", False)
-                        if result is None:
-                            # Backtest or non-API mode: treat as success
-                            success = True
-                        if success:
-                            active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
-                            self.active_orders.append(active_order)
-                            any_success = True
-                            self.pyramiding.on_position_opened(active_order, self)
-                else:
-                    if USE_MARGIN_PER_TRADE:
-                        order_size = self._calc_order_size_from_margin(entry_price)
-                    else:
-                        order_size = FIXED_LOT if USE_FIXED_LOT else self.calculate_order_size(
-                            atr=atr, sl_mult=SL_MULTIPLIER
-                        )
-                    active_order = self.Order(
-                        entry_atr=entryAtr,
-                        side="SELL",
-                        entry_price=entry_price,
-                        take_profit=tp,
-                        trailing_stop_loss=trail_stop,
-                        stop_loss=stop_loss,
-                        order_size=order_size,
-                        **self.api_order_kwargs(),
-                    )
-                    active_order.group_id = group_id
-                    active_order.group_seq = 1
-                    active_order.entry_reference_price = entry_price
-                    result = active_order.place_order()
-                    success = isinstance(result, dict) and result.get("success", False)
-                    if result is None:
-                        success = True
-                    if success:
-                        active_order.opened_eval_ts_ms = self._get_opened_eval_ts_ms_for_current_bar()
-                        self.active_orders.append(active_order)
-                        any_success = True
-                        self.pyramiding.on_position_opened(active_order, self)
-
-                if any_success:
-                    zone["mitigated"] = True
-                    self.lastPositionWasShort = True
-                    self.lastPositionWasLong = False
-                    self.daily_trades_count += 1
-                    self.last_trade_date = str(datetime.now().date())
-                    print(f"📉 SHORT position opened. Daily trades: {self.daily_trades_count}/{MAX_DAILY_TRADES}")
-                else:
-                    self._partial_groups.pop(group_id, None)
-                break
 
     def check_daily_trade_limit(self):
         if self._current_dt is None:
@@ -1225,10 +868,12 @@ class FVG_Backtest(FVG_Strategy):
                 self._cursor += 1
                 continue
 
+            # Mirror live bar_iteration session guard behavior:
+            # block new entries after cutoff and force-close at market close.
+            self._apply_session_time_guards()
+
             self.update_indicators()
-            prev_zone_count = len(self.fvg_zones)
             self.add_fvg_zones()
-            created_new_zone = len(self.fvg_zones) > prev_zone_count
 
 
             if len(self.active_orders) > 0:
@@ -1295,25 +940,85 @@ class FVG_Backtest(FVG_Strategy):
                 if self.account_balance <= 0:
                     self._stopped = True
                     break
-                if getattr(self, "require_intrabar_entry", False) and created_new_zone:
-                    self._cursor += 1
-                    continue
-                last_index = self.data.index[-1]
-                orig_high = self.data.at[last_index, "high"]
-                orig_low = self.data.at[last_index, "low"]
-                if not ALLOW_INTRACANDLE_ENTRY:
-                    self.data.at[last_index, "high"] = self.cur_close
-                    self.data.at[last_index, "low"] = self.cur_close
-                try:
-                    if getattr(self, "require_intrabar_entry", False):
-                        self._intrabar_mode = True
-                    self.entry_logic()
-                finally:
-                    if getattr(self, "require_intrabar_entry", False):
-                        self._intrabar_mode = False
+                intrabar_checked = False
+                if (
+                    getattr(self, "require_intrabar_entry", False)
+                    and self._full_data_1m is not None
+                ):
+                    ts_val = new_row["timestamp"].iloc[-1]
+                    try:
+                        bar_ts_ms = int(float(ts_val))
+                        if bar_ts_ms < 10**12:
+                            bar_ts_ms = int(bar_ts_ms * 1000)
+                    except (TypeError, ValueError):
+                        bar_ts = self._extract_bar_time(new_row)
+                        bar_ts_ms = int(bar_ts.timestamp() * 1000) if bar_ts else 0
+
+                    one_min_bars = self._get_1m_bars_for_15m_bar(bar_ts_ms)
+                    if not one_min_bars.empty:
+                        intrabar_checked = True
+                        for _, row_1m in one_min_bars.iterrows():
+                            if self.active_orders:
+                                break
+
+                            ts_1m = row_1m["timestamp"]
+                            try:
+                                ts_1m = int(float(ts_1m))
+                            except (TypeError, ValueError):
+                                ts_1m = 0
+
+                            eval_bucket_ms = ts_1m if ts_1m > 10**12 else ts_1m * 1000
+                            tick_dt = (
+                                self._parse_start_timestamp(ts_1m)
+                                if ts_1m
+                                else self._current_dt
+                            )
+                            tick_price = (
+                                float(row_1m["close"])
+                                if "close" in row_1m and pd.notna(row_1m["close"])
+                                else self.cur_close
+                            )
+                            tick_high = (
+                                float(row_1m["high"])
+                                if "high" in row_1m and pd.notna(row_1m["high"])
+                                else tick_price
+                            )
+                            tick_low = (
+                                float(row_1m["low"])
+                                if "low" in row_1m and pd.notna(row_1m["low"])
+                                else tick_price
+                            )
+
+                            self._run_intrabar_entry_logic(
+                                tick_price=tick_price,
+                                tick_high=tick_high,
+                                tick_low=tick_low,
+                            )
+
+                            if self.active_orders:
+                                for order in self.active_orders:
+                                    if getattr(order, "opened_eval_ts_ms", None) is None:
+                                        order.opened_eval_ts_ms = eval_bucket_ms
+                                    if order.entry_time is None:
+                                        order.entry_time = tick_dt
+
+                if not self.active_orders and not intrabar_checked:
+                    last_index = self.data.index[-1]
+                    orig_high = self.data.at[last_index, "high"]
+                    orig_low = self.data.at[last_index, "low"]
                     if not ALLOW_INTRACANDLE_ENTRY:
-                        self.data.at[last_index, "high"] = orig_high
-                        self.data.at[last_index, "low"] = orig_low
+                        self.data.at[last_index, "high"] = self.cur_close
+                        self.data.at[last_index, "low"] = self.cur_close
+                    try:
+                        if getattr(self, "require_intrabar_entry", False):
+                            self._intrabar_mode = True
+                        self.entry_logic()
+                    finally:
+                        if getattr(self, "require_intrabar_entry", False):
+                            self._intrabar_mode = False
+                        if not ALLOW_INTRACANDLE_ENTRY:
+                            self.data.at[last_index, "high"] = orig_high
+                            self.data.at[last_index, "low"] = orig_low
                 if self.active_orders:
                     for active_order in self.active_orders:
                         if active_order.entry_time is None:

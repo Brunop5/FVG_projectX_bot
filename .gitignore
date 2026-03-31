@@ -1,5 +1,7 @@
 backtest/results
 backtest/data
+backtest/optimization_results
+backtest/*.json
 pyrightconfig.json
 */runtime_data
 
