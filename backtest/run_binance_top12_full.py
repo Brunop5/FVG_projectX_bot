@@ -55,7 +55,7 @@ def _json_safe_dict(d: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def _load_top_candidates(path: Path, top_n: int) -> list[dict[str, Any]]:
+def _load_top_candidates(path: Path, top_n: int, skip_first: int = 0) -> list[dict[str, Any]]:
     if not path.exists():
         raise FileNotFoundError(path)
     df = pd.read_csv(path)
@@ -66,6 +66,8 @@ def _load_top_candidates(path: Path, top_n: int) -> list[dict[str, Any]]:
         df = df[~failed_col.isin(["true", "1", "yes"])]
     df["objective"] = pd.to_numeric(df["objective"], errors="coerce")
     df = df[df["objective"].notna()].sort_values("objective", ascending=True)
+    if skip_first > 0:
+        df = df.iloc[skip_first:]
     return df.head(top_n).to_dict(orient="records")
 
 
@@ -82,10 +84,7 @@ def _build_trial_inputs(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _strategy_folder_name(rank: int, row: dict[str, Any]) -> str:
-    trial = str(_to_native(row.get("trial", "na")))
-    run_id = _to_native(row.get("run_id"))
-    run_tag = str(run_id) if run_id not in (None, "", "nan") else "legacy"
-    return f"strategy_{rank:02d}_run_{run_tag}_trial_{trial}"
+    return f"test_{rank}"
 
 
 def _force_backtest_second_half(backtest: Any) -> None:
@@ -292,6 +291,7 @@ def _append_result_row(final_csv: Path, row: dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run full-data Binance backtests for top optimized strategies.")
     parser.add_argument("--top-n", type=int, default=12, help="How many top rows by objective to run.")
+    parser.add_argument("--skip-first", type=int, default=4, help="Skip the first N top-ranked rows before selecting top-n.")
     parser.add_argument("--max-workers", type=int, default=4, help="How many backtests to run concurrently.")
     parser.add_argument("--opt-csv", type=str, default=str(BINANCE_OPT_CSV), help="Path to binance optimization_results.csv.")
     parser.add_argument("--out-dir", type=str, default=str(OUT_DIR), help="Output folder for this runner.")
@@ -311,7 +311,11 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     final_csv = out_dir / "final_result.csv"
 
-    candidates = _load_top_candidates(Path(args.opt_csv).resolve(), args.top_n)
+    candidates = _load_top_candidates(
+        Path(args.opt_csv).resolve(),
+        args.top_n,
+        skip_first=max(0, int(args.skip_first)),
+    )
     if not candidates:
         raise RuntimeError("No eligible candidates found in optimization CSV.")
 

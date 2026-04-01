@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 BACKTEST_DIR = Path(__file__).resolve().parent
-os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs_backtest_gold.json"))
+os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs_binance.json"))
 
 from FVG_projectX_bot.FVG_strategy import *
 from FVG_projectX_bot.helping_functions.partial_close import (
@@ -24,12 +24,12 @@ BACKTEST_RUNTIME_DIR = BACKTEST_DIR / INPUTS.RUNTIME_SUBDIR
 BACKTEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==================== USER CONFIG ====================
-ASSET = "MGCJ6"
+ASSET = "BTC"
 TIMEFRAME = "15m"
-INITIAL_BALANCE = 50000
-DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "MGCG6" / "IC_markets_15min.csv")
+INITIAL_BALANCE = 50
+DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
 # Optional 1min data for entry/close TP/SL (matches live behavior). If None, use 15m bar high/low.
-DATA_1M_CSV_PATH = None
+DATA_1M_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_1m.csv")
 START_TIMESTAMP = None
 
 # Pyramiding mode: "none", "client_atr", or "max_orders"
@@ -38,20 +38,20 @@ MAX_PYRAMID_ORDERS = 3
 
 # Backtest data window (bars)
 BACKTEST_WINDOW_BARS = None
-USE_LAST_QUARTER_DATA = False  # If True, only use the last 25% of rows
+USE_LAST_QUARTER_DATA = True  # If True, only use the last 25% of rows
 
 # Contract / fee inputs
-USE_CONTRACTS_CSV = True
+USE_CONTRACTS_CSV = False
 CONTRACTS_CSV_PATH = str(PARENT_DIR.parent / "contracts.csv")
-USE_ROUND_TURN_FEE = True
+USE_ROUND_TURN_FEE = False
 ROUND_TURN_FEE_USD = 3.5
 
 # Margin trading inputs
-USE_MARGIN_PRICING = False  # If False, use ROUND_TURN_FEE_USD (if enabled)
+USE_MARGIN_PRICING = True  # If False, use ROUND_TURN_FEE_USD (if enabled)
 FEE_PCT = 0.001  # Round-turn fee as % of notional
 LEVERAGE = 50
 # Position sizing inputs (backtest only)
-USE_MARGIN_PER_TRADE = False
+USE_MARGIN_PER_TRADE = True
 MARGIN_PER_TRADE_USD = 10
 
 # CSV output options
@@ -244,6 +244,7 @@ class FVG_Backtest(FVG_Strategy):
         self._start_from_dt = self._parse_start_timestamp(start_timestamp) if start_timestamp is not None else None
         self.tick_size = None
         self.tick_value = None
+        self.force_margin_per_trade_sizing = bool(USE_MARGIN_PER_TRADE)
         self.round_turn_fee_usd = ROUND_TURN_FEE_USD if USE_ROUND_TURN_FEE else None
         if USE_CONTRACTS_CSV:
             self._load_contract_info()

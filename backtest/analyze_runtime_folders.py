@@ -79,6 +79,68 @@ def _compute_streaks(signs: list[int]) -> tuple[int, int]:
     return max_win, max_loss
 
 
+def _compute_drawdown_episode_durations(
+    exit_ts: pd.Series,
+    equity_series: pd.Series,
+) -> tuple[float, float]:
+    """
+    Returns:
+      - duration_seconds of the biggest drawdown episode (by depth)
+      - duration_seconds of the longest drawdown episode (by time)
+    """
+    if len(exit_ts) == 0 or len(equity_series) == 0:
+        return 0.0, 0.0
+
+    df = pd.DataFrame({"ts": exit_ts, "equity": equity_series})
+    df = df[df["ts"].notna() & df["equity"].notna()].sort_values("ts").reset_index(drop=True)
+    if df.empty:
+        return 0.0, 0.0
+
+    peak_val = float(df["equity"].iloc[0])
+    peak_time = df["ts"].iloc[0]
+
+    in_dd = False
+    dd_start_time = None
+    dd_max_depth = 0.0
+    episodes: list[dict[str, float]] = []
+
+    for row in df.itertuples(index=False):
+        ts = row.ts
+        eq = float(row.equity)
+
+        if eq >= peak_val:
+            if in_dd and dd_start_time is not None:
+                dur = max(0.0, float((ts - dd_start_time).total_seconds()))
+                episodes.append({"depth": dd_max_depth, "duration_sec": dur})
+                in_dd = False
+                dd_start_time = None
+                dd_max_depth = 0.0
+            peak_val = eq
+            peak_time = ts
+            continue
+
+        # eq < peak_val -> drawdown
+        depth = peak_val - eq
+        if not in_dd:
+            in_dd = True
+            dd_start_time = peak_time if peak_time is not None else ts
+            dd_max_depth = depth
+        else:
+            dd_max_depth = max(dd_max_depth, depth)
+
+    if in_dd and dd_start_time is not None:
+        end_ts = df["ts"].iloc[-1]
+        dur = max(0.0, float((end_ts - dd_start_time).total_seconds()))
+        episodes.append({"depth": dd_max_depth, "duration_sec": dur})
+
+    if not episodes:
+        return 0.0, 0.0
+
+    biggest_by_depth = max(episodes, key=lambda e: e["depth"])
+    longest_by_time = max(episodes, key=lambda e: e["duration_sec"])
+    return float(biggest_by_depth["duration_sec"]), float(longest_by_time["duration_sec"])
+
+
 def _extended_metrics(trades_df: pd.DataFrame, base_summary: dict[str, Any]) -> dict[str, Any]:
     if trades_df.empty:
         return {}
@@ -123,6 +185,10 @@ def _extended_metrics(trades_df: pd.DataFrame, base_summary: dict[str, Any]) -> 
 
     expectancy = (win_rate / 100.0) * avg_win + (1.0 - win_rate / 100.0) * avg_loss
 
+    trade_durations = (exit_ts - entry_ts).dt.total_seconds()
+    trade_durations = trade_durations[trade_durations.notna() & (trade_durations >= 0)]
+    avg_trade_duration_sec = float(trade_durations.mean()) if not trade_durations.empty else 0.0
+
     start_dt = entry_ts.min()
     end_dt = exit_ts.max() if exit_ts.notna().any() else entry_ts.max()
     backtest_days = (
@@ -147,6 +213,11 @@ def _extended_metrics(trades_df: pd.DataFrame, base_summary: dict[str, Any]) -> 
 
     max_dd = _safe_float(base_summary.get("max_drawdown"))
     recovery_factor = (net_profit / max_dd) if max_dd > 1e-12 else math.inf
+    equity_series = pd.to_numeric(trades_df.get("equity", pd.Series(dtype=float)), errors="coerce")
+    biggest_dd_dur_sec, longest_dd_dur_sec = _compute_drawdown_episode_durations(
+        exit_ts=exit_ts,
+        equity_series=equity_series,
+    )
 
     total_fees = 0.0
     if "total_fees" in trades_df.columns:
@@ -173,6 +244,12 @@ def _extended_metrics(trades_df: pd.DataFrame, base_summary: dict[str, Any]) -> 
         "largest_win": largest_win,
         "largest_loss": largest_loss,
         "max_drawdown": max_dd,
+        "avg_trade_duration_sec": avg_trade_duration_sec,
+        "avg_trade_duration_hours": avg_trade_duration_sec / 3600.0,
+        "biggest_drawdown_duration_sec": biggest_dd_dur_sec,
+        "biggest_drawdown_duration_hours": biggest_dd_dur_sec / 3600.0,
+        "longest_drawdown_duration_sec": longest_dd_dur_sec,
+        "longest_drawdown_duration_hours": longest_dd_dur_sec / 3600.0,
         "recovery_factor": recovery_factor,
         "trades_per_day": trades_per_day,
         "backtest_days": backtest_days,
