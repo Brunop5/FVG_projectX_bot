@@ -184,9 +184,16 @@ def place_strategy_entry_orders(
         return order
 
     any_success = False
+    force_margin_sizing = bool(getattr(strategy, "force_margin_per_trade_sizing", False))
     if inputs.SPLIT_ORDERS_ENABLED:
+        if force_margin_sizing:
+            total_size = strategy._calc_order_size_from_margin(entry_price)
+            safe_split_count = max(1, int(split_order_count))
+            per_order_size = total_size / float(safe_split_count)
+        else:
+            per_order_size = inputs.EACH_TRADE_SIZE
         for idx in range(split_order_count):
-            order = _create_entry_order(inputs.EACH_TRADE_SIZE, idx + 1)
+            order = _create_entry_order(per_order_size, idx + 1)
             result = order.place_order()
             success = isinstance(result, dict) and result.get("success", False)
             if result is None:
@@ -196,10 +203,13 @@ def place_strategy_entry_orders(
                 any_success = True
         return any_success
 
-    order_size = inputs.FIXED_LOT if inputs.USE_FIXED_LOT else strategy.calculate_order_size(
-        atr=entry_atr,
-        sl_mult=inputs.SL_MULTIPLIER,
-    )
+    if force_margin_sizing:
+        order_size = strategy._calc_order_size_from_margin(entry_price)
+    else:
+        order_size = inputs.FIXED_LOT if inputs.USE_FIXED_LOT else strategy.calculate_order_size(
+            atr=entry_atr,
+            sl_mult=inputs.SL_MULTIPLIER,
+        )
     order = _create_entry_order(order_size, 1)
     result = order.place_order()
     success = isinstance(result, dict) and result.get("success", False)
