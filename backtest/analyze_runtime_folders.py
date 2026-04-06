@@ -39,9 +39,78 @@ def _find_runtime_dirs(root_dir: Path) -> list[Path]:
     return sorted({p.parent for p in root_dir.rglob("backtest_trades.csv")})
 
 
-def _resolve_price_csv(runtime_dir: Path) -> Path | None:
+def _extract_trades_time_bounds(trades_csv: Path) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    if not trades_csv.exists():
+        return None
+    try:
+        trades_df = pd.read_csv(trades_csv, usecols=["entry_time", "exit_time"])
+    except Exception:
+        return None
+    if trades_df.empty:
+        return None
+    entry_ts = pd.to_datetime(trades_df["entry_time"], utc=True, errors="coerce")
+    exit_ts = pd.to_datetime(trades_df["exit_time"], utc=True, errors="coerce")
+    start_dt = entry_ts.min()
+    end_dt = exit_ts.max() if exit_ts.notna().any() else entry_ts.max()
+    if pd.isna(start_dt) or pd.isna(end_dt):
+        return None
+    return start_dt, end_dt
+
+
+def _extract_price_time_bounds(price_csv: Path) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    if not price_csv.exists():
+        return None
+    try:
+        price_df = pd.read_csv(price_csv)
+    except Exception:
+        return None
+    if price_df.empty:
+        return None
+    if "timestamp" not in price_df.columns:
+        if "<DATE>" in price_df.columns and "<TIME>" in price_df.columns:
+            ts = pd.to_datetime(
+                price_df["<DATE>"].astype(str) + " " + price_df["<TIME>"].astype(str),
+                utc=True,
+                errors="coerce",
+            )
+        else:
+            return None
+    else:
+        ts_raw = price_df["timestamp"]
+        if pd.api.types.is_numeric_dtype(ts_raw):
+            max_val = pd.to_numeric(ts_raw, errors="coerce").max()
+            unit = "ms" if pd.notna(max_val) and float(max_val) > 10**12 else "s"
+            ts = pd.to_datetime(ts_raw, unit=unit, utc=True, errors="coerce")
+        else:
+            ts_num = pd.to_numeric(ts_raw, errors="coerce")
+            if ts_num.notna().any():
+                max_val = ts_num.max()
+                unit = "ms" if pd.notna(max_val) and float(max_val) > 10**12 else "s"
+                ts = pd.to_datetime(ts_num, unit=unit, utc=True, errors="coerce")
+            else:
+                ts = pd.to_datetime(ts_raw, utc=True, errors="coerce")
+    ts = ts[ts.notna()]
+    if ts.empty:
+        return None
+    return ts.min(), ts.max()
+
+
+def _price_covers_trade_window(price_csv: Path, trades_csv: Path) -> bool:
+    trade_bounds = _extract_trades_time_bounds(trades_csv)
+    if trade_bounds is None:
+        return True
+    price_bounds = _extract_price_time_bounds(price_csv)
+    if price_bounds is None:
+        return False
+    trade_start, trade_end = trade_bounds
+    price_start, price_end = price_bounds
+    return bool(price_start <= trade_start and price_end >= trade_end)
+
+
+def _resolve_price_csv(runtime_dir: Path, trades_csv: Path) -> Path | None:
     local_price = runtime_dir / "backtest_data.csv"
-    if local_price.exists():
+    local_ok = local_price.exists() and _price_covers_trade_window(local_price, trades_csv)
+    if local_ok:
         return local_price
 
     metadata_path = runtime_dir / "backtest_metadata.json"
@@ -52,10 +121,13 @@ def _resolve_price_csv(runtime_dir: Path) -> Path | None:
             data_path = metadata.get("data_path")
             if data_path:
                 candidate = Path(str(data_path))
-                if candidate.exists():
+                if candidate.exists() and _price_covers_trade_window(candidate, trades_csv):
                     return candidate
         except Exception:
-            return None
+            pass
+    # Fallback order when full coverage is unavailable.
+    if local_price.exists():
+        return local_price
     return None
 
 
@@ -198,12 +270,13 @@ def _extended_metrics(trades_df: pd.DataFrame, base_summary: dict[str, Any]) -> 
     )
     trades_per_day = (num_trades / backtest_days) if backtest_days > 0 else 0.0
 
-    pnl_by_month = pnl.groupby(entry_ts.dt.to_period("M")).sum()
+    entry_ts_naive = entry_ts.dt.tz_localize(None)
+    pnl_by_month = pnl.groupby(entry_ts_naive.dt.to_period("M")).sum()
     avg_month_pnl = float(pnl_by_month.mean()) if not pnl_by_month.empty else 0.0
     best_month_pnl = float(pnl_by_month.max()) if not pnl_by_month.empty else 0.0
     worst_month_pnl = float(pnl_by_month.min()) if not pnl_by_month.empty else 0.0
 
-    pnl_by_week = pnl.groupby(entry_ts.dt.to_period("W")).sum()
+    pnl_by_week = pnl.groupby(entry_ts_naive.dt.to_period("W")).sum()
     avg_week_pnl = float(pnl_by_week.mean()) if not pnl_by_week.empty else 0.0
     best_week_pnl = float(pnl_by_week.max()) if not pnl_by_week.empty else 0.0
     worst_week_pnl = float(pnl_by_week.min()) if not pnl_by_week.empty else 0.0
@@ -272,7 +345,7 @@ def _analyze_runtime_dir(runtime_dir: Path, start_equity: float) -> dict[str, An
     if not trades_csv.exists():
         raise FileNotFoundError(trades_csv)
 
-    price_csv = _resolve_price_csv(runtime_dir)
+    price_csv = _resolve_price_csv(runtime_dir, trades_csv)
     if price_csv is None:
         raise FileNotFoundError(f"No price CSV found for {runtime_dir}")
 

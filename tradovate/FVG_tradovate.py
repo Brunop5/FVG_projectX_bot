@@ -315,6 +315,10 @@ class TradovateClient:
 
 
 class Tradovate_Order(FVG_Order):
+    MIN_ORDER_SIZE = 1.0
+    ORDER_SIZE_STEP = None
+    ORDER_SIZE_INTEGER_ONLY = True
+
     def __init__(self, client: TradovateClient, account_id: int, contract_id: int, **kwargs):
         super().__init__(**kwargs)
         self._client = client

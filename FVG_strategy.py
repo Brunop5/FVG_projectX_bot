@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import sys
 import threading
@@ -90,6 +91,12 @@ def _apply_username_overrides(username: str | None) -> None:
 
 
 class FVG_Order(Order):
+    # Defaults for fractional-size venues (e.g., Binance in backtest/live simulation).
+    # Venue-specific subclasses can override these.
+    MIN_ORDER_SIZE: float = 0.002
+    ORDER_SIZE_STEP: float | None = None
+    ORDER_SIZE_INTEGER_ONLY: bool = False
+
     entry_atr: float
     pyramid_count: int
     next_add_price: float | None
@@ -111,26 +118,74 @@ class FVG_Order(Order):
         self.entry_reference_price = self.entry_price
         self.opened_eval_ts_ms = None
 
+    def _normalize_order_size(self, value: float) -> float | int:
+        if value is None or isinstance(value, bool):
+            mode = "integer" if self.ORDER_SIZE_INTEGER_ONLY else "numeric"
+            raise ValueError(f"order_size must be a positive {mode} value.")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"order_size must be numeric, got {value!r}.") from None
+        if not math.isfinite(numeric):
+            raise ValueError(f"order_size must be finite, got {value!r}.")
+
+        if self.ORDER_SIZE_INTEGER_ONLY:
+            rounded = int(round(numeric))
+            if not math.isclose(numeric, rounded, rel_tol=1e-9, abs_tol=1e-9):
+                print(
+                    "⚠️  order_size was not an integer; "
+                    f"rounded {numeric!r} → {rounded}"
+                )
+            min_qty_int = max(1, int(round(float(self.MIN_ORDER_SIZE or 1.0))))
+            if rounded < min_qty_int:
+                print(
+                    "⚠️  order_size rounded below minimum; "
+                    f"clamped {rounded} → {min_qty_int}"
+                )
+                rounded = min_qty_int
+            return rounded
+
+        normalized = numeric
+        min_qty = float(self.MIN_ORDER_SIZE or 0.0)
+        if normalized < min_qty:
+            print(
+                "⚠️  order_size below minimum; "
+                f"clamped {normalized} → {min_qty}"
+            )
+            normalized = min_qty
+
+        step = self.ORDER_SIZE_STEP
+        if step is not None and float(step) > 0:
+            step_val = float(step)
+            stepped = round(normalized / step_val) * step_val
+            if not math.isclose(normalized, stepped, rel_tol=1e-9, abs_tol=1e-9):
+                print(
+                    "⚠️  order_size not aligned to step; "
+                    f"rounded {normalized!r} → {stepped!r}"
+                )
+            normalized = max(min_qty, stepped)
+        return float(normalized)
+
     def add_to_position(self, add_size: float, log=print):
         if add_size is None or add_size <= 0:
             return {"success": False, "message": "Invalid add-on size"}
         original_size = float(self.order_size or 0.0)
-        add_size_int = self._normalize_order_size(add_size)
-        self.order_size = add_size_int
+        add_size_norm = self._normalize_order_size(add_size)
+        self.order_size = add_size_norm
         result = self.place_order()
         success = isinstance(result, dict) and result.get("success", False)
         if result is None:
             success = True
         if success:
-            new_size = original_size + float(add_size_int)
+            new_size = original_size + float(add_size_norm)
             if new_size > 0 and self.avg_entry_price is not None:
                 self.avg_entry_price = (
                     (self.avg_entry_price * original_size)
-                    + (self.entry_price * float(add_size_int))
+                    + (self.entry_price * float(add_size_norm))
                 ) / new_size
             self.order_size = self._normalize_order_size(new_size)
             log(
-                f"➕ Add-on placed: size={add_size_int} new_size={self.order_size} "
+                f"➕ Add-on placed: size={add_size_norm} new_size={self.order_size} "
                 f"side={self.side} entry={self.entry_price}"
             )
             return {"success": True, "new_size": self.order_size, "result": result}
