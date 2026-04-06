@@ -26,7 +26,7 @@ BACKTEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 # ==================== USER CONFIG ====================
 ASSET = "BTC"
 TIMEFRAME = "15m"
-INITIAL_BALANCE = 50
+INITIAL_BALANCE = 500
 DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
 # Optional 1min data for entry/close TP/SL (matches live behavior). If None, use 15m bar high/low.
 DATA_1M_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_1m.csv")
@@ -38,7 +38,7 @@ MAX_PYRAMID_ORDERS = 3
 
 # Backtest data window (bars)
 BACKTEST_WINDOW_BARS = None
-USE_LAST_QUARTER_DATA = True  # If True, only use the last 25% of rows
+USE_LAST_QUARTER_DATA = False  # If True, only use the last 25% of rows
 
 # Contract / fee inputs
 USE_CONTRACTS_CSV = False
@@ -90,6 +90,10 @@ def _get_active_backtest():
 
 
 class BacktestOrder(FVG_Order):
+    MIN_ORDER_SIZE = 0.002
+    ORDER_SIZE_STEP = None
+    ORDER_SIZE_INTEGER_ONLY = False
+
     is_open: bool
     entry_time: datetime | None
     exit_time: datetime | None
@@ -235,6 +239,9 @@ class FVG_Backtest(FVG_Strategy):
         self._full_data = None
         self._full_data_1m = None
         self._htf_resampled = None
+        self._htf_source_indexed = None
+        self._htf_resample_period = None
+        self._htf_period_delta = None
         self._current_index = None
         self._cursor = 0
         self._current_dt = None
@@ -430,56 +437,103 @@ class FVG_Backtest(FVG_Strategy):
     def _resample_htf_data(self, current_timestamp: datetime) -> pd.DataFrame:
         if self._full_data is None or "timestamp" not in self._full_data.columns:
             return pd.DataFrame()
+
+        self._build_htf_cache()
+        if self._htf_resampled is None or self._htf_source_indexed is None:
+            return pd.DataFrame()
+        ts = pd.Timestamp(current_timestamp)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        resample_period = self._htf_resample_period
+        period_delta = self._htf_period_delta
+        if not resample_period or period_delta is None:
+            return pd.DataFrame()
+
+        # Keep all fully closed HTF bars (relative to current timestamp) from cache.
+        current_bucket_end = ts.ceil(resample_period)
+        closed = self._htf_resampled[self._htf_resampled["timestamp"] < current_bucket_end]
+
+        # Build the in-progress HTF bar using current 15m close/high/low values,
+        # preserving live-like "current unclosed HTF candle close" behavior.
+        bucket_start = current_bucket_end - period_delta
+        src = self._htf_source_indexed
+        partial = src[(src.index > bucket_start) & (src.index <= ts)]
+        if partial.empty:
+            return closed
+
+        partial_row = {
+            "timestamp": current_bucket_end,
+            "open": float(partial["open"].iloc[0]),
+            "high": float(partial["high"].max()),
+            "low": float(partial["low"].min()),
+            "close": float(partial["close"].iloc[-1]),
+        }
+        if "volume" in partial.columns:
+            partial_row["volume"] = float(partial["volume"].sum())
+
+        return pd.concat([closed, pd.DataFrame([partial_row])], ignore_index=True)
+
+    def _resolve_htf_resample_period(self) -> str:
+        htf_minutes = int(HTF_TF)
+        if htf_minutes == 240:
+            return "4h"
+        if htf_minutes == 120:
+            return "2h"
+        if htf_minutes == 60:
+            return "1h"
+        if htf_minutes == 1440:
+            return "1d"
+        if htf_minutes >= 1440:
+            return f"{htf_minutes // 1440}d"
+        if htf_minutes >= 60:
+            return f"{htf_minutes // 60}h"
+        return f"{htf_minutes}min"
+
+    def _build_htf_cache(self) -> None:
+        if self._htf_source_indexed is not None and self._htf_resampled is not None:
+            return
+        if self._full_data is None or "timestamp" not in self._full_data.columns:
+            return
+
         htf_data = self._full_data.copy()
-        # Normalize timestamps to UTC datetimes even if stored as numeric strings.
         ts_series = htf_data["timestamp"]
         if pd.api.types.is_numeric_dtype(ts_series):
             max_val = pd.Series(ts_series).max()
             unit = "ms" if max_val > 10**12 else "s"
-            htf_data["timestamp"] = pd.to_datetime(ts_series, unit=unit, utc=True)
+            htf_data["timestamp"] = pd.to_datetime(ts_series, unit=unit, utc=True, errors="coerce")
         else:
             numeric_ts = pd.to_numeric(ts_series, errors="coerce")
             if numeric_ts.notna().any():
                 max_val = numeric_ts.max()
                 unit = "ms" if max_val > 10**12 else "s"
-                htf_data["timestamp"] = pd.to_datetime(numeric_ts, unit=unit, utc=True)
+                htf_data["timestamp"] = pd.to_datetime(numeric_ts, unit=unit, utc=True, errors="coerce")
             else:
                 htf_data["timestamp"] = pd.to_datetime(ts_series, utc=True, errors="coerce")
-        htf_data = htf_data[htf_data["timestamp"].notna()]
-        htf_data = htf_data[htf_data["timestamp"] <= current_timestamp]
-        if htf_data.empty:
-            return pd.DataFrame()
-        htf_data = htf_data.set_index("timestamp")
 
-        htf_minutes = int(HTF_TF)
-        if htf_minutes == 240:
-            resample_period = "4h"
-        elif htf_minutes == 120:
-            resample_period = "2h"
-        elif htf_minutes == 60:
-            resample_period = "1h"
-        elif htf_minutes == 1440:
-            resample_period = "1d"
-        elif htf_minutes >= 1440:
-            resample_period = f"{htf_minutes // 1440}d"
-        elif htf_minutes >= 60:
-            resample_period = f"{htf_minutes // 60}h"
-        else:
-            resample_period = f"{htf_minutes}min"
+        htf_data = htf_data[htf_data["timestamp"].notna()]
+        if htf_data.empty:
+            self._htf_source_indexed = pd.DataFrame()
+            self._htf_resampled = pd.DataFrame()
+            return
+
+        htf_data = htf_data.set_index("timestamp").sort_index()
+        self._htf_source_indexed = htf_data
+        self._htf_resample_period = self._resolve_htf_resample_period()
+        self._htf_period_delta = pd.Timedelta(self._htf_resample_period)
 
         agg_dict = {"open": "first", "high": "max", "low": "min", "close": "last"}
         if "volume" in htf_data.columns:
             agg_dict["volume"] = "sum"
-        # Use origin='epoch' to align bars to true timeframe boundaries (e.g. 00:00, 04:00, ...)
-        htf_resampled = (
+        self._htf_resampled = (
             htf_data.resample(
-                resample_period, label="right", closed="right", origin="epoch"
+                self._htf_resample_period, label="right", closed="right", origin="epoch"
             )
             .agg(agg_dict)
             .dropna()
             .reset_index()
         )
-        return htf_resampled
 
     def _parse_start_timestamp(self, ts) -> datetime | None:
         """
@@ -516,6 +570,7 @@ class FVG_Backtest(FVG_Strategy):
 
     def gather_data(self) -> pd.DataFrame:
         self._full_data = self._load_data()
+        self._build_htf_cache()
         self._full_data_1m = self._load_data_1m()
         if self._full_data_1m is not None:
             self._full_data_1m = self._full_data_1m.sort_values("timestamp").reset_index(drop=True)
@@ -859,7 +914,9 @@ class FVG_Backtest(FVG_Strategy):
                 self._stopped = True
                 break
             new_row = self._full_data.iloc[[self._cursor]]
-            self.data = pd.concat([self.data, new_row], ignore_index=True)
+            # Mirror live runners (Binance/ProjectX): keep only the most recent bars.
+            # This prevents self.data from growing unbounded and slowing indicator/entry checks.
+            self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:]
             self.cur_close = float(new_row["close"].iloc[-1])
             self.cur_volume = float(new_row["volume"].iloc[-1]) if "volume" in new_row.columns else 0.0
             self._current_dt = self._extract_bar_time(new_row)
@@ -872,10 +929,6 @@ class FVG_Backtest(FVG_Strategy):
             # Mirror live bar_iteration session guard behavior:
             # block new entries after cutoff and force-close at market close.
             self._apply_session_time_guards()
-
-            self.update_indicators()
-            self.add_fvg_zones()
-
 
             if len(self.active_orders) > 0:
                 self._closed_any_this_bar = False
@@ -934,10 +987,16 @@ class FVG_Backtest(FVG_Strategy):
                     self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
                     self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
                     self._cleanup_partial_groups()
+                # Keep strategy state in sync with the latest closed 15m bar,
+                # but only after close checks to avoid same-bar lookahead exits.
+                self.update_indicators()
+                self.add_fvg_zones()
                 if self.account_balance <= 0:
                     self._stopped = True
                     break
             else:
+                self.update_indicators()
+                self.add_fvg_zones()
                 if self.account_balance <= 0:
                     self._stopped = True
                     break

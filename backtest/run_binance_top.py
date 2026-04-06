@@ -29,7 +29,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PACKAGE_DIR = SCRIPT_DIR.parent
 WORKSPACE_DIR = PACKAGE_DIR.parent
 
-BINANCE_OPT_CSV = SCRIPT_DIR / "results" / "optimization_results" / "binance" / "optimization_results.csv"
+BINANCE_OPT_CSV = SCRIPT_DIR / "optimization_results" / "binance" / "optimization_results.csv"
 BINANCE_INPUTS_PATH = SCRIPT_DIR / "inputs_binance.json"
 OUT_DIR = SCRIPT_DIR / "results" / "btc_opt_results"
 RESULT_MARKER = "__BINANCE_TOP_RESULT__"
@@ -153,7 +153,7 @@ def _run_worker(row: dict[str, Any], rank: int, out_root: Path) -> dict[str, Any
             sys.executable,
             "-u",
             "-m",
-            "FVG_projectX_bot.backtest.run_binance_top12_full",
+            "FVG_projectX_bot.backtest.run_binance_top",
             "--worker",
             "--inputs-path",
             str(inputs_path),
@@ -173,14 +173,33 @@ def _run_worker(row: dict[str, Any], rank: int, out_root: Path) -> dict[str, Any
 
         out_lines: list[str] = []
         result_payload: dict[str, Any] | None = None
+        insufficient_margin_detected = False
         assert proc.stdout is not None
         for raw in proc.stdout:
             line = raw.rstrip("\n")
             out_lines.append(line)
+            if "insufficient margin" in line.lower():
+                insufficient_margin_detected = True
+                print(f"[top{rank:02d}] ⛔ Failing strategy early: insufficient margin detected.")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
             if line.startswith(RESULT_MARKER):
                 result_payload = json.loads(line[len(RESULT_MARKER):])
                 continue
             print(f"[top{rank:02d}] {line}")
+
+        if insufficient_margin_detected:
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            raise RuntimeError("Worker aborted early: insufficient margin.")
 
         rc = proc.wait()
         if rc != 0:
@@ -201,7 +220,7 @@ def _worker_mode(inputs_path: Path, row_payload: Path, strategy_dir: Path) -> No
 
     bt.ASSET = "BTC"
     bt.TIMEFRAME = "15m"
-    bt.INITIAL_BALANCE = 50.0
+    bt.INITIAL_BALANCE = 500.0
     bt.LEVERAGE = 50
     bt.USE_MARGIN_PER_TRADE = True
     bt.MARGIN_PER_TRADE_USD = 10
@@ -253,39 +272,44 @@ def _worker_mode(inputs_path: Path, row_payload: Path, strategy_dir: Path) -> No
     avg_loss = float(summary.get("average_losing_trade", 0.0))
     avg_win_vs_loss = (avg_win / abs(avg_loss)) if avg_loss not in (0.0, -0.0) else math.inf
 
-    result_row = {
-        "run_id": _to_native(row.get("run_id")),
-        "trial": _to_native(row.get("trial")),
-        "objective": float(_to_native(row.get("objective", summary.get("max_drawdown", 0.0))) or 0.0),
-        "total_pnl": float(summary.get("total_pnl_original", 0.0)),
-        "max_dd": float(summary.get("max_drawdown", 0.0)),
-        "trades_per_day": float(summary.get("num_trades", 0) / max(float(summary.get("days_of_backtest", 0.0) or 1.0), 1e-9)),
-        "trades_total": int(summary.get("num_trades", 0)),
-        "winrate": float((win_count / max(win_count + loss_count, 1)) * 100.0),
-        "average_win": avg_win,
-        "average_loss": avg_loss,
-        "average_win_vs_loss": float(avg_win_vs_loss),
-        "total_fees": total_fees,
-        "winning_trades": win_count,
-        "losing_trades": loss_count,
-        "profit_factor_sharpe": float(summary.get("sharpe", 0.0)),
-        "largest_win": largest_win,
-        "largest_loss": largest_loss,
-        "backtest_days": float(summary.get("days_of_backtest", 0.0)),
-        "strategy_dir": str(strategy_dir),
-    }
+    pnl_total = float(summary.get("total_pnl_original", 0.0))
+    max_dd = float(summary.get("max_drawdown", 0.0))
+    ratio = (max_dd / pnl_total) if pnl_total > 0 else math.inf
+    objective = (
+        (1_000_000.0 + abs(pnl_total) + max_dd)
+        if pnl_total <= 0
+        else ratio
+    )
+    result_row = dict(row)
+    result_row.update(
+        {
+            "failed": False,
+            "error": "",
+            "ratio": float(ratio) if math.isfinite(ratio) else None,
+            "tpd_penalty_factor": 1.0,
+            "pnl": pnl_total,
+            "max_dd": max_dd,
+            "trades_per_day": float(summary.get("num_trades", 0) / max(float(summary.get("days_of_backtest", 0.0) or 1.0), 1e-9)),
+            "trades_total": int(summary.get("num_trades", 0)),
+            "average_win": avg_win,
+            "average_loss": avg_loss,
+            "win_rate": float((win_count / max(win_count + loss_count, 1)) * 100.0),
+            "objective": float(objective),
+            "RUNTIME_SUBDIR": str(strategy_dir),
+        }
+    )
     print(f"{RESULT_MARKER}{json.dumps(result_row)}")
 
 
-def _append_result_row(final_csv: Path, row: dict[str, Any]) -> None:
+def _append_result_row(final_csv: Path, row: dict[str, Any], fieldnames: list[str]) -> None:
     final_csv.parent.mkdir(parents=True, exist_ok=True)
     write_header = not final_csv.exists()
-    fieldnames = list(row.keys())
+    normalized_row = {k: row.get(k) for k in fieldnames}
     with final_csv.open("a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(normalized_row)
 
 
 def main() -> None:
@@ -309,7 +333,9 @@ def main() -> None:
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    final_csv = out_dir / "final_result.csv"
+    final_csv = out_dir / "optimization_results.csv"
+    opt_source_df = pd.read_csv(Path(args.opt_csv).resolve())
+    fieldnames = list(opt_source_df.columns)
 
     candidates = _load_top_candidates(
         Path(args.opt_csv).resolve(),
@@ -322,13 +348,25 @@ def main() -> None:
     max_workers = max(1, int(args.max_workers))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_run_worker, row=row, rank=idx, out_root=out_dir): idx
+            executor.submit(_run_worker, row=row, rank=idx, out_root=out_dir): (idx, row)
             for idx, row in enumerate(candidates, start=1)
         }
         for fut in as_completed(futures):
-            idx = futures[fut]
-            result = fut.result()
-            _append_result_row(final_csv, result)
+            idx, base_row = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as exc:
+                failed_row = dict(base_row)
+                failed_row.update(
+                    {
+                        "failed": True,
+                        "error": str(exc),
+                    }
+                )
+                _append_result_row(final_csv, failed_row, fieldnames)
+                print(f"❌ Saved failed result for strategy {idx}/{len(candidates)} -> {final_csv}")
+                continue
+            _append_result_row(final_csv, result, fieldnames)
             print(f"✅ Saved metrics for strategy {idx}/{len(candidates)} -> {final_csv}")
 
     print(f"\nDone. Results CSV: {final_csv}")

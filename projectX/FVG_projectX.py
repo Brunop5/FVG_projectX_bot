@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 import warnings
-import math
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -93,6 +92,10 @@ def init_api(username, api_key):
 
 
 class ProjectX_Order(FVG_Order):
+    MIN_ORDER_SIZE = 1.0
+    ORDER_SIZE_STEP = None
+    ORDER_SIZE_INTEGER_ONLY = True
+
     account_id: str
     asset_id: str
     auth_token: str
@@ -103,30 +106,6 @@ class ProjectX_Order(FVG_Order):
         self.account_id = account_id
         self.asset_id = asset_id
         self.auth_token = auth_token
-
-    def _normalize_order_size(self, value):
-        if value is None or isinstance(value, bool):
-            raise ValueError("order_size must be a positive integer.")
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"order_size must be numeric, got {value!r}.") from None
-        if not math.isfinite(numeric):
-            raise ValueError(f"order_size must be finite, got {value!r}.")
-        rounded = int(round(numeric))
-        if not math.isclose(numeric, rounded, rel_tol=1e-9, abs_tol=1e-9):
-            print(
-                "⚠️  order_size was not an integer; "
-                f"rounded {numeric!r} → {rounded}"
-            )
-        if rounded <= 0:
-            print(
-                "⚠️  order_size rounded to <= 0; "
-                f"clamped {rounded} → 1"
-            )
-            rounded = 1
-        return rounded
-
 
     def place_order(self):
         """
