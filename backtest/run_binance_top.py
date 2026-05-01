@@ -133,7 +133,13 @@ def _ensure_trades_csv_exists(path: Path) -> None:
         writer.writeheader()
 
 
-def _run_worker(row: dict[str, Any], rank: int, out_root: Path) -> dict[str, Any]:
+def _run_worker(
+    row: dict[str, Any],
+    rank: int,
+    out_root: Path,
+    *,
+    second_half: bool = False,
+) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="btc_top12_") as tmp_dir:
         strategy_dir = out_root / _strategy_folder_name(rank, row)
         strategy_dir.mkdir(parents=True, exist_ok=True)
@@ -162,6 +168,8 @@ def _run_worker(row: dict[str, Any], rank: int, out_root: Path) -> dict[str, Any
             "--strategy-dir",
             str(strategy_dir),
         ]
+        if second_half:
+            cmd.append("--second-half")
         proc = subprocess.Popen(
             cmd,
             cwd=str(WORKSPACE_DIR),
@@ -209,7 +217,13 @@ def _run_worker(row: dict[str, Any], rank: int, out_root: Path) -> dict[str, Any
         return result_payload
 
 
-def _worker_mode(inputs_path: Path, row_payload: Path, strategy_dir: Path) -> None:
+def _worker_mode(
+    inputs_path: Path,
+    row_payload: Path,
+    strategy_dir: Path,
+    *,
+    second_half: bool = False,
+) -> None:
     os.environ["FVG_INPUTS_JSON"] = str(inputs_path.resolve())
 
     from FVG_projectX_bot.backtest import FVG_backtest as bt
@@ -237,7 +251,8 @@ def _worker_mode(inputs_path: Path, row_payload: Path, strategy_dir: Path) -> No
         pyramiding_mode=bt.PYRAMIDING_MODE,
         data_path_1m=bt.DATA_1M_CSV_PATH,
     )
-    _force_backtest_second_half(backtest)
+    if second_half:
+        _force_backtest_second_half(backtest)
     _ensure_trades_csv_exists(Path(backtest.trades_csv_path))
     backtest.run()
 
@@ -317,6 +332,11 @@ def main() -> None:
     parser.add_argument("--top-n", type=int, default=12, help="How many top rows by objective to run.")
     parser.add_argument("--skip-first", type=int, default=4, help="Skip the first N top-ranked rows before selecting top-n.")
     parser.add_argument("--max-workers", type=int, default=4, help="How many backtests to run concurrently.")
+    parser.add_argument(
+        "--second-half",
+        action="store_true",
+        help="Start from midpoint of 15m history (legacy behavior).",
+    )
     parser.add_argument("--opt-csv", type=str, default=str(BINANCE_OPT_CSV), help="Path to binance optimization_results.csv.")
     parser.add_argument("--out-dir", type=str, default=str(OUT_DIR), help="Output folder for this runner.")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -328,7 +348,12 @@ def main() -> None:
     if args.worker:
         if not args.inputs_path or not args.row_payload or not args.strategy_dir:
             raise ValueError("Worker mode requires --inputs-path, --row-payload, and --strategy-dir.")
-        _worker_mode(Path(args.inputs_path), Path(args.row_payload), Path(args.strategy_dir))
+        _worker_mode(
+            Path(args.inputs_path),
+            Path(args.row_payload),
+            Path(args.strategy_dir),
+            second_half=bool(args.second_half),
+        )
         return
 
     out_dir = Path(args.out_dir).resolve()
@@ -348,7 +373,13 @@ def main() -> None:
     max_workers = max(1, int(args.max_workers))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_run_worker, row=row, rank=idx, out_root=out_dir): (idx, row)
+            executor.submit(
+                _run_worker,
+                row=row,
+                rank=idx,
+                out_root=out_dir,
+                second_half=bool(args.second_half),
+            ): (idx, row)
             for idx, row in enumerate(candidates, start=1)
         }
         for fut in as_completed(futures):

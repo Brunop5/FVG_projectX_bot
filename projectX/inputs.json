@@ -1,10 +1,10 @@
 {
   "APIS": {
-    "Bruno": {
-      "username": "REDACTED_EMAIL",
-      "api_key": "REDACTED_PROJECTX_API_KEY=",
+    "Primary": {
+      "username": "${PROJECTX_USERNAME}",
+      "api_key": "${PROJECTX_API_KEY}",
       "assets_list": [
-        ["CON.F.US.MGC.J26", "15min", "50KTC-V2-546152-16615340"]
+        ["${PROJECTX_ASSET}", "${PROJECTX_TIMEFRAME}", "${PROJECTX_ACCOUNT_NAME}"]
       ]
     }
   },
