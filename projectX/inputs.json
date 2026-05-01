@@ -1,10 +1,10 @@
 {
   "APIS": {
-    "Bruno": {
-      "username": "bruno@platek.sk",
-      "api_key": "xS9c0el16xOwmGu33Y8J5b0qCdDjqO4rV/judAac9d4=",
+    "Primary": {
+      "username": "${PROJECTX_USERNAME}",
+      "api_key": "${PROJECTX_API_KEY}",
       "assets_list": [
-        ["CON.F.US.MGC.J26", "15min", "50KTC-V2-546152-16615340"]
+        ["${PROJECTX_ASSET}", "${PROJECTX_TIMEFRAME}", "${PROJECTX_ACCOUNT_NAME}"]
       ]
     }
   },

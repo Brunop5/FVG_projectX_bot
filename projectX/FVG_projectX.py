@@ -82,7 +82,7 @@ def setup_global_logging(log_path: str) -> None:
 def init_api(username, api_key):
     res = login_to_api(username, api_key)
     if not res["success"]:
-        print(username, api_key)
+        print(username)
         print(res)
         raise RuntimeError("❌ API login failed")
 
@@ -726,6 +726,10 @@ def validation_thread(
 if __name__ == "__main__":
     setup_global_logging(PROJECTX_LOG_PATH)
     for api in INPUTS.APIS.values():
+        if not api.get("username") or not api.get("api_key"):
+            raise RuntimeError(
+                "Missing ProjectX credentials. Set PROJECTX_USERNAME and PROJECTX_API_KEY in .env."
+            )
         global_token = init_api(api["username"], api["api_key"])
 
         if INPUTS.UPDATE_CONTRACT_LIST:

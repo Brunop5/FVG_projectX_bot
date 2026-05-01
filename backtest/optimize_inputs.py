@@ -14,9 +14,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import os
+import random
 import re
 import statistics
 import subprocess
@@ -32,10 +34,8 @@ import pandas as pd
 
 try:
     import optuna
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "optuna is required. Install with: pip install optuna"
-    ) from exc
+except ImportError:  # pragma: no cover
+    optuna = None
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -167,6 +167,38 @@ def _suggest_params(trial: "optuna.trial.Trial", base_inputs: dict[str, Any]) ->
         # Keep baseline value if trailing is disabled.
         params["TRAIL_OFFSET_MULT"] = base_inputs.get("TRAIL_OFFSET_MULT", 1.0)
 
+    return params
+
+
+def _rand_int_step(rng: random.Random, start: int, stop: int, step: int = 1) -> int:
+    return int(rng.randrange(int(start), int(stop) + int(step), int(step)))
+
+
+def _rand_float_step(rng: random.Random, start: float, stop: float, step: float) -> float:
+    steps = int(round((float(stop) - float(start)) / float(step)))
+    idx = rng.randint(0, max(0, steps))
+    value = float(start) + float(step) * idx
+    return float(round(value, 10))
+
+
+def _sample_random_params(base_inputs: dict[str, Any], rng: random.Random) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "FVG_HISTORY_NBR": _rand_int_step(rng, 1, 15, 1),
+        "MIN_FVG_POWER_PCT": _rand_float_step(rng, 0.0, 0.1, 0.01),
+        "HTF_TF": int(rng.choice([30, 60, 120, 240])),
+        "EMA_PERIOD": int(rng.choice([10, 25, 50, 100, 200])),
+        "VOLUME_MULTIPLIER": _rand_float_step(rng, 1.0, 1.3, 0.05),
+        "USE_VOLUME_CHECK": bool(rng.choice([True, False])),
+        "ATR_PERIOD": _rand_int_step(rng, 5, 25, 1),
+        "SL_MULTIPLIER": _rand_int_step(rng, 1, 20, 1),
+        "TP_MULTIPLIER": _rand_int_step(rng, 1, 20, 1),
+        "USE_TRAILING": bool(rng.choice([True, False])),
+        "HOLD_UNTIL_OPPOSITE": bool(rng.choice([True, False])),
+    }
+    if params["USE_TRAILING"]:
+        params["TRAIL_OFFSET_MULT"] = _rand_int_step(rng, 1, 20, 1)
+    else:
+        params["TRAIL_OFFSET_MULT"] = base_inputs.get("TRAIL_OFFSET_MULT", 1.0)
     return params
 
 
@@ -746,6 +778,14 @@ def main() -> None:
         default=2.0,
         help="Penalty curve exponent for low trades/day.",
     )
+    parser.add_argument(
+        "--random-search",
+        action="store_true",
+        help=(
+            "Run plain random parameter search (no Optuna optimizer). "
+            "In this mode, phase_idx and trial_in_phase are recorded as -1."
+        ),
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -835,6 +875,8 @@ def main() -> None:
             cmd.append("--restart-on-stagnation" if args.restart_on_stagnation else "--no-restart-on-stagnation")
             if args.timeout_sec is not None:
                 cmd.extend(["--timeout-sec", str(args.timeout_sec)])
+            if args.random_search:
+                cmd.append("--random-search")
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(WORKSPACE_DIR),
@@ -886,9 +928,10 @@ def main() -> None:
         if parsed_phase > max_existing_phase:
             max_existing_phase = parsed_phase
 
-    # Continue with a fresh phase index after the highest persisted phase.
-    phase_idx = max_existing_phase + 1 if max_existing_phase >= 0 else 0
-    phase_seed = int((int(args.seed) + phase_idx * 104_729) % (2**31 - 1))
+    # Continue with a fresh phase index after the highest persisted phase,
+    # except random-search mode where phase is intentionally marked as -1.
+    phase_idx = -1 if args.random_search else (max_existing_phase + 1 if max_existing_phase >= 0 else 0)
+    phase_seed = int((int(args.seed) + max(phase_idx, 0) * 104_729) % (2**31 - 1))
     if phase_seed <= 0:
         phase_seed = int(args.seed)
     phase_restarts = 0
@@ -900,8 +943,11 @@ def main() -> None:
         with trial_counter_lock:
             global_trial_idx = trial_counter
             trial_counter += 1
-            trial_in_phase = phase_trial_counter + 1
-            phase_trial_counter += 1
+            if phase_idx >= 0:
+                trial_in_phase = phase_trial_counter + 1
+                phase_trial_counter += 1
+            else:
+                trial_in_phase = -1
 
         trial_params = _suggest_params(trial, base_inputs)
         merged_inputs = dict(base_inputs)
@@ -977,84 +1023,176 @@ def main() -> None:
 
         return float(result["objective"])
 
-    while trial_counter < int(args.trials):
-        timeout_remaining: float | None = None
-        if args.timeout_sec is not None:
-            elapsed = time.monotonic() - optimization_start_monotonic
-            timeout_remaining = float(args.timeout_sec) - elapsed
-            if timeout_remaining <= 0:
+    if args.random_search:
+        rng = random.Random(int(args.seed))
+        total_trials = int(args.trials)
+        n_jobs = max(1, int(args.n_jobs))
+        scheduled = 0
+
+        def _run_random_trial(global_trial_idx: int, sampled_params: dict[str, Any]) -> None:
+            merged_inputs = dict(base_inputs)
+            merged_inputs.update(sampled_params)
+            merged_inputs["RUNTIME_SUBDIR"] = (
+                f"optimization_results/{target}/trial_runs/trial_{global_trial_idx}"
+            )
+            try:
+                result = _run_trial_subprocess(
+                    trial_inputs=merged_inputs,
+                    trial_idx=global_trial_idx,
+                    target=target,
+                    min_trades_per_day=args.min_trades_per_day,
+                    tpd_penalty_power=args.tpd_penalty_power,
+                )
+                failed = False
+                fail_reason = ""
+            except Exception as exc:
+                failed = True
+                fail_reason = str(exc)
+                result = {
+                    "objective": 9_999_999.0,
+                    "ratio": None,
+                    "tpd_penalty_factor": 1.0,
+                    "ending_pnl": 0.0,
+                    "max_drawdown": 0.0,
+                    "num_trades": 0,
+                    "trades_per_day": 0.0,
+                    "avg_win": 0.0,
+                    "avg_loss": 0.0,
+                    "win_rate": 0.0,
+                }
+
+            record = {
+                "run_id": run_id,
+                "trial": global_trial_idx,
+                "phase_idx": -1,
+                "trial_in_phase": -1,
+                "failed": failed,
+                "error": fail_reason,
+                "ratio": result.get("ratio"),
+                "tpd_penalty_factor": float(result["tpd_penalty_factor"]),
+                "pnl": float(result["ending_pnl"]),
+                "max_dd": float(result["max_drawdown"]),
+                "trades_per_day": float(result["trades_per_day"]),
+                "trades_total": int(result["num_trades"]),
+                "average_win": float(result["avg_win"]),
+                "average_loss": float(result["avg_loss"]),
+                "win_rate": float(result["win_rate"]),
+                "objective": float(result["objective"]),
+            }
+            record.update(merged_inputs)
+            with records_lock:
+                trial_records.append(record)
+                _write_results_snapshot(trial_records, results_csv)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
+            in_flight: set[concurrent.futures.Future] = set()
+            while scheduled < total_trials or in_flight:
+                while scheduled < total_trials and len(in_flight) < n_jobs:
+                    if args.timeout_sec is not None:
+                        elapsed = time.monotonic() - optimization_start_monotonic
+                        if elapsed >= float(args.timeout_sec):
+                            scheduled = total_trials
+                            break
+                    with trial_counter_lock:
+                        global_trial_idx = trial_counter
+                        trial_counter += 1
+                    sampled_params = _sample_random_params(base_inputs, rng)
+                    fut = executor.submit(_run_random_trial, global_trial_idx, sampled_params)
+                    in_flight.add(fut)
+                    scheduled += 1
+                if not in_flight:
+                    continue
+                done, _ = concurrent.futures.wait(
+                    in_flight,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    in_flight.remove(fut)
+                    fut.result()
+    else:
+        if optuna is None:
+            raise SystemExit(
+                "optuna is required for optimizer mode. Install with: pip install optuna "
+                "or run with --random-search."
+            )
+        while trial_counter < int(args.trials):
+            timeout_remaining: float | None = None
+            if args.timeout_sec is not None:
+                elapsed = time.monotonic() - optimization_start_monotonic
+                timeout_remaining = float(args.timeout_sec) - elapsed
+                if timeout_remaining <= 0:
+                    break
+
+            sampler = optuna.samplers.TPESampler(seed=phase_seed)
+            study = optuna.create_study(direction="minimize", sampler=sampler)
+            restart_triggered = False
+            restart_reason = ""
+
+            def _stagnation_callback(st: "optuna.study.Study", _: "optuna.trial.FrozenTrial") -> None:
+                nonlocal restart_triggered, restart_reason
+                if not args.restart_on_stagnation:
+                    return
+                window = max(3, int(args.stagnation_window))
+                completed = [
+                    t for t in st.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+                ]
+                if len(completed) < max(PHASE_MIN_COMPLETED_TRIALS, window):
+                    return
+                non_improve_streak, best_value = _count_consecutive_non_improvements(
+                    completed,
+                    objective_abs_tol=float(args.stagnation_objective_abs_tol),
+                    objective_rel_tol=float(args.stagnation_objective_rel_tol),
+                )
+                if non_improve_streak < window:
+                    return
+
+                if len(completed) < (2 * window):
+                    return
+
+                prior_values = [float(t.value) for t in completed[-2 * window : -window]]
+                recent_values = [float(t.value) for t in completed[-window:]]
+                prior_median = float(statistics.median(prior_values))
+                recent_median = float(statistics.median(recent_values))
+                if prior_median != 0.0:
+                    median_improvement = (prior_median - recent_median) / abs(prior_median)
+                else:
+                    median_improvement = 0.0 if recent_median >= prior_median else 1.0
+
+                # Restart only when the recent window no longer shows material progress.
+                if median_improvement >= PHASE_MEDIAN_IMPROVEMENT_MIN:
+                    return
+
+                restart_triggered = True
+                restart_reason = (
+                    f"{non_improve_streak} consecutive non-improvements "
+                    f"(best objective={best_value:.6f}); "
+                    f"median improvement over last {window} vs previous {window}="
+                    f"{median_improvement * 100:.2f}%"
+                )
+                st.stop()
+
+            n_trials_remaining = int(args.trials) - trial_counter
+            study.optimize(
+                objective,
+                n_trials=n_trials_remaining,
+                timeout=timeout_remaining,
+                n_jobs=max(1, int(args.n_jobs)),
+                show_progress_bar=False,
+                callbacks=[_stagnation_callback],
+            )
+
+            if not restart_triggered:
                 break
 
-        sampler = optuna.samplers.TPESampler(seed=phase_seed)
-        study = optuna.create_study(direction="minimize", sampler=sampler)
-        restart_triggered = False
-        restart_reason = ""
-
-        def _stagnation_callback(st: "optuna.study.Study", _: "optuna.trial.FrozenTrial") -> None:
-            nonlocal restart_triggered, restart_reason
-            if not args.restart_on_stagnation:
-                return
-            window = max(3, int(args.stagnation_window))
-            completed = [
-                t for t in st.trials if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-            ]
-            if len(completed) < max(PHASE_MIN_COMPLETED_TRIALS, window):
-                return
-            non_improve_streak, best_value = _count_consecutive_non_improvements(
-                completed,
-                objective_abs_tol=float(args.stagnation_objective_abs_tol),
-                objective_rel_tol=float(args.stagnation_objective_rel_tol),
+            phase_restarts += 1
+            phase_idx += 1
+            phase_trial_counter = 0
+            # Equivalent of script restart: fresh sampler seed => fresh random startup exploration.
+            phase_seed = int((time.time_ns() + phase_idx * 104_729) % (2**31 - 1))
+            print(
+                f"↻ Restarting optimization phase {phase_idx} with seed={phase_seed} "
+                f"because {restart_reason}."
             )
-            if non_improve_streak < window:
-                return
-
-            if len(completed) < (2 * window):
-                return
-
-            prior_values = [float(t.value) for t in completed[-2 * window : -window]]
-            recent_values = [float(t.value) for t in completed[-window:]]
-            prior_median = float(statistics.median(prior_values))
-            recent_median = float(statistics.median(recent_values))
-            if prior_median != 0.0:
-                median_improvement = (prior_median - recent_median) / abs(prior_median)
-            else:
-                median_improvement = 0.0 if recent_median >= prior_median else 1.0
-
-            # Restart only when the recent window no longer shows material progress.
-            if median_improvement >= PHASE_MEDIAN_IMPROVEMENT_MIN:
-                return
-
-            restart_triggered = True
-            restart_reason = (
-                f"{non_improve_streak} consecutive non-improvements "
-                f"(best objective={best_value:.6f}); "
-                f"median improvement over last {window} vs previous {window}="
-                f"{median_improvement * 100:.2f}%"
-            )
-            st.stop()
-
-        n_trials_remaining = int(args.trials) - trial_counter
-        study.optimize(
-            objective,
-            n_trials=n_trials_remaining,
-            timeout=timeout_remaining,
-            n_jobs=max(1, int(args.n_jobs)),
-            show_progress_bar=False,
-            callbacks=[_stagnation_callback],
-        )
-
-        if not restart_triggered:
-            break
-
-        phase_restarts += 1
-        phase_idx += 1
-        phase_trial_counter = 0
-        # Equivalent of script restart: fresh sampler seed => fresh random startup exploration.
-        phase_seed = int((time.time_ns() + phase_idx * 104_729) % (2**31 - 1))
-        print(
-            f"↻ Restarting optimization phase {phase_idx} with seed={phase_seed} "
-            f"because {restart_reason}."
-        )
 
     with records_lock:
         _write_results_snapshot(trial_records, results_csv)

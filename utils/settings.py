@@ -1,6 +1,7 @@
 # pyright: reportMissingImports=false
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -26,14 +27,101 @@ except ModuleNotFoundError:
             return default_factory()
         return default
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover
+    load_dotenv = None  # type: ignore
+
+if load_dotenv is not None:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+    load_dotenv(override=False)
+
+
+ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+
+def _env(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+def _resolve_env_placeholders(value: Any) -> Any:
+    if isinstance(value, str):
+        return ENV_PLACEHOLDER_RE.sub(
+            lambda match: os.getenv(match.group(1), ""),
+            value,
+        )
+    if isinstance(value, list):
+        return [_resolve_env_placeholders(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _resolve_env_placeholders(val) for key, val in value.items()}
+    return value
+
+
+def _apply_api_env_fallbacks(raw: dict[str, Any]) -> dict[str, Any]:
+    apis = raw.get("APIS")
+    if not isinstance(apis, dict):
+        return raw
+
+    default_asset = _env("PROJECTX_ASSET", default="CON.F.US.MGC.J26")
+    default_timeframe = _env("PROJECTX_TIMEFRAME", default="15min")
+    default_account_name = _env("PROJECTX_ACCOUNT_NAME", default="DEFAULT_ACCOUNT")
+    default_username = _env("PROJECTX_USERNAME", "USERNAME")
+    default_api_key = _env("PROJECTX_API_KEY", "API_KEY")
+
+    for api in apis.values():
+        if not isinstance(api, dict):
+            continue
+        if not api.get("username"):
+            api["username"] = default_username
+        if not api.get("api_key"):
+            api["api_key"] = default_api_key
+
+        assets_list = api.get("assets_list")
+        if not isinstance(assets_list, list):
+            api["assets_list"] = [[default_asset, default_timeframe, default_account_name]]
+            continue
+
+        normalized_assets = []
+        for item in assets_list:
+            if isinstance(item, list):
+                row = list(item)
+            elif isinstance(item, tuple):
+                row = list(item)
+            else:
+                continue
+
+            while len(row) < 3:
+                row.append("")
+
+            if not row[0]:
+                row[0] = default_asset
+            if not row[1]:
+                row[1] = default_timeframe
+            if not row[2]:
+                row[2] = default_account_name
+            normalized_assets.append(row[:3])
+
+        api["assets_list"] = normalized_assets or [[default_asset, default_timeframe, default_account_name]]
+
+    return raw
+
 
 def _default_apis() -> dict[str, dict[str, Any]]:
     return {
-        "Bruno": {
-            "username": "bruno@platek.sk",
-            "api_key": "xS9c0el16xOwmGu33Y8J5b0qCdDjqO4rV/judAac9d4=",
+        "Primary": {
+            "username": _env("PROJECTX_USERNAME", "USERNAME"),
+            "api_key": _env("PROJECTX_API_KEY", "API_KEY"),
             "assets_list": [
-                ["CON.F.US.MGC.J26", "15min", "50KTC-V2-546152-16615340"],
+                [
+                    _env("PROJECTX_ASSET", default="CON.F.US.MGC.J26"),
+                    _env("PROJECTX_TIMEFRAME", default="15min"),
+                    _env("PROJECTX_ACCOUNT_NAME", default="DEFAULT_ACCOUNT"),
+                ],
             ],
         }
     }
@@ -83,6 +171,7 @@ class StrategyInputs(BaseModel):
     MAX_DAILY_LOSS: float = 1000.0
 
     ENABLE_SESSION_TIME_GUARDS: bool = True
+    PROHIBIT_ENTRY_UNTIL_SHADOW_FILLED: bool = False
     MARKET_ENTRY_CUTOFF_UTC: str = "19:30"
     MARKET_CLOSE_UTC: str = "20:00"
     MARKET_REOPEN_UTC: str = "22:00"
@@ -135,5 +224,7 @@ def load_strategy_inputs(default_path: str | None = None) -> StrategyInputs:
 
     with p.open("r", encoding="utf-8") as f:
         raw = json.load(f)
+    raw = _resolve_env_placeholders(raw)
+    raw = _apply_api_env_fallbacks(raw)
     return _validate_inputs(raw)
 
