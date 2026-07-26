@@ -1,10 +1,11 @@
 import os
 import sys
+import json
 import logging
 import warnings
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from time import sleep
 import threading
 import time
@@ -21,6 +22,7 @@ from .projectx_api_functions import fetch_data
 from .projectx_api_functions import login_to_api
 from .projectx_api_functions import validate_token
 from .projectx_api_functions import sleep_until_next_boundary
+from .projectx_api_functions import _is_likely_futures_session_closed
 from .projectx_api_functions import topstepx_post
 from .projectx_api_functions import search_trades
 
@@ -287,6 +289,7 @@ class ProjectX_Strategy(FVG_Strategy):
         filename = self._safe_filename(f"{self.asset}-{self.timeframe}-{self.account_name}")
         self.csv_filename = os.path.join(PROJECTX_RUNTIME_DIR, f"{filename}.csv")
         self.metadata_filename = os.path.join(PROJECTX_RUNTIME_DIR, f"{filename}.json")
+        self._adopt_existing_runtime_snapshot()
 
     def _safe_filename(self, name: str) -> str:
         # Avoid Windows reserved device names like CON, PRN, AUX, NUL, COM1, LPT1
@@ -302,6 +305,93 @@ class ProjectX_Strategy(FVG_Strategy):
             safe = f"PX_{safe}"
         return safe
 
+    @staticmethod
+    def _looks_like_strategy_metadata(path: str) -> bool:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        markers = ("fvg_zones", "active_orders", "asset", "timeframe", "daily_trades_count")
+        return any(key in payload for key in markers)
+
+    def _resolve_csv_for_metadata(self, metadata_path: str) -> str:
+        """Prefer CSV beside the JSON; fall back to paths recorded inside it."""
+        stem_csv = os.path.splitext(metadata_path)[0] + ".csv"
+        if os.path.exists(stem_csv):
+            return stem_csv
+
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            payload = {}
+
+        candidates: list[str] = []
+        data_meta = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data_meta, dict):
+            recorded = data_meta.get("path")
+            if recorded:
+                candidates.append(recorded)
+                candidates.append(os.path.join(PROJECTX_RUNTIME_DIR, os.path.basename(recorded)))
+        recorded_csv = payload.get("csv_filename") if isinstance(payload, dict) else None
+        if recorded_csv:
+            candidates.append(recorded_csv)
+            candidates.append(os.path.join(PROJECTX_RUNTIME_DIR, os.path.basename(recorded_csv)))
+        candidates.append(self.csv_filename)
+
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        return stem_csv
+
+    def _adopt_existing_runtime_snapshot(self) -> None:
+        """
+        If the canonical metadata file is missing, adopt any strategy JSON already
+        present in runtime_data (any filename). Keeps saves pointed at that snapshot.
+        """
+        os.makedirs(PROJECTX_RUNTIME_DIR, exist_ok=True)
+        if os.path.exists(self.metadata_filename):
+            self.csv_filename = self._resolve_csv_for_metadata(self.metadata_filename)
+            base = os.path.splitext(self.csv_filename)[0]
+            self.trade_log_filename = f"{base}_trades.csv"
+            return
+
+        candidates: list[tuple[float, str]] = []
+        try:
+            names = os.listdir(PROJECTX_RUNTIME_DIR)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(PROJECTX_RUNTIME_DIR, name)
+            if not os.path.isfile(path):
+                continue
+            if not self._looks_like_strategy_metadata(path):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                mtime = 0.0
+            candidates.append((mtime, path))
+
+        if not candidates:
+            return
+
+        candidates.sort(reverse=True)
+        chosen = candidates[0][1]
+        self.metadata_filename = chosen
+        self.csv_filename = self._resolve_csv_for_metadata(chosen)
+        base = os.path.splitext(self.csv_filename)[0]
+        self.trade_log_filename = f"{base}_trades.csv"
+        print(
+            f"📄 Adopted runtime snapshot: {os.path.basename(chosen)} "
+            f"(csv={os.path.basename(self.csv_filename)})"
+        )
+
     def init_api(self, auth_token):
         self.set_token(auth_token)
         super().__init__()
@@ -314,10 +404,31 @@ class ProjectX_Strategy(FVG_Strategy):
         print(f"strat initializeds (auth_token {token_state})")
 
     def load_metadata(self) -> bool:
+        # Re-resolve in case files were dropped after construction.
+        self._adopt_existing_runtime_snapshot()
+        meta_path = self.metadata_filename
+        csv_path = self.csv_filename
+        trade_log = getattr(self, "trade_log_filename", None)
+
         ok = super().load_metadata()
         if ok:
             # Never trust persisted tokens; always re-authenticate.
             self.auth_token = None
+            # JSON may contain absolute paths from another machine — keep local ones.
+            self.metadata_filename = meta_path
+            self.csv_filename = csv_path
+            if trade_log:
+                self.trade_log_filename = trade_log
+            if (
+                (not isinstance(getattr(self, "data", None), pd.DataFrame) or self.data.empty)
+                and csv_path
+                and os.path.exists(csv_path)
+            ):
+                try:
+                    self.data = pd.read_csv(csv_path)
+                    print(f"📄 Reloaded bars from {csv_path}")
+                except Exception as exc:
+                    print(f"⚠️ Failed to reload bars from {csv_path}: {exc}")
         return ok
 
     def save_data(self) -> None:
@@ -359,10 +470,22 @@ class ProjectX_Strategy(FVG_Strategy):
         if data is not None:
             return data
         data = fetch_data(self.asset, self.timeframe, 100, self.auth_token)
-        if data is None:
-            print("⚠️  Initial data fetch failed; starting with empty dataset.")
-            return pd.DataFrame()
-        return data
+        if data is not None and len(data) > 0:
+            return data
+        # Weekend / outage fallback: use bars already saved beside the runtime JSON.
+        if self.csv_filename and os.path.exists(self.csv_filename):
+            try:
+                df = pd.read_csv(self.csv_filename)
+                if not df.empty:
+                    print(
+                        f"📄 API bars unavailable; using runtime CSV "
+                        f"({len(df)} rows) from {self.csv_filename}"
+                    )
+                    return df
+            except Exception as exc:
+                print(f"⚠️ Failed reading runtime CSV fallback: {exc}")
+        print("⚠️  Initial data fetch failed; starting with empty dataset.")
+        return pd.DataFrame()
 
     def fetch_new_data(self):
         new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token)
@@ -573,9 +696,11 @@ class ProjectX_Strategy(FVG_Strategy):
         print("subscribed")
         _last_fail_log = 0.0
         _last_stale_log = 0.0
+        _last_closed_log = 0.0
         _fail_streak = 0
         while True:
-            sleep(10)
+            session_closed = _is_likely_futures_session_closed()
+            sleep(60 if session_closed else 10)
             t0 = time.monotonic()
             try:
                 new_row = fetch_data(
@@ -606,6 +731,14 @@ class ProjectX_Strategy(FVG_Strategy):
             if new_row is None or len(new_row) == 0:
                 _fail_streak += 1
                 now = time.monotonic()
+                if session_closed:
+                    if now - _last_closed_log >= 600.0:
+                        print(
+                            "⏸️  Futures session likely closed; price poll idle "
+                            f"(empty 1m bars, streak={_fail_streak})."
+                        )
+                        _last_closed_log = now
+                    continue
                 if now - _last_fail_log >= 30.0 or _fail_streak <= 3:
                     print(
                         f"❌ Price poll: no 1m bar returned "
@@ -626,7 +759,7 @@ class ProjectX_Strategy(FVG_Strategy):
                     if lag_s > 90.0:
                         now = time.monotonic()
                         if now - _last_stale_log >= 60.0:
-                            bar_dt = datetime.utcfromtimestamp(bar_ts).strftime(
+                            bar_dt = datetime.fromtimestamp(bar_ts, tz=timezone.utc).strftime(
                                 "%Y-%m-%d %H:%M:%S"
                             )
                             print(
@@ -865,7 +998,7 @@ if __name__ == "__main__":
             account_id = get_account_id(global_token, account_name=account_name)
 
             # Default to last 7 days of trades
-            now_utc = datetime.utcnow()
+            now_utc = datetime.now(timezone.utc)
             start_ts = now_utc - timedelta(days=7)
             end_ts = now_utc
 

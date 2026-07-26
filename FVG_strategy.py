@@ -338,11 +338,14 @@ class FVG_Strategy(Strategy):
         if not hasattr(self, "last_pnl_date"):
             self.last_pnl_date = None
 
+        restored_fvg_zones = bool(getattr(self, "fvg_zones", None))
         if isinstance(self.data, pd.DataFrame) and not self.data.empty:
             self.cur_close = self.data["close"].iloc[-1]
             self.cur_volume = self.data["volume"].iloc[-1]
             self.update_indicators()
-            self.add_fvg_zones()
+            # Keep zones restored from runtime JSON; only build fresh if none loaded.
+            if not restored_fvg_zones:
+                self.add_fvg_zones()
         else:
             self.cur_close = 0.0
             self.cur_volume = 0.0

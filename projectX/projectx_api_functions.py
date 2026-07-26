@@ -219,6 +219,7 @@ def fetch_data(
     live=False,
     include_partial_bar=False,
     max_retry_seconds: float | None = TOPSTEPX_MAX_RETRY_SECONDS,
+    _extra_lookback_days: int = 0,
 ):
 
     """
@@ -248,7 +249,7 @@ def fetch_data(
     # Map timeframe to unit and unitNumber
     unit, unit_number = _map_timeframe_to_unit(timeframe)    
 
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
 
     if unit == 1:  # Seconds
         delta = timedelta(seconds=unit_number * num_bars*200)
@@ -265,9 +266,17 @@ def fetch_data(
     else:
         raise ValueError("Unsupported unit")
 
-    # Extend window on Mondays to cover weekend gaps.
-    if end_time.weekday() == 6 or end_time.weekday() == 0:
+    # Extend window over weekend gaps so Sat/Sun/Mon still reach last session bars.
+    # (Previously only Sun/Mon were covered — Sunday lookbacks often missed Friday.)
+    weekday = end_time.weekday()  # Mon=0 ... Sun=6
+    if weekday == 5:  # Saturday
         delta = delta + timedelta(days=2)
+    elif weekday == 6:  # Sunday
+        delta = delta + timedelta(days=3)
+    elif weekday == 0:  # Monday
+        delta = delta + timedelta(days=2)
+    if _extra_lookback_days > 0:
+        delta = delta + timedelta(days=_extra_lookback_days)
     start_time = end_time - delta
 
     
@@ -388,11 +397,32 @@ def fetch_data(
                     df = df.iloc[::-1].reset_index(drop=True)
                     return df
                 else:
-                    print(
-                        f"⚠️  TopStepX returned empty bars "
-                        f"(asset={asset}, tf={timeframe}, limit={num_bars}, "
-                        f"includePartialBar={include_partial_bar})."
-                    )
+                    # Tiny/misaligned windows often miss the last session over weekends.
+                    # Widen once (historical fetches only — skip live 1-bar price polls).
+                    if _extra_lookback_days <= 0 and num_bars >= 5:
+                        print(
+                            f"⚠️  TopStepX returned empty bars "
+                            f"(asset={asset}, tf={timeframe}, limit={num_bars}). "
+                            "Retrying with +5 day lookback."
+                        )
+                        return fetch_data(
+                            asset,
+                            timeframe,
+                            num_bars,
+                            auth_token=auth_token,
+                            live=live,
+                            include_partial_bar=include_partial_bar,
+                            max_retry_seconds=_remaining_retry_seconds(),
+                            _extra_lookback_days=5,
+                        )
+                    if not (
+                        num_bars <= 2 and _is_likely_futures_session_closed()
+                    ):
+                        print(
+                            f"⚠️  TopStepX returned empty bars "
+                            f"(asset={asset}, tf={timeframe}, limit={num_bars}, "
+                            f"includePartialBar={include_partial_bar})."
+                        )
                     return None  # Empty DataFrame if no data
             if response.status_code in retryable_statuses:
                 body_preview = (response.text or "").strip()
@@ -465,6 +495,22 @@ def load_data(asset, timeframe, data_dir=None):
 
     else:
         return None
+
+
+def _is_likely_futures_session_closed(now_utc: datetime | None = None) -> bool:
+    """
+    Rough CME equity/metal futures break: Fri after ~20:00 UTC through Sun ~22:00 UTC.
+    Used to quiet price-poll spam when the API returns empty bars.
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    weekday = now.weekday()  # Mon=0 ... Sun=6
+    if weekday == 5:
+        return True
+    if weekday == 6 and now.hour < 22:
+        return True
+    if weekday == 4 and (now.hour, now.minute) >= (20, 0):
+        return True
+    return False
 
 
 def sleep_until_next_boundary(timeframe: str):
