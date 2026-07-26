@@ -489,8 +489,10 @@ class ProjectX_Strategy(FVG_Strategy):
 
     def fetch_new_data(self):
         new_row = fetch_data(self.asset, self.timeframe, 1, self.auth_token)
-        if new_row is None:
-            print("⚠️  No new data available; waiting for next bar.")
+        session_closed = _is_likely_futures_session_closed()
+        if new_row is None or len(new_row) == 0:
+            if not session_closed:
+                print("⚠️  No new data available; waiting for next bar.")
             self._fetch_failures += 1
             if self._fetch_failures >= 3 and self.username and self.api_key:
                 now = time.time()
@@ -505,6 +507,19 @@ class ProjectX_Strategy(FVG_Strategy):
                         print(f"⚠️ Re-auth failed: {exc}")
             return False
         self._fetch_failures = 0
+        if "timestamp" not in new_row.columns:
+            return False
+        # Empty / column-less data (common after weekend fetch failure) — don't KeyError.
+        if (
+            self.data is None
+            or getattr(self.data, "empty", True)
+            or "timestamp" not in self.data.columns
+        ):
+            self.data = new_row.copy()
+            self.cur_close = float(new_row["close"].iloc[-1])
+            if "volume" in new_row.columns:
+                self.cur_volume = float(new_row["volume"].iloc[-1])
+            return True
         if new_row["timestamp"].iloc[-1] > self.data["timestamp"].iloc[-1]:
             self.cur_close = new_row["close"].iloc[-1]
             self.cur_volume = new_row["volume"].iloc[-1]
@@ -695,7 +710,6 @@ class ProjectX_Strategy(FVG_Strategy):
     def subscribe_to_price_updates(self):
         print("subscribed")
         _last_fail_log = 0.0
-        _last_stale_log = 0.0
         _last_closed_log = 0.0
         _fail_streak = 0
         while True:
@@ -752,26 +766,43 @@ class ProjectX_Strategy(FVG_Strategy):
                 # Detect lagging "success" responses (common miss mode: got a bar,
                 # but not the minute that actually touched the zone).
                 ts_val = new_row["timestamp"].iloc[-1] if "timestamp" in new_row.columns else None
+                lag_s = None
+                bar_ts = None
                 if ts_val is not None and pd.notna(ts_val):
                     ts_num = float(ts_val)
                     bar_ts = ts_num / 1000.0 if ts_num > 1e12 else ts_num
                     lag_s = time.time() - bar_ts
-                    if lag_s > 90.0:
-                        now = time.monotonic()
-                        if now - _last_stale_log >= 60.0:
+
+                # Weekend / session gap: API often returns Friday's last bar.
+                # Skip update_price while closed; during open hours still process but don't spam.
+                if session_closed:
+                    now = time.monotonic()
+                    if now - _last_closed_log >= 600.0:
+                        if lag_s is not None and bar_ts is not None:
                             bar_dt = datetime.fromtimestamp(bar_ts, tz=timezone.utc).strftime(
                                 "%Y-%m-%d %H:%M:%S"
                             )
                             print(
-                                f"⚠️  Price poll stale 1m bar: ts={bar_dt} UTC "
-                                f"(lag={lag_s:.0f}s) OHLCV="
-                                f"{float(new_row['open'].iloc[-1]):.2f}/"
-                                f"{float(new_row['high'].iloc[-1]):.2f}/"
-                                f"{float(new_row['low'].iloc[-1]):.2f}/"
-                                f"{float(new_row['close'].iloc[-1]):.2f}/"
-                                f"{float(new_row['volume'].iloc[-1]):.0f}"
+                                "⏸️  Skipping closed-session price poll "
+                                f"(last bar ts={bar_dt} UTC, lag={lag_s:.0f}s)."
                             )
-                            _last_stale_log = now
+                        else:
+                            print("⏸️  Skipping price poll while futures session is closed.")
+                        _last_closed_log = now
+                    continue
+
+                if lag_s is not None and lag_s > 90.0:
+                    now = time.monotonic()
+                    if now - _last_closed_log >= 600.0:
+                        bar_dt = datetime.fromtimestamp(bar_ts, tz=timezone.utc).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        print(
+                            f"⚠️  Price poll stale 1m bar: ts={bar_dt} UTC "
+                            f"(lag={lag_s:.0f}s)"
+                        )
+                        _last_closed_log = now
+
                 self.update_price(new_row)
             except Exception as exc:
                 print(f"❌ Price poll update_price failed: {exc}")
@@ -780,12 +811,16 @@ class ProjectX_Strategy(FVG_Strategy):
         sleep_until_next_boundary(self.timeframe)
         while True:
             try:
+                if _is_likely_futures_session_closed():
+                    # Avoid hammering History/retrieveBars + KeyError spam over the weekend.
+                    sleep(300)
+                    continue
                 self.bar_iteration()
                 sleep_until_next_boundary(self.timeframe)
                 
             except Exception as e:
                 print(f"❌ Error in bar iteration: {e}")
-                sleep(60)
+                sleep(300 if _is_likely_futures_session_closed() else 60)
 
     def run(self):
         """Start the trading bot"""
