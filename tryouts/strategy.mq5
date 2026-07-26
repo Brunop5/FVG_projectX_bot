@@ -1,4 +1,4 @@
-#property copyright "Gildo Marrove"
+#property copyright "Gildo REDACTED_USERNAME"
 #property link      https://www.primetechmall.com
 #property version   "1.11"
 #property strict
