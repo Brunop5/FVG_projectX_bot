@@ -388,6 +388,11 @@ def fetch_data(
                     df = df.iloc[::-1].reset_index(drop=True)
                     return df
                 else:
+                    print(
+                        f"⚠️  TopStepX returned empty bars "
+                        f"(asset={asset}, tf={timeframe}, limit={num_bars}, "
+                        f"includePartialBar={include_partial_bar})."
+                    )
                     return None  # Empty DataFrame if no data
             if response.status_code in retryable_statuses:
                 body_preview = (response.text or "").strip()

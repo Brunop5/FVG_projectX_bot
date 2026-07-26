@@ -1,0 +1,478 @@
+{
+  "asset": "MGCJ6",
+  "timeframe": "15m",
+  "account_balance": 57659.79079490221,
+  "used_margin": 0.0,
+  "data_path": "/mnt/LibraryOfAlexandria/programming/python/trading_bots/FVG_projectX_bot/backtest/data/MGCJ6/topstep_15min.csv",
+  "data_path_1m": "/mnt/LibraryOfAlexandria/programming/python/trading_bots/FVG_projectX_bot/backtest/data/MGCJ6/topstep_1min.csv",
+  "metadata_filename": "/mnt/LibraryOfAlexandria/programming/python/trading_bots/FVG_projectX_bot/backtest/FVG_projectX_bot/backtest/results/gold_mirror_t53/backtest_metadata.json",
+  "csv_filename": "/mnt/LibraryOfAlexandria/programming/python/trading_bots/FVG_projectX_bot/backtest/FVG_projectX_bot/backtest/results/gold_mirror_t53/backtest_data.csv",
+  "trades": [
+    {
+      "side": "BUY",
+      "entry_price": 5179.2,
+      "exit_price": 5206.2,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 10, 2, 56, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 10, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 266.5,
+      "equity": 50266.5,
+      "group_id": 1,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 5195.5,
+      "exit_price": 5186.1,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 11, 8, 53, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 11, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 90.49999999999636,
+      "equity": 50357.0,
+      "group_id": 2,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 5152.9,
+      "exit_price": 5092.0,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 12, 0, 24, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 12, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 605.4999999999964,
+      "equity": 50962.5,
+      "group_id": 3,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 5078.1,
+      "exit_price": 5021.4,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 12, 22, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 13, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 563.5000000000073,
+      "equity": 51526.00000000001,
+      "group_id": 4,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 5011.1,
+      "exit_price": 5023.0,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 16, 0, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 16, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": -122.49999999999636,
+      "equity": 51403.500000000015,
+      "group_id": 5,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 5011.9,
+      "exit_price": 5008.4,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 17, 6, 30, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 17, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 31.5,
+      "equity": 51435.000000000015,
+      "group_id": 6,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 5005.0,
+      "exit_price": 4853.7920436464165,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 18, 1, 45, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 18, 13, 11, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 1508.5795635358354,
+      "equity": 52943.57956353585,
+      "group_id": 7,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4868.8,
+      "exit_price": 4829.3,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 18, 13, 39, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 18, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 391.5,
+      "equity": 53335.07956353585,
+      "group_id": 8,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4831.7,
+      "exit_price": 4539.404826389215,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 18, 22, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 19, 12, 47, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 2919.4517361078524,
+      "equity": 56254.531299643706,
+      "group_id": 9,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4588.6,
+      "exit_price": 4657.4,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 19, 13, 53, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 19, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": -691.4999999999927,
+      "equity": 55563.03129964371,
+      "group_id": 10,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4670.9,
+      "exit_price": 4507.4,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 20, 10, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 20, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 1631.5,
+      "equity": 57194.53129964371,
+      "group_id": 11,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4517.5,
+      "exit_price": 4101.703441912305,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 22, 22, 18, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 23, 7, 22, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 4154.465580876953,
+      "equity": 61348.996880520666,
+      "group_id": 12,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4162.2,
+      "exit_price": 4468.970608561846,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 23, 7, 33, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 23, 12, 50, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": -3071.2060856184653,
+      "equity": 58277.790794902205,
+      "group_id": 13,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "BUY",
+      "entry_price": 4434.5,
+      "exit_price": 4406.2,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 23, 13, 7, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 23, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": -286.5000000000018,
+      "equity": 57991.290794902205,
+      "group_id": 14,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4382.5,
+      "exit_price": 4401.4,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 24, 12, 47, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 24, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": -192.49999999999636,
+      "equity": 57798.790794902205,
+      "group_id": 15,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "BUY",
+      "entry_price": 4555.7,
+      "exit_price": 4526.7,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 25, 15, 6, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 25, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": -293.5,
+      "equity": 57505.290794902205,
+      "group_id": 16,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4505.3,
+      "exit_price": 4394.9,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 25, 22, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 26, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 1100.5000000000055,
+      "equity": 58605.79079490221,
+      "group_id": 17,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "SELL",
+      "entry_price": 4392.0,
+      "exit_price": 4506.2,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 26, 22, 6, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 27, 20, 0, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": -1145.4999999999982,
+      "equity": 57460.29079490221,
+      "group_id": 18,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    },
+    {
+      "side": "BUY",
+      "entry_price": 4506.2,
+      "exit_price": 4526.5,
+      "entry_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 29, 22, 30, tzinfo=datetime.timezone.utc)"
+      },
+      "exit_time": {
+        "__type__": "repr",
+        "value": "datetime.datetime(2026, 3, 30, 9, 15, tzinfo=datetime.timezone.utc)"
+      },
+      "order_size": 1.0,
+      "pnl": 199.50000000000182,
+      "equity": 57659.79079490221,
+      "group_id": 19,
+      "margin_per_trade": null,
+      "lot_size": 1.0,
+      "total_fees": 3.5
+    }
+  ],
+  "trades_csv_path": "/mnt/LibraryOfAlexandria/programming/python/trading_bots/FVG_projectX_bot/backtest/FVG_projectX_bot/backtest/results/gold_mirror_t53/backtest_trades.csv",
+  "tick_size": 0.1,
+  "tick_value": 1.0,
+  "force_margin_per_trade_sizing": false,
+  "round_turn_fee_usd": 3.5,
+  "pyramiding": {
+    "__type__": "object",
+    "class": "FVG_projectX_bot.helping_functions.pyramiding.NoPyramidingPolicy",
+    "state": {}
+  },
+  "isBOS": {
+    "__type__": "repr",
+    "value": "np.False_"
+  },
+  "isCHOCH": {
+    "__type__": "repr",
+    "value": "np.False_"
+  },
+  "lastBullFvg": {
+    "__type__": "repr",
+    "value": "np.False_"
+  },
+  "lastBearFvg": {
+    "__type__": "repr",
+    "value": "np.False_"
+  },
+  "lastPositionWasLong": true,
+  "lastPositionWasShort": false,
+  "daily_trades_count": 1,
+  "last_trade_date": "2026-07-14",
+  "fvg_zones": [
+    {
+      "direction": "bear",
+      "top": 4490.2,
+      "bottom": 4487.3,
+      "mitigated": false
+    },
+    {
+      "direction": "bear",
+      "top": 4468.0,
+      "bottom": 4448.2,
+      "mitigated": false
+    },
+    {
+      "direction": "bull",
+      "top": 4477.0,
+      "bottom": 4471.0,
+      "mitigated": false
+    },
+    {
+      "direction": "bull",
+      "top": 4502.6,
+      "bottom": 4491.8,
+      "mitigated": false
+    }
+  ],
+  "require_intrabar_entry": true,
+  "peak_unrealized_pnl": 1000.0,
+  "peak_total_pnl": 1000.0,
+  "lockout_start_pnl": null,
+  "max_dd_triggered_until": null,
+  "trade_log_filename": "/mnt/LibraryOfAlexandria/programming/python/trading_bots/FVG_projectX_bot/backtest/FVG_projectX_bot/backtest/results/gold_mirror_t53/backtest_data_trades.csv",
+  "data": {
+    "__type__": "dataframe_csv",
+    "path": "/mnt/LibraryOfAlexandria/programming/python/trading_bots/FVG_projectX_bot/backtest/FVG_projectX_bot/backtest/results/gold_mirror_t53/backtest_data.csv"
+  },
+  "active_orders": [],
+  "daily_realized_pnl": 0.0,
+  "last_pnl_date": null,
+  "cur_close": 4526.5,
+  "cur_volume": 11.0,
+  "isBullishHTF": true,
+  "isBearishHTF": false,
+  "marketOK": {
+    "__type__": "repr",
+    "value": "np.False_"
+  },
+  "bullishPowerOK": {
+    "__type__": "repr",
+    "value": "np.False_"
+  },
+  "bearishPowerOK": {
+    "__type__": "repr",
+    "value": "np.False_"
+  },
+  "mirror_live_entry_timing": true
+}

@@ -2,13 +2,18 @@
 """
 Optimize strategy inputs for backtest using Optuna (TPE sampler).
 
-Objective (minimize):
-    max_drawdown / ending_pnl
+Objective (maximize):
+    ending_pnl / max_drawdown
+
+Hybrid search:
+- Run an initial batch of purely random trials (warmup exploration)
+- Then switch to Optuna TPE optimization
 
 Notes:
-- Keeps money/fee settings from backtest/FVG_backtest.py unchanged.
-- Only mutates the requested INPUTS fields.
-- Runs each trial on fixed Binance regime windows (or spaced month chunks for non-Binance).
+- Binance keeps margin-per-trade sizing + %-of-notional fees from FVG_backtest.py.
+- Gold/topstep uses fixed lot + per-contract round-turn fees (see configure_futures_backtest).
+- Gold/topstep evaluates the full 15m/1m overlap window (intrabar-valid bars only).
+- Runs each trial on fixed Binance regime windows, or the full overlap for gold.
 """
 
 from __future__ import annotations
@@ -23,7 +28,6 @@ import re
 import statistics
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -48,6 +52,7 @@ DEFAULT_OPT_ROOT = SCRIPT_DIR / "optimization_results"
 RESULT_MARKER = "__OPT_RESULT__"
 PHASE_MIN_COMPLETED_TRIALS = 30
 PHASE_MEDIAN_IMPROVEMENT_MIN = 0.015
+MAXIMIZE_EPS = 1e-9
 
 TARGET_CONFIGS: dict[str, dict[str, Any]] = {
     "binance": {
@@ -58,15 +63,21 @@ TARGET_CONFIGS: dict[str, dict[str, Any]] = {
         "data_path_1m": SCRIPT_DIR / "data" / "BTCUSDT_PERP_1m.csv",
         "fixed_15m_bars": 3827,
         "default_inputs_path": DEFAULT_BINANCE_INPUTS_PATH,
+        "tick_size": 0.0,
+        "tick_value": 1.0,
+        "benchmark_label": "Buy & Hold BTC",
     },
     "topstep": {
-        "asset": "MGCJ6",
+        "asset": "MGCQ6",
         "timeframe": "15m",
         "initial_balance": 50000.0,
-        "data_path": SCRIPT_DIR / "data" / "MGCJ6" / "topstep_15min.csv",
-        "data_path_1m": SCRIPT_DIR / "data" / "MGCJ6" / "topstep_1min.csv",
+        "data_path": SCRIPT_DIR / "data" / "MGCQ6" / "topstep_15min.csv",
+        "data_path_1m": SCRIPT_DIR / "data" / "MGCQ6" / "topstep_1min.csv",
         "fixed_15m_bars": None,
         "default_inputs_path": DEFAULT_TOPSTEP_INPUTS_PATH,
+        "tick_size": 0.1,
+        "tick_value": 1.0,
+        "benchmark_label": "Buy & Hold Gold",
     },
 }
 
@@ -103,12 +114,15 @@ def _resolve_targets(target_arg: str) -> list[str]:
 def _write_results_snapshot(records: list[dict[str, Any]], out_csv: Path) -> None:
     results_df = pd.DataFrame(records)
     if not results_df.empty:
-        if "pnl" in results_df.columns:
-            pnl_values = pd.to_numeric(results_df["pnl"], errors="coerce")
-            results_df = results_df[pnl_values > 0]
+        # Sort best-first for maximize objective.
+        # Keep the full table (including non-profitable runs) for debugging.
+        if "objective" in results_df.columns:
+            results_df["objective"] = pd.to_numeric(results_df["objective"], errors="coerce")
+        if "ratio" in results_df.columns:
+            results_df["ratio"] = pd.to_numeric(results_df["ratio"], errors="coerce")
         results_df = results_df.sort_values(
             by=["objective", "ratio"],
-            ascending=[True, True],
+            ascending=[False, False],
             na_position="last",
         ).reset_index(drop=True)
         # Keep these internals for in-memory bookkeeping, but do not persist them.
@@ -250,61 +264,60 @@ def _run_trial_subprocess(
     min_trades_per_day: float,
     tpd_penalty_power: float,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="fvg_opt_") as tmp_dir:
-        tmp_inputs_path = Path(tmp_dir) / f"inputs_trial_{trial_idx}.json"
-        with tmp_inputs_path.open("w", encoding="utf-8") as f:
-            json.dump(trial_inputs, f, indent=2)
+    # Run worker as a subprocess but pass inputs inline (no temp files),
+    # and hard-disable any disk writes during the run.
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        "FVG_projectX_bot.backtest.optimize_inputs",
+        "--worker",
+        "--target",
+        target,
+        "--min-trades-per-day",
+        str(min_trades_per_day),
+        "--tpd-penalty-power",
+        str(tpd_penalty_power),
+    ]
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["FVG_NO_DISK_IO"] = "1"
+    env["FVG_INPUTS_JSON_INLINE"] = json.dumps(trial_inputs)
+    env.pop("FVG_INPUTS_JSON", None)
 
-        cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            "FVG_projectX_bot.backtest.optimize_inputs",
-            "--worker",
-            "--inputs-path",
-            str(tmp_inputs_path),
-            "--target",
-            target,
-            "--min-trades-per-day",
-            str(min_trades_per_day),
-            "--tpd-penalty-power",
-            str(tpd_penalty_power),
-        ]
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(WORKSPACE_DIR),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=1,
-            env=env,
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(WORKSPACE_DIR),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        env=env,
+    )
+    output_lines: list[str] = []
+    result_payload: dict[str, Any] | None = None
+
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = raw_line.rstrip("\n")
+        output_lines.append(line)
+        if line.startswith(RESULT_MARKER):
+            result_payload = json.loads(line[len(RESULT_MARKER):])
+            continue
+        if line.startswith("[backtest]"):
+            print(f"{target.upper()} TEST NO {trial_idx}: {line}")
+
+    return_code = proc.wait()
+    if return_code != 0:
+        stdout_tail = output_lines[-12:]
+        raise RuntimeError(
+            f"Worker failed (code={return_code}). "
+            f"stdout_tail={' | '.join(stdout_tail)}"
         )
-        output_lines: list[str] = []
-        result_payload: dict[str, Any] | None = None
-
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            line = raw_line.rstrip("\n")
-            output_lines.append(line)
-            if line.startswith(RESULT_MARKER):
-                result_payload = json.loads(line[len(RESULT_MARKER):])
-                continue
-            # Show only per-backtest progress lines.
-            if line.startswith("[backtest]"):
-                print(f"{target.upper()} TEST NO {trial_idx}: {line}")
-
-        return_code = proc.wait()
-        if return_code != 0:
-            stdout_tail = output_lines[-12:]
-            raise RuntimeError(
-                f"Worker failed (code={return_code}). "
-                f"stdout_tail={' | '.join(stdout_tail)}"
-            )
-        if result_payload is None:
-            raise RuntimeError("Worker completed but returned no result payload.")
-        return result_payload
+    if result_payload is None:
+        raise RuntimeError("Worker completed but returned no result payload.")
+    return result_payload
 
 
 def _force_backtest_tail_bars(backtest: Any, bar_count: int) -> None:
@@ -478,13 +491,20 @@ def _force_backtest_timestamp_chunk(
 
 
 def _worker_mode(
-    inputs_path: Path,
     target: str,
     min_trades_per_day: float,
     tpd_penalty_power: float,
 ) -> None:
-    os.environ["FVG_INPUTS_JSON"] = str(inputs_path.resolve())
-    worker_inputs = _load_base_inputs(inputs_path)
+    # Worker inputs must come inline (no files) when running under the optimizer.
+    # Fallback to defaults only if inline is missing (manual/dev runs).
+    inline = os.getenv("FVG_INPUTS_JSON_INLINE", "").strip()
+    if inline:
+        try:
+            worker_inputs = json.loads(inline)
+        except Exception:
+            worker_inputs = {}
+    else:
+        worker_inputs = _load_base_inputs(Path(TARGET_CONFIGS[target]["default_inputs_path"]).resolve())
 
     from FVG_projectX_bot.backtest import FVG_backtest as bt
     from FVG_projectX_bot.backtest.evaluate_backtest import evaluate_backtest
@@ -495,9 +515,13 @@ def _worker_mode(
     bt.INITIAL_BALANCE = float(target_cfg["initial_balance"])
     bt.DATA_CSV_PATH = str(target_cfg["data_path"])
     bt.DATA_1M_CSV_PATH = str(target_cfg["data_path_1m"])
-    runtime_subdir = str(worker_inputs.get("RUNTIME_SUBDIR", "runtime_data"))
-    trial_runtime_dir = (SCRIPT_DIR / runtime_subdir).resolve()
-    trial_runtime_dir.mkdir(parents=True, exist_ok=True)
+    # Gold/topstep: fixed lot sizing + round-turn fees (matches live ProjectX).
+    if target != "binance":
+        bt.configure_futures_backtest(contracts_path=(SCRIPT_DIR / "contracts.csv").resolve())
+    # Disk IO must be disabled under optimization.
+    # `FVG_Backtest` respects FVG_NO_DISK_IO for directory creation and trade CSV writes.
+    os.environ["FVG_NO_DISK_IO"] = os.getenv("FVG_NO_DISK_IO", "1")
+    trial_runtime_dir = None
 
     class _ChunkInsufficientMargin(Exception):
         pass
@@ -514,26 +538,7 @@ def _worker_mode(
 
     bt.BacktestOrder.place_order = _place_order_chunk_guard
 
-    def _build_spaced_chunk_offsets(total_bars: int, month_bars: int) -> list[int]:
-        """
-        Build 3 offsets (from latest bar) for one-month evaluation chunks.
-        Offsets are chosen to spread chunks across the full available history.
-        """
-        if total_bars <= 0 or month_bars <= 0:
-            return []
-        month_slots = total_bars // month_bars
-        if month_slots < 3:
-            return []
-
-        # Pick most recent month, a midpoint month, and the oldest full month slot.
-        middle_slot = (month_slots - 1) // 2
-        oldest_slot = month_slots - 1
-        candidate_offsets = [0, middle_slot * month_bars, oldest_slot * month_bars]
-        unique_offsets = sorted({int(v) for v in candidate_offsets})
-        return unique_offsets
-
-    # Evaluate each parameter set across fixed regime windows for Binance.
-    # Non-Binance targets keep spaced month chunks as a fallback.
+    # Binance: fixed regime windows. Gold/topstep: one full 15m/1m overlap run.
     bt.USE_LAST_QUARTER_DATA = False
     chunk_specs: list[dict[str, Any]] = []
     if target == "binance":
@@ -550,34 +555,9 @@ def _worker_mode(
                 }
             )
     else:
-        tf_minutes = _timeframe_to_minutes(bt.TIMEFRAME)
-        chunk_bars = max(1, int((30 * 24 * 60) / tf_minutes))
-        probe_backtest = bt.FVG_Backtest(
-            asset=bt.ASSET,
-            timeframe=bt.TIMEFRAME,
-            initial_balance=bt.INITIAL_BALANCE,
-            data_path=bt.DATA_CSV_PATH,
-            start_timestamp=None,
-            pyramiding_mode=bt.PYRAMIDING_MODE,
-            data_path_1m=bt.DATA_1M_CSV_PATH,
-        )
-        total_bars = len(getattr(probe_backtest, "_full_data", []))
-        chunk_offsets = _build_spaced_chunk_offsets(total_bars, chunk_bars)
-        if len(chunk_offsets) < 3:
-            raise RuntimeError(
-                "Not enough data to evaluate 3 spaced one-month chunks "
-                f"(bars={total_bars}, month_bars={chunk_bars})."
-            )
-        for idx, end_offset in enumerate(chunk_offsets, start=1):
-            chunk_specs.append(
-                {
-                    "label": f"spaced_month_{idx}",
-                    "chunk_bars": int(chunk_bars),
-                    "end_offset_bars": int(end_offset),
-                }
-            )
+        chunk_specs.append({"label": "full_1m_overlap", "full_overlap": True})
 
-    if len(chunk_specs) < 3:
+    if len(chunk_specs) < 1:
         raise RuntimeError("Not enough evaluation chunks configured.")
 
     chunk_metrics: list[dict[str, float]] = []
@@ -593,13 +573,19 @@ def _worker_mode(
                 pyramiding_mode=bt.PYRAMIDING_MODE,
                 data_path_1m=bt.DATA_1M_CSV_PATH,
             )
-            # Keep per-trial folder ids and split outputs by chunk within that trial.
-            chunk_dir = trial_runtime_dir / f"chunk_{chunk_idx}"
-            chunk_dir.mkdir(parents=True, exist_ok=True)
-            backtest.metadata_filename = str(chunk_dir / "backtest_metadata.json")
-            backtest.csv_filename = str(chunk_dir / "backtest_data.csv")
-            backtest.trades_csv_path = str(chunk_dir / "backtest_trades.csv")
-            if "start_ts_ms" in chunk_spec and "end_ts_ms" in chunk_spec:
+            if target != "binance" and not backtest.restrict_to_1m_overlap():
+                print(
+                    f"[backtest] chunk={chunk_idx}/{len(chunk_specs)} "
+                    f"label={chunk_spec.get('label', 'unknown')} skipped (no 15m/1m overlap).",
+                    flush=True,
+                )
+                continue
+            # Avoid persisting per-chunk folders: write any temporary artifacts directly
+            # into the runtime dir (which should be a temp directory in parent mode).
+            # With disk IO disabled, these filenames are unused.
+            if chunk_spec.get("full_overlap"):
+                ok_chunk = True
+            elif "start_ts_ms" in chunk_spec and "end_ts_ms" in chunk_spec:
                 ok_chunk = _force_backtest_timestamp_chunk(
                     backtest,
                     start_ts_ms=int(chunk_spec["start_ts_ms"]),
@@ -668,10 +654,33 @@ def _worker_mode(
                 )
                 continue
 
+            # Skip chunks that produced no trades (do not count them in objective).
+            if not getattr(backtest, "trades", None):
+                print(
+                    f"[backtest] chunk={chunk_idx}/{len(chunk_specs)} "
+                    f"label={chunk_spec.get('label', 'unknown')} "
+                    "skipped (no trades).",
+                    flush=True,
+                )
+                # Clean temporary trade file if created.
+                try:
+                    if os.path.exists(backtest.trades_csv_path):
+                        os.remove(backtest.trades_csv_path)
+                except Exception:
+                    pass
+                continue
+
+            # No-disk evaluation: metrics from in-memory trades + chunked price
+            # (after restrict_to_1m_overlap / chunk trim), not the full on-disk CSV.
+            tick_size = float(target_cfg.get("tick_size", getattr(backtest, "tick_size", 0.0) or 0.0) or 0.0)
+            tick_value = float(target_cfg.get("tick_value", getattr(backtest, "tick_value", 1.0) or 1.0) or 1.0)
             summary = evaluate_backtest(
-                trades_csv=Path(backtest.trades_csv_path),
-                price_csv=Path(backtest.data_path),
+                trades_df=pd.DataFrame(backtest.trades),
+                price_df=getattr(backtest, "_full_data", None),
                 start_equity=bt.INITIAL_BALANCE,
+                tick_size=tick_size,
+                tick_value=tick_value,
+                benchmark_label=str(target_cfg.get("benchmark_label", "Buy & Hold")),
             )
 
             chunk_pnl = float(summary.get("total_pnl_original", 0.0))
@@ -682,7 +691,7 @@ def _worker_mode(
             chunk_avg_loss = float(summary.get("average_losing_trade", 0.0))
             chunk_tpd = (chunk_num_trades / chunk_days) if chunk_days > 0 else 0.0
 
-            trades_df = pd.read_csv(backtest.trades_csv_path)
+            trades_df = pd.DataFrame(backtest.trades)
             if trades_df.empty or "pnl" not in trades_df.columns:
                 chunk_win_rate = 0.0
             else:
@@ -704,7 +713,22 @@ def _worker_mode(
         bt.BacktestOrder.place_order = original_place_order
 
     if not chunk_metrics:
-        raise RuntimeError("No valid evaluation chunks available.")
+        # No-trade parameter set: return a payload that the parent can score,
+        # but parent should skip persisting this row.
+        payload = {
+            "objective": -9_999_999.0,
+            "ratio": None,
+            "tpd_penalty_factor": 1.0,
+            "ending_pnl": 0.0,
+            "max_drawdown": 0.0,
+            "num_trades": 0,
+            "trades_per_day": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "win_rate": 0.0,
+        }
+        print(f"{RESULT_MARKER}{json.dumps(payload)}")
+        return
 
     ending_pnl = float(sum(m["pnl"] for m in chunk_metrics) / len(chunk_metrics))
     max_drawdown = float(sum(m["max_drawdown"] for m in chunk_metrics) / len(chunk_metrics))
@@ -714,7 +738,9 @@ def _worker_mode(
     avg_loss = float(sum(m["avg_loss"] for m in chunk_metrics) / len(chunk_metrics))
     win_rate = float(sum(m["win_rate"] for m in chunk_metrics) / len(chunk_metrics))
 
-    ratio = (max_drawdown / ending_pnl) if ending_pnl > 0 else math.inf
+    # Ratio is now profit-to-drawdown (higher is better).
+    # Use epsilon to avoid division by zero when drawdown is ~0.
+    ratio = (ending_pnl / max(max_drawdown, MAXIMIZE_EPS)) if ending_pnl > 0 else -math.inf
     tpd_penalty_factor = 1.0
     if trades_per_day < min_trades_per_day:
         # Smoothly increase penalty as activity drops below threshold.
@@ -724,12 +750,14 @@ def _worker_mode(
         safe_tpd = max(trades_per_day, 1e-9)
         tpd_penalty_factor = (min_trades_per_day / safe_tpd) ** tpd_penalty_power
 
-    # Objective: lower drawdown-to-profit ratio is better.
-    # Penalize non-profitable / zero-profit runs heavily.
+    # Objective: higher profit-to-drawdown ratio is better.
+    # Penalize non-profitable / zero-profit runs heavily (very low objective).
     if ending_pnl <= 0:
-        objective = 1_000_000.0 + abs(ending_pnl) + max_drawdown
+        objective = -1_000_000.0 - abs(ending_pnl) - max_drawdown
     else:
-        objective = ratio * tpd_penalty_factor
+        # Keep penalty semantics: penalty_factor >= 1 when activity is too low,
+        # so divide by it to reduce the score for inactive strategies.
+        objective = ratio / max(tpd_penalty_factor, 1e-9)
 
     payload = {
         "objective": float(objective),
@@ -786,6 +814,15 @@ def main() -> None:
             "In this mode, phase_idx and trial_in_phase are recorded as -1."
         ),
     )
+    parser.add_argument(
+        "--random-warmup-trials",
+        type=int,
+        default=30,
+        help=(
+            "In optimizer mode (default), run this many purely random trials first, "
+            "then switch to Optuna TPE. Set to 0 to disable warmup."
+        ),
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--child-run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -828,13 +865,7 @@ def main() -> None:
     if args.worker:
         if len(targets) != 1:
             raise ValueError("Worker mode requires a single --target (binance or gold).")
-        worker_inputs_path = (
-            Path(args.inputs_path).resolve()
-            if args.inputs_path
-            else Path(TARGET_CONFIGS[targets[0]]["default_inputs_path"]).resolve()
-        )
         _worker_mode(
-            worker_inputs_path,
             targets[0],
             args.min_trades_per_day,
             args.tpd_penalty_power,
@@ -902,8 +933,6 @@ def main() -> None:
     trial_records: list[dict[str, Any]] = []
     records_lock = threading.Lock()
     results_csv = opt_root_dir / "optimization_results.csv"
-    trial_runs_root = opt_root_dir / "trial_runs"
-    trial_runs_root.mkdir(parents=True, exist_ok=True)
     trial_records = _load_existing_records(results_csv)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     max_csv_trial = -1
@@ -915,8 +944,7 @@ def main() -> None:
             continue
         if parsed > max_csv_trial:
             max_csv_trial = parsed
-    max_folder_trial = _discover_max_trial_id(trial_runs_root)
-    trial_counter = max(max_csv_trial, max_folder_trial) + 1
+    trial_counter = max_csv_trial + 1
     trial_counter_lock = threading.Lock()
     max_existing_phase = -1
     for record in trial_records:
@@ -952,10 +980,6 @@ def main() -> None:
         trial_params = _suggest_params(trial, base_inputs)
         merged_inputs = dict(base_inputs)
         merged_inputs.update(trial_params)
-        # Isolate runtime outputs by global trial number so restarts/continuations never overwrite.
-        merged_inputs["RUNTIME_SUBDIR"] = (
-            f"optimization_results/{target}/trial_runs/trial_{global_trial_idx}"
-        )
 
         try:
             result = _run_trial_subprocess(
@@ -972,7 +996,7 @@ def main() -> None:
             failed = True
             fail_reason = str(exc)
             result = {
-                "objective": 9_999_999.0,
+                "objective": -9_999_999.0,
                 "ratio": None,
                 "tpd_penalty_factor": 1.0,
                 "ending_pnl": 0.0,
@@ -983,6 +1007,13 @@ def main() -> None:
                 "avg_loss": 0.0,
                 "win_rate": 0.0,
             }
+
+        # Don't persist no-trade trials (but still return objective to Optuna).
+        try:
+            if int(result.get("num_trades", 0)) <= 0:
+                return float(result["objective"])
+        except Exception:
+            return float(result["objective"])
 
         trial.set_user_attr("ending_pnl", float(result["ending_pnl"]))
         trial.set_user_attr("max_drawdown", float(result["max_drawdown"]))
@@ -1115,7 +1146,18 @@ def main() -> None:
                 "optuna is required for optimizer mode. Install with: pip install optuna "
                 "or run with --random-search."
             )
-        while trial_counter < int(args.trials):
+        # Hybrid: random warmup, then Optuna TPE.
+        total_trials = int(args.trials)
+        warmup_trials = max(0, int(args.random_warmup_trials))
+        warmup_trials = min(warmup_trials, max(0, total_trials - trial_counter))
+
+        # Generate warmup params once per invocation (reproducible).
+        rng = random.Random(int(args.seed) + 99_991 + max(0, int(phase_idx)) * 1_000_003)
+        warmup_param_sets: list[dict[str, Any]] = []
+        for _ in range(warmup_trials):
+            warmup_param_sets.append(_sample_random_params(base_inputs, rng))
+
+        while trial_counter < total_trials:
             timeout_remaining: float | None = None
             if args.timeout_sec is not None:
                 elapsed = time.monotonic() - optimization_start_monotonic
@@ -1124,7 +1166,7 @@ def main() -> None:
                     break
 
             sampler = optuna.samplers.TPESampler(seed=phase_seed)
-            study = optuna.create_study(direction="minimize", sampler=sampler)
+            study = optuna.create_study(direction="maximize", sampler=sampler)
             restart_triggered = False
             restart_reason = ""
 
@@ -1154,9 +1196,10 @@ def main() -> None:
                 prior_median = float(statistics.median(prior_values))
                 recent_median = float(statistics.median(recent_values))
                 if prior_median != 0.0:
-                    median_improvement = (prior_median - recent_median) / abs(prior_median)
+                    # For maximize objective, improvement is positive when recent median is higher.
+                    median_improvement = (recent_median - prior_median) / abs(prior_median)
                 else:
-                    median_improvement = 0.0 if recent_median >= prior_median else 1.0
+                    median_improvement = 0.0 if recent_median <= prior_median else 1.0
 
                 # Restart only when the recent window no longer shows material progress.
                 if median_improvement >= PHASE_MEDIAN_IMPROVEMENT_MIN:
@@ -1172,6 +1215,15 @@ def main() -> None:
                 st.stop()
 
             n_trials_remaining = int(args.trials) - trial_counter
+
+            # Enqueue random warmup trials at the start of the very first phase (per invocation).
+            # These will be consumed first by Optuna, but still evaluated through the normal objective().
+            if warmup_param_sets:
+                for params in warmup_param_sets:
+                    study.enqueue_trial(params)
+                # Ensure we only enqueue once (even if phases restart later).
+                warmup_param_sets = []
+
             study.optimize(
                 objective,
                 n_trials=n_trials_remaining,
@@ -1204,31 +1256,16 @@ def main() -> None:
     if not complete_records:
         raise RuntimeError("No completed trials.")
 
-    best_record = min(complete_records, key=lambda r: float(r["objective"]))
-    best_inputs = dict(base_inputs)
-    for key, value in best_record.items():
-        if key in base_inputs:
-            best_inputs[key] = value
-    if not best_inputs.get("USE_TRAILING", False):
-        best_inputs["TRAIL_OFFSET_MULT"] = base_inputs.get("TRAIL_OFFSET_MULT", 1.0)
-
-    best_inputs_path = opt_root_dir / "optimized_inputs_best.json"
-    with best_inputs_path.open("w", encoding="utf-8") as f:
-        json.dump(best_inputs, f, indent=2)
+    best_record = max(complete_records, key=lambda r: float(r["objective"]))
 
     print("\n✅ Optimization finished")
     print(f"Target: {target}")
     print(f"Trials: {len(complete_records)}")
     print(f"Phase restarts: {phase_restarts}")
-    print(f"Best objective (max_drawdown / ending_pnl): {float(best_record['objective']):.6f}")
+    print(f"Best objective (ending_pnl / max_drawdown, penalized): {float(best_record['objective']):.6f}")
     print(f"Best ending_pnl: {best_record.get('pnl')}")
     print(f"Best max_drawdown: {best_record.get('max_dd')}")
     print(f"Saved trial table: {results_csv}")
-    print(f"Saved best inputs: {best_inputs_path}")
-    print(
-        "\nRun backtest with best inputs:\n"
-        f"FVG_INPUTS_JSON=\"{best_inputs_path}\" python -m FVG_projectX_bot.backtest.FVG_backtest"
-    )
 
 
 if __name__ == "__main__":

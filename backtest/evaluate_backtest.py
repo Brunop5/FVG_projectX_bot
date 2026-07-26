@@ -28,12 +28,11 @@ def _load_trades(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def _load_price_data(path: Path) -> pd.DataFrame:
-    if not path.exists():
+def _normalize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize OHLC frame timestamps/columns for equity evaluation."""
+    if df is None or df.empty:
         return pd.DataFrame()
-    df = pd.read_csv(path)
-    if len(df.columns) == 1 and "<DATE>" in str(df.columns[0]) and "\t" in str(df.columns[0]):
-        df = pd.read_csv(path, sep="\t")
+    df = df.copy()
 
     if "<DATE>" in df.columns and "<TIME>" in df.columns:
         df["timestamp"] = pd.to_datetime(
@@ -51,7 +50,9 @@ def _load_price_data(path: Path) -> pd.DataFrame:
         )
     elif "timestamp" in df.columns:
         ts = df["timestamp"]
-        if pd.api.types.is_numeric_dtype(ts):
+        if pd.api.types.is_datetime64_any_dtype(ts):
+            df["timestamp"] = pd.to_datetime(ts, utc=True, errors="coerce")
+        elif pd.api.types.is_numeric_dtype(ts):
             max_val = pd.Series(ts).max()
             unit = "ms" if max_val > 10**12 else "s"
             df["timestamp"] = pd.to_datetime(ts, unit=unit, utc=True, errors="coerce")
@@ -71,8 +72,21 @@ def _load_price_data(path: Path) -> pd.DataFrame:
     else:
         return pd.DataFrame()
 
-    df = df[df["timestamp"].notna()].sort_values("timestamp").reset_index(drop=True)
-    return df
+    return df[df["timestamp"].notna()].sort_values("timestamp").reset_index(drop=True)
+
+
+def _load_price_data(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path)
+    if len(df.columns) == 1 and "<DATE>" in str(df.columns[0]) and "\t" in str(df.columns[0]):
+        df = pd.read_csv(path, sep="\t")
+    return _normalize_price_frame(df)
+
+
+def _load_price_data_from_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Accept in-memory backtest._full_data (epoch seconds/ms or datetime)."""
+    return _normalize_price_frame(df)
 
 
 def _compute_equity_before(trades_df: pd.DataFrame) -> pd.Series:
@@ -101,7 +115,31 @@ def _compute_sharpe(trades_df: pd.DataFrame) -> float:
     return float(mean / std * (len(returns) ** 0.5))
 
 
-def _build_equity_curve_with_price(trades_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+def _futures_pnl(
+    entry_price: float,
+    mark_price: float,
+    side: str,
+    size: float,
+    tick_size: float,
+    tick_value: float,
+) -> float:
+    """Gross PnL for one contract lot. Uses tick sizing when tick_size > 0."""
+    direction = 1 if str(side).upper() == "BUY" else -1
+    if tick_size and float(tick_size) != 0:
+        ticks = (float(mark_price) - float(entry_price)) / float(tick_size)
+        if direction < 0:
+            ticks = -ticks
+        return float(ticks) * float(tick_value) * float(size)
+    return (float(mark_price) - float(entry_price)) * direction * float(size)
+
+
+def _build_equity_curve_with_price(
+    trades_df: pd.DataFrame,
+    price_df: pd.DataFrame,
+    start_equity: float,
+    tick_size: float = 0.0,
+    tick_value: float = 1.0,
+) -> pd.DataFrame:
     if trades_df.empty or price_df.empty or "close" not in price_df.columns:
         return pd.DataFrame()
     trades = trades_df.copy()
@@ -111,8 +149,7 @@ def _build_equity_curve_with_price(trades_df: pd.DataFrame, price_df: pd.DataFra
     if trades.empty:
         return pd.DataFrame()
 
-    equity_before = _compute_equity_before(trades)
-    initial_balance = float(equity_before.iloc[0]) if len(equity_before) else 0.0
+    initial_balance = float(start_equity)
     open_positions = []
     realized_pnl = 0.0
     trade_idx = 0
@@ -142,12 +179,18 @@ def _build_equity_curve_with_price(trades_df: pd.DataFrame, price_df: pd.DataFra
         unrealized = 0.0
         for trade in open_positions:
             entry_price = trade.get("entry_price")
-            size = trade.get("order_size")
+            size = trade.get("order_size", trade.get("size"))
             side = trade.get("side")
             if pd.isna(entry_price) or pd.isna(size) or not side:
                 continue
-            direction = 1 if str(side).upper() == "BUY" else -1
-            unrealized += (float(close) - float(entry_price)) * direction * float(size)
+            unrealized += _futures_pnl(
+                float(entry_price),
+                float(close),
+                str(side),
+                float(size),
+                tick_size,
+                tick_value,
+            )
 
         rows.append({"timestamp": ts, "equity": initial_balance + realized_pnl + unrealized})
 
@@ -329,7 +372,12 @@ def calculate_avg_max_monthly_drawdown(trades_df: pd.DataFrame, initial_balance:
     return float(sum(monthly_dd) / len(monthly_dd)) if monthly_dd else 0.0
 
 
-def compute_trade_drawdowns(trades_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+def compute_trade_drawdowns(
+    trades_df: pd.DataFrame,
+    price_df: pd.DataFrame,
+    tick_size: float = 0.0,
+    tick_value: float = 1.0,
+) -> pd.DataFrame:
     if trades_df.empty or price_df.empty:
         return pd.DataFrame()
     size_col = "size" if "size" in trades_df.columns else "order_size"
@@ -362,19 +410,30 @@ def compute_trade_drawdowns(trades_df: pd.DataFrame, price_df: pd.DataFrame) -> 
             if side == "BUY"
             else entry_price - float(slice_df["high"].max())
         )
+        # Convert adverse price move into dollar PnL using tick sizing when available.
+        if tick_size and float(tick_size) != 0:
+            adverse_pnl = (adverse_move / float(tick_size)) * float(tick_value) * size
+        else:
+            adverse_pnl = adverse_move * size
         rows.append(
             {
                 "trade_index": idx,
                 "entry_time": entry_time,
                 "exit_time": exit_time,
                 "min_adverse_move": adverse_move,
-                "min_unrealized_pnl": adverse_move * size,
+                "min_unrealized_pnl": adverse_pnl,
             }
         )
     return pd.DataFrame(rows)
 
 
-def _plot_equity_vs_btc(equity_df: pd.DataFrame, price_df: pd.DataFrame, output_path: Path, start_equity: float) -> None:
+def _plot_equity_vs_benchmark(
+    equity_df: pd.DataFrame,
+    price_df: pd.DataFrame,
+    output_path: Path,
+    start_equity: float,
+    benchmark_label: str = "Buy & Hold",
+) -> None:
     if equity_df.empty or price_df.empty or "close" not in price_df.columns:
         return
     price_df = price_df.copy()
@@ -389,8 +448,8 @@ def _plot_equity_vs_btc(equity_df: pd.DataFrame, price_df: pd.DataFrame, output_
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(equity_df["timestamp"], equity_df["equity"], label="Strategy Equity", linewidth=1.5)
-    ax.plot(price_df["timestamp"], buy_hold, label="Buy & Hold BTC", linewidth=1.2)
-    ax.set_title("Equity vs BTC Hold")
+    ax.plot(price_df["timestamp"], buy_hold, label=benchmark_label, linewidth=1.2)
+    ax.set_title(f"Equity vs {benchmark_label}")
     ax.set_xlabel("Time")
     ax.set_ylabel("Equity")
     ax.legend()
@@ -401,24 +460,42 @@ def _plot_equity_vs_btc(equity_df: pd.DataFrame, price_df: pd.DataFrame, output_
     plt.close(fig)
 
 
+# Back-compat alias
+def _plot_equity_vs_btc(equity_df: pd.DataFrame, price_df: pd.DataFrame, output_path: Path, start_equity: float) -> None:
+    _plot_equity_vs_benchmark(
+        equity_df,
+        price_df,
+        output_path,
+        start_equity,
+        benchmark_label="Buy & Hold BTC",
+    )
+
+
 def evaluate_backtest(
-    trades_csv: Path,
-    price_csv: Path,
+    price_csv: Path | None = None,
+    trades_csv: Path | None = None,
+    trades_df: pd.DataFrame | None = None,
+    price_df: pd.DataFrame | None = None,
     output_metrics_csv: Path | None = None,
     output_monthly_csv: Path | None = None,
     output_drawdowns_csv: Path | None = None,
     output_plot: Path | None = None,
     start_equity: float = DEFAULT_START_EQUITY,
-    tick_size: float = 0.1,
+    tick_size: float = 0.0,
     tick_value: float = 1.0,
     night_start_hour: int = 22,
     night_end_hour: int = 0,
+    benchmark_label: str = "Buy & Hold",
 ) -> dict:
-    trades_df = _load_trades(trades_csv)
+    if trades_df is None:
+        if trades_csv is None:
+            raise ValueError("Either trades_df or trades_csv must be provided.")
+        trades_df = _load_trades(trades_csv)
     if trades_df.empty:
         print("⚠️ No trades found.")
         return {}
 
+    trades_df = trades_df.copy()
     trades_df["entry_time"] = pd.to_datetime(trades_df["entry_time"], utc=True, errors="coerce")
     trades_df["exit_time"] = pd.to_datetime(trades_df["exit_time"], utc=True, errors="coerce")
     trades_df = trades_df[trades_df["entry_time"].notna()].sort_values("entry_time").reset_index(drop=True)
@@ -426,33 +503,76 @@ def evaluate_backtest(
         print("⚠️ No valid trade timestamps found.")
         return {}
 
-    start_dt = trades_df["entry_time"].iloc[0]
-    end_dt = trades_df["exit_time"].dropna().iloc[-1] if trades_df["exit_time"].notna().any() else trades_df["entry_time"].iloc[-1]
-    days_of_backtest = (end_dt - start_dt).total_seconds() / 86400
+    if price_df is None:
+        if price_csv is None:
+            price_df = pd.DataFrame()
+        else:
+            price_df = _load_price_data(price_csv)
+    else:
+        price_df = _load_price_data_from_frame(price_df)
 
-    price_df = _load_price_data(price_csv)
+    # Prefer filtering leftover trades to the price window (not trimming price to
+    # trade span). Older appended trade CSVs otherwise poison gold charts.
     if not price_df.empty:
-        price_df = price_df[(price_df["timestamp"] >= start_dt) & (price_df["timestamp"] <= end_dt)]
+        p_start = price_df["timestamp"].iloc[0]
+        p_end = price_df["timestamp"].iloc[-1]
+        in_window = (trades_df["entry_time"] >= p_start) & (trades_df["entry_time"] <= p_end)
+        dropped = int((~in_window).sum())
+        if dropped:
+            print(f"⚠️ Dropped {dropped} trades outside price window [{p_start} .. {p_end}]")
+        trades_df = trades_df.loc[in_window].reset_index(drop=True)
+        if trades_df.empty:
+            print("⚠️ No trades overlap the price window.")
+            return {}
+        days_of_backtest = (p_end - p_start).total_seconds() / 86400
+    else:
+        start_dt = trades_df["entry_time"].iloc[0]
+        end_dt = (
+            trades_df["exit_time"].dropna().iloc[-1]
+            if trades_df["exit_time"].notna().any()
+            else trades_df["entry_time"].iloc[-1]
+        )
+        days_of_backtest = (end_dt - start_dt).total_seconds() / 86400
 
     avg_trade = float(trades_df["pnl"].mean())
     avg_win = float(trades_df.loc[trades_df["pnl"] > 0, "pnl"].mean()) if (trades_df["pnl"] > 0).any() else 0.0
     avg_loss = float(trades_df.loc[trades_df["pnl"] < 0, "pnl"].mean()) if (trades_df["pnl"] < 0).any() else 0.0
     trade_sharpe = _compute_sharpe(trades_df)
 
-    equity_curve = _build_equity_curve_with_price(trades_df, price_df) if not price_df.empty else pd.DataFrame()
+    equity_curve = (
+        _build_equity_curve_with_price(
+            trades_df,
+            price_df,
+            start_equity=start_equity,
+            tick_size=tick_size,
+            tick_value=tick_value,
+        )
+        if not price_df.empty
+        else pd.DataFrame()
+    )
     price_sharpe = _compute_price_sharpe(price_df) if not price_df.empty else 0.0
     equity_sharpe = _compute_equity_sharpe(equity_curve)
     max_drawdown = _compute_max_drawdown_from_equity(equity_curve) if not equity_curve.empty else 0.0
     eq_streak_bars, eq_streak_value = _compute_equity_losing_streak(equity_curve)
 
     equity_before = _compute_equity_before(trades_df)
-    initial_balance = float(equity_before.iloc[0]) if len(equity_before) else start_equity
+    initial_balance = float(start_equity)
+    if len(equity_before) and pd.notna(equity_before.iloc[0]):
+        # Prefer start_equity for futures fixed-balance charts; fall back only if missing.
+        try:
+            initial_balance = float(start_equity)
+        except (TypeError, ValueError):
+            initial_balance = float(equity_before.iloc[0])
 
     max_losing_streak, avg_monthly_losing_streak, streak_value, avg_monthly_streak_value = calculate_losing_streaks(trades_df)
-    avg_max_monthly_dd = calculate_avg_max_monthly_drawdown(trades_df, initial_balance)
+    avg_max_monthly_dd = calculate_avg_max_monthly_drawdown(trades_df, float(start_equity))
     monthly_df = _compute_monthly_stats(trades_df, start_equity)
 
-    drawdowns_df = compute_trade_drawdowns(trades_df, price_df) if not price_df.empty else pd.DataFrame()
+    drawdowns_df = (
+        compute_trade_drawdowns(trades_df, price_df, tick_size=tick_size, tick_value=tick_value)
+        if not price_df.empty
+        else pd.DataFrame()
+    )
     avg_trade_dd = float(drawdowns_df["min_unrealized_pnl"].mean()) if not drawdowns_df.empty else 0.0
     max_trade_dd = float(drawdowns_df["min_unrealized_pnl"].min()) if not drawdowns_df.empty else 0.0
 
@@ -489,10 +609,9 @@ def evaluate_backtest(
                     total_new += float(trade.get("pnl", 0.0) or 0.0)
                     continue
                 exit_price = float(price_row["close"].iloc[0])
-                ticks = (exit_price - entry_price) / tick_size
-                if side == "SELL":
-                    ticks = -ticks
-                total_new += ticks * tick_value * size - fees
+                total_new += _futures_pnl(
+                    entry_price, exit_price, side, size, tick_size, tick_value
+                ) - fees
                 changed += 1
             else:
                 total_new += float(trade.get("pnl", 0.0) or 0.0)
@@ -533,7 +652,13 @@ def evaluate_backtest(
         output_drawdowns_csv.parent.mkdir(parents=True, exist_ok=True)
         drawdowns_df.to_csv(output_drawdowns_csv, index=False)
     if output_plot is not None and not equity_curve.empty and not price_df.empty:
-        _plot_equity_vs_btc(equity_curve, price_df, output_plot, start_equity)
+        _plot_equity_vs_benchmark(
+            equity_curve,
+            price_df,
+            output_plot,
+            start_equity,
+            benchmark_label=benchmark_label,
+        )
 
     print("\n📊 Backtest Evaluation")
     for k, v in summary.items():
@@ -559,10 +684,11 @@ def main() -> None:
     parser.add_argument("--output-drawdowns", default=None, help="Path to output drawdowns CSV")
     parser.add_argument("--output-plot", default=None, help="Path to output equity plot PNG")
     parser.add_argument("--start-equity", type=float, default=DEFAULT_START_EQUITY)
-    parser.add_argument("--tick-size", type=float, default=0.1)
+    parser.add_argument("--tick-size", type=float, default=0.0)
     parser.add_argument("--tick-value", type=float, default=1.0)
     parser.add_argument("--night-start-hour", type=int, default=22)
     parser.add_argument("--night-end-hour", type=int, default=0)
+    parser.add_argument("--benchmark-label", default="Buy & Hold", help="Label for buy-and-hold series")
     args = parser.parse_args()
 
     trades_path = Path(args.trades).resolve()
@@ -570,7 +696,7 @@ def main() -> None:
     output_metrics = Path(args.output_metrics).resolve() if args.output_metrics else (output_dir / "backtest_trades_metrics.csv")
     output_monthly = Path(args.output_monthly).resolve() if args.output_monthly else (output_dir / "backtest_trades_monthly_pnl.csv")
     output_drawdowns = Path(args.output_drawdowns).resolve() if args.output_drawdowns else (output_dir / "backtest_trade_drawdowns.csv")
-    output_plot = Path(args.output_plot).resolve() if args.output_plot else (output_dir / "equity_vs_btc.png")
+    output_plot = Path(args.output_plot).resolve() if args.output_plot else (output_dir / "equity_vs_benchmark.png")
 
     evaluate_backtest(
         trades_csv=trades_path,
@@ -584,6 +710,7 @@ def main() -> None:
         tick_value=args.tick_value,
         night_start_hour=args.night_start_hour,
         night_end_hour=args.night_end_hour,
+        benchmark_label=args.benchmark_label,
     )
 
 

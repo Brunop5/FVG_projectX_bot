@@ -2,6 +2,7 @@ import csv
 import os
 import sys
 import threading
+import time
 from abc import abstractmethod
 from datetime import datetime, timedelta, time as dt_time, timezone
 from pathlib import Path
@@ -287,6 +288,8 @@ class FVG_Strategy(Strategy):
         self._split_order_count = validate_split_config(self, INPUTS)
         self.require_intrabar_entry = False
         self._intrabar_mode = False
+        # Live entry-check logs: throttle identical "touched but blocked" lines.
+        self._entry_check_log_ts: dict[tuple, float] = {}
 
         self._partial_tp_close_count = (
             validate_partial_close_size(
@@ -739,6 +742,62 @@ class FVG_Strategy(Strategy):
         finally:
             self._intrabar_mode = False
 
+    def _resolve_intracandle_entry_price(
+        self,
+        *,
+        side: str,
+        fvg_top: float,
+        fvg_bottom: float,
+    ) -> float:
+        """
+        Realistic fill for intracandle FVG entries.
+
+        Previous behavior always filled at the zone border (bull→top, bear→bottom),
+        which invents fills when price is already inside the zone and the current
+        bar never traded that border.
+
+        Rules:
+        - Open already inside the zone → fill at open
+        - Bar first enters the zone from outside → fill at the edge touched first
+        - Otherwise → fill at current mark (1m close), clamped to this bar's range
+        """
+        if hasattr(self, "_intrabar_high") and hasattr(self, "_intrabar_low"):
+            high = float(self._intrabar_high)
+            low = float(self._intrabar_low)
+        elif self.data is not None and len(self.data) > 0:
+            high = float(self.data["high"].iloc[-1])
+            low = float(self.data["low"].iloc[-1])
+        else:
+            high = float(self.cur_close)
+            low = float(self.cur_close)
+        mark = float(getattr(self, "_intrabar_price", self.cur_close) or self.cur_close)
+        open_px = getattr(self, "_intrabar_open", None)
+        open_px = float(open_px) if open_px is not None else mark
+
+        top = float(fvg_top)
+        bottom = float(fvg_bottom)
+        if top < bottom:
+            top, bottom = bottom, top
+
+        def _clamp(px: float) -> float:
+            return min(max(float(px), low), high)
+
+        if bottom <= open_px <= top:
+            return _clamp(open_px)
+
+        side_u = str(side).upper()
+        if side_u == "BUY":
+            if open_px > top and low <= top:
+                return _clamp(top)
+            if open_px < bottom and high >= bottom:
+                return _clamp(bottom)
+        else:
+            if open_px < bottom and high >= bottom:
+                return _clamp(bottom)
+            if open_px > top and low <= top:
+                return _clamp(top)
+
+        return _clamp(mark)
 
     def _run_intrabar_entry_logic(
         self,
@@ -746,8 +805,14 @@ class FVG_Strategy(Strategy):
         tick_price: float,
         tick_high: float,
         tick_low: float,
+        tick_open: float | None = None,
     ) -> None:
         # Use intrabar values for live checks without persisting them to history.
+        self._intrabar_price = float(tick_price)
+        self._intrabar_high = float(tick_high)
+        self._intrabar_low = float(tick_low)
+        self._intrabar_open = float(tick_open) if tick_open is not None else float(tick_price)
+        orig_cur_close = getattr(self, "cur_close", None)
         if self.data is not None and len(self.data) > 0:
             last_index = self.data.index[-1]
             orig_high = self.data.at[last_index, "high"] if "high" in self.data.columns else None
@@ -760,6 +825,7 @@ class FVG_Strategy(Strategy):
                     self.data.at[last_index, "low"] = tick_low
                 if "close" in self.data.columns:
                     self.data.at[last_index, "close"] = tick_price
+                self.cur_close = float(tick_price)
                 self._run_entry_logic_intrabar_mode()
             finally:
                 if orig_high is not None:
@@ -768,8 +834,15 @@ class FVG_Strategy(Strategy):
                     self.data.at[last_index, "low"] = orig_low
                 if orig_close is not None:
                     self.data.at[last_index, "close"] = orig_close
+                if orig_cur_close is not None:
+                    self.cur_close = orig_cur_close
             return
-        self._run_entry_logic_intrabar_mode()
+        try:
+            self.cur_close = float(tick_price)
+            self._run_entry_logic_intrabar_mode()
+        finally:
+            if orig_cur_close is not None:
+                self.cur_close = orig_cur_close
 
     def update_price(self, new_row: pd.DataFrame):
         """
@@ -882,16 +955,46 @@ class FVG_Strategy(Strategy):
                 tick_price = float(self.cur_close)
                 tick_high = (float(new_row["high"].iloc[-1]) if "high" in new_row.columns else tick_price)
                 tick_low = (float(new_row["low"].iloc[-1]) if "low" in new_row.columns else tick_price)
+                tick_open = (
+                    float(new_row["open"].iloc[-1])
+                    if "open" in new_row.columns
+                    else tick_price
+                )
 
-                self._intrabar_price = tick_price
-                self._intrabar_high = tick_high
-                self._intrabar_low = tick_low
                 self._run_intrabar_entry_logic(
                     tick_price=tick_price,
                     tick_high=tick_high,
                     tick_low=tick_low,
+                    tick_open=tick_open,
                 )
 
+
+    def _format_data_bar_time(self, row_index: int = -1) -> str:
+        """Format timestamp for a row in self.data (used for FVG logging)."""
+        if self.data is None or self.data.empty:
+            return "unknown time"
+        if abs(row_index) > len(self.data):
+            return "unknown time"
+        if "timestamp" not in self.data.columns:
+            if row_index == -1 and getattr(self, "_current_dt", None) is not None:
+                return self._current_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            return "unknown time"
+        ts = self.data["timestamp"].iloc[row_index]
+        if pd.isna(ts):
+            return "unknown time"
+        try:
+            val = float(ts)
+            if val > 10**12:
+                dt = datetime.fromtimestamp(val / 1000.0, tz=timezone.utc)
+            else:
+                dt = datetime.fromtimestamp(val, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (TypeError, ValueError):
+            try:
+                dt = pd.to_datetime(ts, utc=True).to_pydatetime(warn=False)
+                return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            except Exception:
+                return str(ts)
 
     def _append_fvg_zone(self, direction: str, top: float, bottom: float) -> None:
         self.fvg_zones.append(
@@ -907,6 +1010,8 @@ class FVG_Strategy(Strategy):
 
     def add_fvg_zones(self):
         # === FVG ZONE CREATION (equivalent to the box.new blocks) ===
+        if self.data is None or len(self.data) < 3:
+            return
         gap_close = self.data["close"].iloc[-3]
         bull_power_pct = (
             (self.data["low"].iloc[-1] - self.data["high"].iloc[-3])
@@ -974,7 +1079,10 @@ class FVG_Strategy(Strategy):
                 top=self.data["low"].iloc[-1],
                 bottom=self.data["high"].iloc[-3],
             )
-            print(f"🟢 Bullish FVG detected: {self.data['high'].iloc[-3]:.5f} - {self.data['low'].iloc[-1]:.5f}")
+            print(
+                f"🟢 Bullish FVG detected ({self._format_data_bar_time(-2)}): "
+                f"{self.data['high'].iloc[-3]:.5f} - {self.data['low'].iloc[-1]:.5f}"
+            )
 
 
         if self.bearishPowerOK and self.isBearishHTF and self.marketOK:
@@ -984,7 +1092,10 @@ class FVG_Strategy(Strategy):
                 top=self.data["low"].iloc[-3],
                 bottom=self.data["high"].iloc[-1],
             )
-            print(f"🔴 Bearish FVG detected: {self.data['high'].iloc[-1]:.5f} - {self.data['low'].iloc[-3]:.5f}")
+            print(
+                f"🔴 Bearish FVG detected ({self._format_data_bar_time(-2)}): "
+                f"{self.data['high'].iloc[-1]:.5f} - {self.data['low'].iloc[-3]:.5f}"
+            )
 
 
     def _update_trend_indicators(self):
@@ -999,9 +1110,15 @@ class FVG_Strategy(Strategy):
             self.isBearishHTF = self.cur_close < htfEMA
 
         atrVal = get_atr(self.data, INPUTS.ATR_PERIOD)
-        atr_sma = sma(atrVal, min(20, len(atrVal))) if not atrVal.empty else None
-        atrOK = atrVal.iloc[-1] > atr_sma if (not atrVal.empty and atr_sma is not None) else False
-        atr_last = atrVal.iloc[-1] if not atrVal.empty else None
+        if atrVal is None or getattr(atrVal, "empty", True):
+            atr_sma = None
+            atrOK = False
+            atr_last = None
+        else:
+            atr_sma = sma(atrVal, min(20, len(atrVal)))
+            atrOK = atrVal.iloc[-1] > atr_sma if atr_sma is not None else False
+            atr_last = atrVal.iloc[-1]
+
         vol_sma = None
         volOK = None
 
@@ -1025,6 +1142,10 @@ class FVG_Strategy(Strategy):
             "market_ok": self.marketOK,
         }
 
+        if len(self.data) < 3:
+            self.lastBullFvg = False
+            self.lastBearFvg = False
+            return
 
         self.lastBullFvg = self.data["high"].iloc[-3] < self.data["low"].iloc[-1] and not self.lastBullFvg
         self.lastBearFvg = self.data["low"].iloc[-3] > self.data["high"].iloc[-1] and not self.lastBearFvg
@@ -1048,6 +1169,18 @@ class FVG_Strategy(Strategy):
         )
     
     def update_indicators(self):
+        if self.data is None or len(self.data) < 3:
+            self.isBullishHTF = False
+            self.isBearishHTF = False
+            self.marketOK = False
+            self.lastBullFvg = False
+            self.lastBearFvg = False
+            self.bullishPowerOK = False
+            self.bearishPowerOK = False
+            self.isBOS = False
+            self.isCHOCH = False
+            return
+
         self._update_trend_indicators()
 
         gapClose = self.data["close"].iloc[-3]
@@ -1062,13 +1195,78 @@ class FVG_Strategy(Strategy):
             and (self.data["low"].iloc[-3] - self.data["high"].iloc[-1]) / gapClose * 100 >= INPUTS.MIN_FVG_POWER_PCT
         )
 
-        self._calc_BOS_and_CHOCH()
+        if len(self.data) >= 22:
+            self._calc_BOS_and_CHOCH()
+        else:
+            self.isBOS = False
+            self.isCHOCH = False
+
+    def _should_log_entry_checks(self) -> bool:
+        # Backtest walks every 1m bar; skip there. Live ProjectX polls use this path.
+        return not getattr(self, "mirror_live_entry_timing", False)
+
+    def _log_entry_zone_check(
+        self,
+        *,
+        zone: dict,
+        touches: bool,
+        current_high: float,
+        current_low: float,
+        tick_open: float | None = None,
+        tick_close: float | None = None,
+    ) -> None:
+        """Log when price overlaps an unmitigated zone (live only; throttled)."""
+        if not self._should_log_entry_checks():
+            return
+        if not touches:
+            return
+
+        direction = zone.get("direction")
+        fvg_top = float(zone["top"])
+        fvg_bottom = float(zone["bottom"])
+        market_ok = bool(self.marketOK)
+        htf_ok = (
+            bool(self.isBullishHTF)
+            if direction == "bull"
+            else bool(self.isBearishHTF)
+        )
+        blockers: list[str] = []
+        if direction == "bull" and not self.isBullishHTF:
+            blockers.append("HTF not bullish")
+        if direction == "bear" and not self.isBearishHTF:
+            blockers.append("HTF not bearish")
+        if not market_ok:
+            blockers.append("marketOK false")
+        would_enter = not blockers
+
+        # Throttle identical blocked lines; always log a fresh enter attempt.
+        key = (direction, fvg_top, fvg_bottom, market_ok, htf_ok, would_enter)
+        now = time.monotonic()
+        last = self._entry_check_log_ts.get(key, 0.0)
+        if not would_enter and (now - last) < 60.0:
+            return
+        self._entry_check_log_ts[key] = now
+
+        open_s = f"{tick_open:.2f}" if tick_open is not None else "?"
+        close_s = f"{tick_close:.2f}" if tick_close is not None else f"{float(self.cur_close):.2f}"
+        decision = "ENTER" if would_enter else f"BLOCKED ({', '.join(blockers)})"
+        print(
+            f"🔎 Entry check [{direction}] zone {fvg_bottom:.2f}-{fvg_top:.2f} | "
+            f"1m H/L {current_high:.2f}/{current_low:.2f} O/C {open_s}/{close_s} | "
+            f"touch=True marketOK={market_ok} HTF_ok={htf_ok} → {decision}"
+        )
 
     def entry_logic(self):
         if not self.fvg_zones:
             return
 
         if getattr(self, "trading_paused", False):
+            if self._should_log_entry_checks() and getattr(self, "_intrabar_mode", False):
+                # Rare; log at most once per minute while paused.
+                now = time.monotonic()
+                if now - self._entry_check_log_ts.get(("paused",), 0.0) >= 60.0:
+                    self._entry_check_log_ts[("paused",)] = now
+                    print("🔎 Entry check skipped: trading_paused=True")
             return
 
         if INPUTS.MAX_DRAWDOWN_ENABLED and self._is_drawdown_lockout(self._get_current_timestamp()):
@@ -1115,9 +1313,16 @@ class FVG_Strategy(Strategy):
             current_low = self._intrabar_low
 
         atr_series = get_atr(self.data, INPUTS.ATR_PERIOD)
-        atr = atr_series.iloc[-1] if not atr_series.empty else None
+        atr = (
+            atr_series.iloc[-1]
+            if atr_series is not None and not atr_series.empty
+            else None
+        )
         if atr is None:
             return
+
+        tick_open = getattr(self, "_intrabar_open", None)
+        tick_close = getattr(self, "_intrabar_price", None)
 
         for zone in self.fvg_zones[-INPUTS.FVG_HISTORY_NBR:]:
             if not self.pyramiding.should_allow_entry(self, zone):
@@ -1130,6 +1335,14 @@ class FVG_Strategy(Strategy):
 
             # Full touch: current bar's high/low overlaps the FVG zone
             touchesFVG = current_high > fvg_bottom and current_low < fvg_top
+            self._log_entry_zone_check(
+                zone=zone,
+                touches=touchesFVG,
+                current_high=float(current_high),
+                current_low=float(current_low),
+                tick_open=float(tick_open) if tick_open is not None else None,
+                tick_close=float(tick_close) if tick_close is not None else None,
+            )
 
             if (
                 zone["direction"] == "bull"
@@ -1137,9 +1350,14 @@ class FVG_Strategy(Strategy):
                 and self.isBullishHTF
                 and self.marketOK
             ):
-                entry_price = self.cur_close
                 if allow_intracandle:
-                    entry_price = fvg_top
+                    entry_price = self._resolve_intracandle_entry_price(
+                        side="BUY",
+                        fvg_top=fvg_top,
+                        fvg_bottom=fvg_bottom,
+                    )
+                else:
+                    entry_price = self.cur_close
                 stop_loss = entry_price - atr * INPUTS.SL_MULTIPLIER
                 if INPUTS.USE_TRAILING:
                     trail_stop = entry_price - atr * INPUTS.TRAIL_OFFSET_MULT
@@ -1176,6 +1394,11 @@ class FVG_Strategy(Strategy):
                     print(f"📈 LONG position opened. Daily trades: {self.daily_trades_count}/{INPUTS.MAX_DAILY_TRADES}")
                 else:
                     self._partial_groups.pop(group_id, None)
+                    if self._should_log_entry_checks():
+                        print(
+                            f"🔎 Entry check: place_order FAILED for bull zone "
+                            f"{fvg_bottom:.2f}-{fvg_top:.2f} @ {entry_price:.2f}"
+                        )
                 break
 
 
@@ -1185,9 +1408,14 @@ class FVG_Strategy(Strategy):
                 and self.isBearishHTF
                 and self.marketOK
             ):
-                entry_price = self.cur_close
                 if allow_intracandle:
-                    entry_price = fvg_bottom
+                    entry_price = self._resolve_intracandle_entry_price(
+                        side="SELL",
+                        fvg_top=fvg_top,
+                        fvg_bottom=fvg_bottom,
+                    )
+                else:
+                    entry_price = self.cur_close
                 stop_loss = entry_price + atr * INPUTS.SL_MULTIPLIER
                 if INPUTS.USE_TRAILING:
                     trail_stop = entry_price + atr * INPUTS.TRAIL_OFFSET_MULT
@@ -1224,6 +1452,11 @@ class FVG_Strategy(Strategy):
                     print(f"📉 SHORT position opened. Daily trades: {self.daily_trades_count}/{INPUTS.MAX_DAILY_TRADES}")
                 else:
                     self._partial_groups.pop(group_id, None)
+                    if self._should_log_entry_checks():
+                        print(
+                            f"🔎 Entry check: place_order FAILED for bear zone "
+                            f"{fvg_bottom:.2f}-{fvg_top:.2f} @ {entry_price:.2f}"
+                        )
                 break
 
     def _update_order_trailing_stop(

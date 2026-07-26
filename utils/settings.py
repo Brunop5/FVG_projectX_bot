@@ -209,10 +209,21 @@ def load_strategy_inputs(default_path: str | None = None) -> StrategyInputs:
     Load strategy inputs from JSON.
 
     Priority:
-    1) FVG_INPUTS_JSON env var
+    1) FVG_INPUTS_JSON_INLINE env var (raw JSON string)
+    2) FVG_INPUTS_JSON env var (path)
     2) default_path arg
     3) defaults from StrategyInputs
     """
+    inline = os.getenv("FVG_INPUTS_JSON_INLINE", "").strip()
+    if inline:
+        try:
+            raw = json.loads(inline)
+        except Exception:
+            return StrategyInputs()
+        raw = _resolve_env_placeholders(raw)
+        raw = _apply_api_env_fallbacks(raw)
+        return _validate_inputs(raw)
+
     env_path = os.getenv("FVG_INPUTS_JSON")
     json_path = env_path or default_path
     if not json_path:

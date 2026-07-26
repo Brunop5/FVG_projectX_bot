@@ -1,0 +1,438 @@
+//@version=1
+/*****************************************************************************************
+ *  FXReplay — NY market open (vertical line, dashed)
+ *
+ *  Why lines often “don’t show”:
+ *  1) Crossing rule for bar opens vs target HHMM (see crossesSessionOpenAtBarsAgo).
+ *  2) verticalLine time: sec→ms normalize option.
+ *  3) input bool/string coercion via truthyInput.
+ *  4) NY from UTC: Auto US Eastern DST (2007+) with utcOffset (no .tz).
+ *
+ *  Future markers use plot.line (histogram + offset). FXR re-evaluates plot.line arguments on the
+ *  host — use module globals _fxrNyf* for title/hi/lo/off. Future opens are queued; at most two
+ *  plot.line calls per onTick drain the queue (bursting freezes loading). Queue rebuild uses time(1)
+ *  as bar key (stable while bar 0 forms); time(0) can change every tick in replay.
+ *****************************************************************************************/
+
+let historyScanned = false;
+const drawnNyDayKeys = {};
+
+// plot.line() is bridged: identifiers inside its argument list are resolved on the host, so
+// closure locals (e.g. stableId, off) are not in scope there. Pass only module-level bindings.
+var _fxrNyfPlotTitle = '';
+var _fxrNyfPlotHi = 0;
+var _fxrNyfPlotLo = 0;
+var _fxrNyfPlotOff = 0;
+var _fxrLastFuturePlotBarKey = null;
+var _fxrNyfPending = null;
+var _fxrNyfPendingQi = 0;
+
+const G_TIME = 'FXReplay Time';
+const G_STYLE = 'FXReplay Style';
+
+const truthyInput = (v) => {
+  if (v === true || v === 1) {
+    return true;
+  }
+  if (v === false || v === 0 || v === null || v === undefined) {
+    return false;
+  }
+  const s = String(v).toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+};
+
+init = () => {
+  indicator({ onMainPanel: true, format: 'inherit' });
+
+  input.int('NY open (HHMM)', 930, 'openHm', 0, 2359, 1, 'Session open in your “wall clock” series (930 = 9:30)', G_TIME);
+
+  input.color('Line color', color.white, 'lineColor', G_STYLE);
+  input.int('Line width', 2, 'lineWidth', 1, 6, 1, 'Pixels', G_STYLE);
+  input.int('Line style', 2, 'lineStyle', 0, 4, 1, '0=solid 2=dashed', G_STYLE);
+  input.int(
+    'Future session lines',
+    40,
+    'futureCount',
+    0,
+    200,
+    1,
+    'Upcoming NY opens drawn ahead of the last bar (0 = off)',
+    G_TIME
+  );
+  input.int(
+    'Max bars (history scan)',
+    500,
+    'maxScan',
+    100,
+    2000,
+    50,
+    'Lower if FXR errors on long loops',
+    G_TIME
+  );
+  input.bool(
+    'Treat bar time as UTC then shift (utcOffset)',
+    true,
+    'useUtcOffset',
+    G_TIME,
+    'ON when bar timestamps are Unix UTC. OFF only if stamps are already correct local wall time.'
+  );
+  input.bool(
+    'Use US Eastern DST (NY from UTC, auto)',
+    true,
+    'autoNyDst',
+    G_TIME,
+    'When ON with UTC bars: applies Mar/Nov US rules (no manual -300/-240). When OFF, use manual minutes below.'
+  );
+  input.int(
+    'Manual NY vs UTC (minutes)',
+    -300,
+    'nyUtcMinutes',
+    -720,
+    840,
+    15,
+    'Only when UTC shift ON and Auto DST OFF (fixed offset).',
+    G_TIME
+  );
+  input.bool(
+    'Normalize time (sec→ms)',
+    true,
+    'normalizeTime',
+    G_TIME,
+    'If lines still invisible, turn OFF (some feeds already use ms).'
+  );
+  input.bool(
+    'verticalLine uses bar index (not time)',
+    false,
+    'verticalUseBarIndex',
+    G_TIME,
+    'If still invisible, try ON (some FXR builds want 0,1,2… not epoch ms).'
+  );
+};
+
+onTick = (length, _moment, _, ta, inputs) => {
+  const targetHm = Math.trunc(Number(inputs.openHm));
+  if (!Number.isFinite(targetHm)) {
+    return;
+  }
+
+  const lineWidth = Math.trunc(Number(inputs.lineWidth)) || 2;
+  const lineStyle = Math.trunc(Number(inputs.lineStyle));
+  const lineStyleSafe = Number.isFinite(lineStyle) ? lineStyle : 2;
+  const useUtc = truthyInput(inputs.useUtcOffset);
+  const autoNy = truthyInput(inputs.autoNyDst);
+
+  const springUtcMs = (year) => {
+    let m = _moment.utc([year, 2, 1, 0, 0, 0, 0]);
+    const dow = m.day();
+    const toFirstSun = (7 - dow) % 7;
+    m = m.clone().add(toFirstSun, 'days').add(7, 'days');
+    return m.clone().hour(7).minute(0).second(0).millisecond(0).valueOf();
+  };
+
+  const fallUtcMs = (year) => {
+    let m = _moment.utc([year, 10, 1, 0, 0, 0, 0]);
+    const dow = m.day();
+    const toFirstSun = (7 - dow) % 7;
+    m = m.clone().add(toFirstSun, 'days');
+    return m.clone().hour(6).minute(0).second(0).millisecond(0).valueOf();
+  };
+
+  const isUsEasternDst = (utcMs) => {
+    const y = _moment.utc(utcMs).year();
+    const sp = springUtcMs(y);
+    const fl = fallUtcMs(y);
+    return utcMs >= sp && utcMs < fl;
+  };
+
+  const nyOffsetMinutesForUtcMs = (utcMs) => {
+    if (useUtc && autoNy) {
+      return isUsEasternDst(utcMs) ? -240 : -300;
+    }
+    const off = Math.trunc(Number(inputs.nyUtcMinutes));
+    return Number.isFinite(off) ? off : -300;
+  };
+
+  const baseMoment = (ms) => {
+    if (useUtc && _moment.utc) {
+      return _moment.utc(ms);
+    }
+    return _moment(ms);
+  };
+
+  const wallClockMoment = (ms) => {
+    const n = Number(ms);
+    let m = baseMoment(ms);
+    if (useUtc && typeof m.utcOffset === 'function') {
+      const off = nyOffsetMinutesForUtcMs(n);
+      m = m.clone().utcOffset(off, false);
+    }
+    return m;
+  };
+
+  const nyDayKey = (barTimeMs) => wallClockMoment(barTimeMs).format('YYYY-MM-DD');
+  const nyHm = (barTimeMs) => {
+    const m = wallClockMoment(barTimeMs);
+    return m.hour() * 100 + m.minute();
+  };
+
+  const crossesSessionOpenAtBarsAgo = (barsAgo) => {
+    const ti = time(barsAgo);
+    if (ti === null || ti === undefined) {
+      return false;
+    }
+    const hmCurr = nyHm(ti);
+    if (hmCurr < targetHm) {
+      return false;
+    }
+    const tiOlder = time(barsAgo + 1);
+    if (tiOlder === null || tiOlder === undefined) {
+      return hmCurr >= targetHm;
+    }
+    const hmOlder = nyHm(tiOlder);
+    return hmOlder < targetHm && hmCurr >= targetHm;
+  };
+
+  const toChartTime = (ti) => {
+    const tRaw = Number(ti);
+    if (!Number.isFinite(tRaw)) {
+      return null;
+    }
+    if (!truthyInput(inputs.normalizeTime)) {
+      return tRaw;
+    }
+    if (tRaw > 0 && tRaw < 1e11) {
+      return tRaw * 1000;
+    }
+    return tRaw;
+  };
+
+  const inferBarMsMedian = () => {
+    const rawLen =
+      typeof length === 'number' && Number.isFinite(length) && length > 0
+        ? Math.floor(length)
+        : 0;
+    const spread = Math.min(120, Math.max(4, rawLen - 1));
+    const gaps = [];
+    for (let i = 0; i < spread; i += 1) {
+      const a = toChartTime(time(i));
+      const b = toChartTime(time(i + 1));
+      if (a === null || b === null) {
+        continue;
+      }
+      gaps.push(Math.abs(a - b));
+    }
+    if (gaps.length === 0) {
+      return 60 * 1000;
+    }
+    gaps.sort((x, y) => x - y);
+    const mid = gaps[Math.floor(gaps.length / 2)] || 60 * 1000;
+    return mid > 0 ? mid : 60 * 1000;
+  };
+
+  const offsetBarsAheadOfBar0 = (targetChartMs) => {
+    const t0 = toChartTime(time(0));
+    if (t0 === null || targetChartMs === null || !Number.isFinite(targetChartMs)) {
+      return null;
+    }
+    const barMs = inferBarMsMedian();
+    const off = Math.round((targetChartMs - t0) / barMs);
+    if (!Number.isFinite(off)) {
+      return null;
+    }
+    return off;
+  };
+
+  const panePriceBounds = () => {
+    let lo = Number(low(0));
+    let hi = Number(high(0));
+    if (!Number.isFinite(lo)) {
+      lo = 0;
+    }
+    if (!Number.isFinite(hi)) {
+      hi = 0;
+    }
+    const rawLen =
+      typeof length === 'number' && Number.isFinite(length) && length > 0
+        ? Math.floor(length)
+        : 0;
+    const maxB = Math.min(500, rawLen > 0 ? rawLen : 500);
+    for (let i = 0; i < maxB; i += 1) {
+      const Ln = Number(low(i));
+      const Hn = Number(high(i));
+      if (Number.isFinite(Ln) && Ln < lo) {
+        lo = Ln;
+      }
+      if (Number.isFinite(Hn) && Hn > hi) {
+        hi = Hn;
+      }
+    }
+    if (!Number.isFinite(hi) || !Number.isFinite(lo) || hi <= lo) {
+      hi = lo + 1e-6;
+    }
+    const pad = (hi - lo) * 0.05;
+    return { lo: lo - pad, hi: hi + pad };
+  };
+
+  const chartNowUtcMs = () => {
+    const raw = time(0);
+    const tRaw = Number(raw);
+    if (!Number.isFinite(tRaw)) {
+      if (_moment.utc) {
+        return _moment.utc().valueOf();
+      }
+      return _moment().valueOf();
+    }
+    if (!truthyInput(inputs.normalizeTime)) {
+      return tRaw;
+    }
+    if (tRaw > 0 && tRaw < 1e11) {
+      return tRaw * 1000;
+    }
+    return tRaw;
+  };
+
+  const styles = {
+    linecolor: inputs.lineColor,
+    color: inputs.lineColor,
+    linewidth: lineWidth,
+    linestyle: lineStyleSafe,
+    showLabel: false,
+  };
+
+  const drawFutureColumnByOffset = (targetChartMs, stableId) => {
+    let off = offsetBarsAheadOfBar0(targetChartMs);
+    if (off === null || !Number.isFinite(off)) {
+      return;
+    }
+    const lastT = toChartTime(time(0));
+    if (lastT !== null && targetChartMs > lastT && off < 1) {
+      off = 1;
+    }
+    if (off < 1 || off > 2000) {
+      return;
+    }
+    const bny = panePriceBounds();
+    _fxrNyfPlotTitle = 'nyf_' + String(stableId).replace(/[^a-zA-Z0-9_-]/g, '_');
+    _fxrNyfPlotHi = bny.hi;
+    _fxrNyfPlotLo = bny.lo;
+    _fxrNyfPlotOff = off;
+    plot.line(_fxrNyfPlotTitle, _fxrNyfPlotHi, inputs.lineColor, 1, _fxrNyfPlotLo, _fxrNyfPlotOff);
+  };
+
+  const drawOneVertical = (timeArg) => {
+    if (truthyInput(inputs.verticalUseBarIndex) && typeof timeArg === 'number' && timeArg >= 0 && timeArg < 1e9) {
+      verticalLine(timeArg, styles);
+      return;
+    }
+    const tDraw = toChartTime(timeArg);
+    if (tDraw === null) {
+      return;
+    }
+    const lastT = toChartTime(time(0));
+    if (lastT !== null && Number.isFinite(lastT) && tDraw > lastT) {
+      drawFutureColumnByOffset(tDraw, 'nyf_' + String(tDraw));
+      return;
+    }
+    verticalLine(tDraw, styles);
+  };
+
+  const buildFutureOpenQueue = () => {
+    const fcRaw = Math.trunc(Number(inputs.futureCount));
+    if (!Number.isFinite(fcRaw) || fcRaw <= 0) {
+      _fxrNyfPending = null;
+      _fxrNyfPendingQi = 0;
+      return;
+    }
+    const fc = Math.min(60, Math.max(1, fcRaw));
+    const start = chartNowUtcMs();
+    const hh = Math.floor(targetHm / 100);
+    const mm = targetHm % 100;
+    let slot = wallClockMoment(start);
+    if (typeof slot.startOf === 'function') {
+      slot = slot.startOf('day');
+    } else {
+      slot = slot.clone().hour(0).minute(0).second(0).millisecond(0);
+    }
+    slot = slot.clone().hour(hh).minute(mm).second(0).millisecond(0);
+    if (slot.valueOf() <= start) {
+      slot = slot.clone().add(1, 'day');
+    }
+    const rows = [];
+    for (let k = 0; k < fc; k += 1) {
+      const utcMs = slot.valueOf();
+      const tDraw = toChartTime(utcMs);
+      if (tDraw !== null) {
+        rows.push({ t: tDraw, s: 'nyf_' + String(utcMs) });
+      }
+      slot = slot.clone().add(1, 'day');
+    }
+    _fxrNyfPending = rows;
+    _fxrNyfPendingQi = 0;
+  };
+
+  const tryMarkOpenAtBarsAgo = (barsAgo) => {
+    if (!crossesSessionOpenAtBarsAgo(barsAgo)) {
+      return;
+    }
+    const ti = time(barsAgo);
+    const dk = nyDayKey(ti);
+    if (drawnNyDayKeys[dk]) {
+      return;
+    }
+    drawnNyDayKeys[dk] = true;
+    if (truthyInput(inputs.verticalUseBarIndex)) {
+      drawOneVertical(barsAgo);
+      return;
+    }
+    drawOneVertical(ti);
+  };
+
+  if (!historyScanned) {
+    const maxScan = Math.min(
+      2000,
+      Math.max(1, Math.trunc(Number(inputs.maxScan)) || 500)
+    );
+    const rawLen =
+      typeof length === 'number' && Number.isFinite(length) && length > 0
+        ? Math.floor(length)
+        : 0;
+    const cap = rawLen > 0 ? Math.min(rawLen, maxScan) : maxScan;
+    for (let i = 0; i < cap; i += 1) {
+      tryMarkOpenAtBarsAgo(i);
+    }
+    historyScanned = true;
+  }
+
+  let barStableKey = '';
+  const t1raw = time(1);
+  if (t1raw !== null && t1raw !== undefined && Number.isFinite(Number(t1raw))) {
+    barStableKey = 't1_' + String(Number(t1raw));
+  } else if (typeof length === 'number' && Number.isFinite(length) && length >= 0) {
+    barStableKey = 'L_' + String(Math.floor(length));
+  } else if (typeof index === 'number' && Number.isFinite(index)) {
+    barStableKey = 'i_' + String(Math.floor(index));
+  } else {
+    const t0raw = time(0);
+    barStableKey =
+      t0raw === null || t0raw === undefined ? 'x' : String(Number(t0raw));
+  }
+  if (barStableKey !== _fxrLastFuturePlotBarKey) {
+    _fxrLastFuturePlotBarKey = barStableKey;
+    buildFutureOpenQueue();
+  }
+
+  let drain = 0;
+  const drainMax = 2;
+  while (
+    drain < drainMax &&
+    _fxrNyfPending &&
+    _fxrNyfPendingQi < _fxrNyfPending.length
+  ) {
+    const row = _fxrNyfPending[_fxrNyfPendingQi];
+    _fxrNyfPendingQi += 1;
+    drain += 1;
+    drawFutureColumnByOffset(row.t, row.s);
+  }
+
+  tryMarkOpenAtBarsAgo(0);
+};

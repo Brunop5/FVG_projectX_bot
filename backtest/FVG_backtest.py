@@ -5,7 +5,11 @@ from pathlib import Path
 import pandas as pd
 
 BACKTEST_DIR = Path(__file__).resolve().parent
-os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs_binance.json"))
+_ASSET_PRESET = os.getenv("FVG_BACKTEST_ASSET", "BTC").strip()
+if _ASSET_PRESET.upper().startswith("MGC"):
+    os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs_topstep.json"))
+else:
+    os.environ.setdefault("FVG_INPUTS_JSON", str(BACKTEST_DIR / "inputs_binance.json"))
 
 from FVG_projectX_bot.FVG_strategy import *
 from FVG_projectX_bot.helping_functions.partial_close import (
@@ -21,10 +25,13 @@ from FVG_projectX_bot.helping_functions.pyramiding import (
 
 PARENT_DIR = Path(__file__).parents[1]
 BACKTEST_RUNTIME_DIR = BACKTEST_DIR / INPUTS.RUNTIME_SUBDIR
-BACKTEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+_NO_DISK_IO = os.getenv("FVG_NO_DISK_IO", "").strip().lower() in ("1", "true", "yes", "on")
+if not _NO_DISK_IO:
+    BACKTEST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 # ==================== USER CONFIG ====================
-ASSET = "BTC"
+# For gold: set FVG_BACKTEST_ASSET=MGCQ6 (or edit ASSET below) before running.
+ASSET = os.getenv("FVG_BACKTEST_ASSET", "BTC")
 TIMEFRAME = "15m"
 INITIAL_BALANCE = 500
 DATA_CSV_PATH = str(PARENT_DIR / "backtest" / "data" / "BTCUSDT_PERP_15m.csv")
@@ -53,6 +60,92 @@ LEVERAGE = 50
 # Position sizing inputs (backtest only)
 USE_MARGIN_PER_TRADE = True
 MARGIN_PER_TRADE_USD = 10
+
+
+def _is_futures_asset(asset: str) -> bool:
+    return (asset or "").upper().startswith("MGC")
+
+
+def _to_epoch_ms(value: float | int | str | None) -> int | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        ts = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if ts < 10**12:
+        ts *= 1000
+    return ts
+
+
+def _timestamp_series_ms(series: pd.Series) -> pd.Series:
+    raw = pd.to_numeric(series, errors="coerce")
+    if raw.notna().any() and float(raw.max()) < 10**12:
+        raw = raw * 1000.0
+    return raw
+
+
+def _parse_timeframe_minutes(timeframe: str) -> int:
+    tf = str(timeframe).strip().lower()
+    if tf.isdigit():
+        return int(tf)
+    if tf.endswith("m") and tf[:-1].isdigit():
+        return int(tf[:-1])
+    if tf.endswith("h") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 60
+    if tf.endswith("d") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 1440
+    raise ValueError(f"Unsupported timeframe format: {timeframe!r}")
+
+
+def find_15m_1m_overlap_indices(
+    data_15m: pd.DataFrame,
+    data_1m: pd.DataFrame,
+    *,
+    bar_minutes: int = 15,
+) -> tuple[int, int] | None:
+    """
+    Return (first_idx, last_idx) of 15m rows that have at least one 1m bar
+    in their bar window [open, open + bar_minutes).
+    """
+    if data_15m is None or data_1m is None or data_15m.empty or data_1m.empty:
+        return None
+    if "timestamp" not in data_15m.columns or "timestamp" not in data_1m.columns:
+        return None
+
+    ts_15 = _timestamp_series_ms(data_15m["timestamp"])
+    ts_1m = _timestamp_series_ms(data_1m["timestamp"])
+    bar_ms = int(bar_minutes) * 60 * 1000
+    first_idx: int | None = None
+    last_idx: int | None = None
+    for idx, bar_ts in enumerate(ts_15):
+        if pd.isna(bar_ts):
+            continue
+        bar_start = int(bar_ts)
+        bar_end = bar_start + bar_ms
+        if ((ts_1m >= bar_start) & (ts_1m < bar_end)).any():
+            if first_idx is None:
+                first_idx = idx
+            last_idx = idx
+    if first_idx is None or last_idx is None:
+        return None
+    return first_idx, last_idx
+
+
+def configure_futures_backtest(contracts_path: Path | str | None = None) -> None:
+    """
+    Gold/futures backtest profile: fixed lot sizing + per-contract round-turn fees.
+    Matches live ProjectX PnL (3.5 USD per contract round turn).
+    """
+    global USE_CONTRACTS_CSV, CONTRACTS_CSV_PATH
+    global USE_MARGIN_PER_TRADE, USE_MARGIN_PRICING, USE_ROUND_TURN_FEE
+
+    USE_CONTRACTS_CSV = True
+    CONTRACTS_CSV_PATH = str(contracts_path or (BACKTEST_DIR / "contracts.csv"))
+    USE_MARGIN_PER_TRADE = False
+    USE_MARGIN_PRICING = False
+    USE_ROUND_TURN_FEE = True
+
 
 # CSV output options
 TRADE_CSV_WRITE_MODE = "append"  # "prepend" (newest first) or "append" (faster)
@@ -258,6 +351,229 @@ class FVG_Backtest(FVG_Strategy):
         self._configure_pyramiding(pyramiding_mode)
         super().__init__()
         self.require_intrabar_entry = True
+        # Match live ProjectX: intrabar entries use filters from last closed 15m bar;
+        # the forming 15m bar is not in self.data until after the 1m walk completes.
+        self.mirror_live_entry_timing = True
+        self._cached_entry_filters: dict[str, bool] | None = None
+
+    def _cache_entry_filters(self) -> None:
+        self._cached_entry_filters = {
+            "isBullishHTF": bool(self.isBullishHTF),
+            "isBearishHTF": bool(self.isBearishHTF),
+            "marketOK": bool(self.marketOK),
+        }
+
+    def _apply_cached_entry_filters(self) -> None:
+        cached = self._cached_entry_filters
+        if not cached:
+            return
+        self.isBullishHTF = cached["isBullishHTF"]
+        self.isBearishHTF = cached["isBearishHTF"]
+        self.marketOK = cached["marketOK"]
+
+    def _row_bar_ts_ms(self, row: pd.DataFrame) -> int:
+        ts_val = row["timestamp"].iloc[-1]
+        try:
+            bar_ts_ms = int(float(ts_val))
+            if bar_ts_ms < 10**12:
+                bar_ts_ms = int(bar_ts_ms * 1000)
+            return bar_ts_ms
+        except (TypeError, ValueError):
+            bar_ts = self._extract_bar_time(row)
+            return int(bar_ts.timestamp() * 1000) if bar_ts else 0
+
+    def _append_closed_bar(self, new_row: pd.DataFrame) -> None:
+        self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:]
+        self.cur_close = float(new_row["close"].iloc[-1])
+        self.cur_volume = float(new_row["volume"].iloc[-1]) if "volume" in new_row.columns else 0.0
+        self._current_dt = self._extract_bar_time(new_row)
+        self._current_index = self._cursor
+
+    def _mirror_live_1m_phase(self, new_row: pd.DataFrame) -> bool:
+        """
+        Walk 1m ticks for the forming 15m bar before it is appended to self.data.
+        Entries use cached filters; exits use stale BOS/CHOCH (pre-bar-close).
+        """
+        bar_ts_ms = self._row_bar_ts_ms(new_row)
+        one_min_bars = self._get_1m_bars_for_15m_bar(bar_ts_ms)
+        if one_min_bars.empty:
+            return False
+
+        self._closed_any_this_bar = False
+        saved_dt = self._current_dt
+        try:
+            for _, row_1m in one_min_bars.iterrows():
+                ts_1m = row_1m["timestamp"]
+                try:
+                    ts_1m = int(float(ts_1m))
+                except (TypeError, ValueError):
+                    ts_1m = 0
+                eval_bucket_ms = ts_1m if ts_1m > 10**12 else ts_1m * 1000
+                tick_dt = self._parse_start_timestamp(ts_1m) if ts_1m else saved_dt
+                tick_price = (
+                    float(row_1m["close"])
+                    if "close" in row_1m and pd.notna(row_1m["close"])
+                    else float(new_row["close"].iloc[-1])
+                )
+                tick_high = (
+                    float(row_1m["high"])
+                    if "high" in row_1m and pd.notna(row_1m["high"])
+                    else tick_price
+                )
+                tick_low = (
+                    float(row_1m["low"])
+                    if "low" in row_1m and pd.notna(row_1m["low"])
+                    else tick_price
+                )
+                tick_open = (
+                    float(row_1m["open"])
+                    if "open" in row_1m and pd.notna(row_1m["open"])
+                    else tick_price
+                )
+                self._current_dt = tick_dt
+
+                if self.active_orders:
+                    self.update_stops(
+                        current_high=tick_high,
+                        current_low=tick_low,
+                        high_changed=True,
+                        low_changed=True,
+                        eval_bucket_ts_ms=eval_bucket_ms,
+                    )
+                    self._process_order_closes(
+                        tick_high, tick_low, tick_price, tick_dt,
+                        use_1m=True,
+                        eval_bucket_ts_ms=eval_bucket_ms,
+                    )
+                    continue
+
+                if not getattr(self, "require_intrabar_entry", False):
+                    continue
+
+                self._apply_cached_entry_filters()
+                self._run_intrabar_entry_logic(
+                    tick_price=tick_price,
+                    tick_high=tick_high,
+                    tick_low=tick_low,
+                    tick_open=tick_open,
+                )
+                for attr in ("_intrabar_high", "_intrabar_low", "_intrabar_open", "_intrabar_price"):
+                    if hasattr(self, attr):
+                        delattr(self, attr)
+
+                if self.active_orders:
+                    for order in self.active_orders:
+                        if getattr(order, "opened_eval_ts_ms", None) is None:
+                            order.opened_eval_ts_ms = eval_bucket_ms
+                        if order.entry_time is None:
+                            order.entry_time = tick_dt
+        finally:
+            self._current_dt = saved_dt
+
+        return True
+
+    def _process_15m_bar_closes(self, new_row: pd.DataFrame) -> None:
+        current_high = float(new_row["high"].iloc[-1])
+        current_low = float(new_row["low"].iloc[-1])
+        self._process_order_closes(
+            current_high,
+            current_low,
+            float(new_row["close"].iloc[-1]),
+            self._extract_bar_time(new_row) or self._current_dt,
+            use_1m=False,
+        )
+
+    def _legacy_process_1m_closes_for_bar(self, new_row: pd.DataFrame) -> None:
+        """Legacy backtest path: 1m exits after the 15m bar is already in self.data."""
+        self._closed_any_this_bar = False
+        bar_ts_ms = self._row_bar_ts_ms(new_row)
+        one_min_bars = self._get_1m_bars_for_15m_bar(bar_ts_ms)
+
+        if one_min_bars.empty:
+            current_high = float(new_row["high"].iloc[-1])
+            current_low = float(new_row["low"].iloc[-1])
+            self._process_order_closes(
+                current_high, current_low, self.cur_close, self._current_dt,
+                use_1m=False,
+            )
+            return
+
+        for _, row_1m in one_min_bars.iterrows():
+            if not self.active_orders:
+                break
+            ts_val = row_1m["timestamp"]
+            try:
+                ts_val = int(float(ts_val))
+            except (TypeError, ValueError):
+                ts_val = 0
+            eval_bucket_ms = ts_val if ts_val > 10**12 else ts_val * 1000
+            h_1m = float(row_1m["high"]) if "high" in row_1m else self.cur_close
+            l_1m = float(row_1m["low"]) if "low" in row_1m else self.cur_close
+            c_1m = float(row_1m["close"]) if "close" in row_1m else self.cur_close
+            dt_1m = self._parse_start_timestamp(ts_val) if ts_val else self._current_dt
+            self.update_stops(
+                current_high=h_1m,
+                current_low=l_1m,
+                high_changed=True,
+                low_changed=True,
+                eval_bucket_ts_ms=eval_bucket_ms,
+            )
+            self._process_order_closes(
+                h_1m, l_1m, c_1m, dt_1m,
+                use_1m=True,
+                eval_bucket_ts_ms=eval_bucket_ms,
+            )
+
+    def _legacy_process_1m_intrabar_entries(self, new_row: pd.DataFrame) -> bool:
+        """Legacy path: intrabar entries after indicators ran on the appended 15m bar."""
+        bar_ts_ms = self._row_bar_ts_ms(new_row)
+        one_min_bars = self._get_1m_bars_for_15m_bar(bar_ts_ms)
+        if one_min_bars.empty:
+            return False
+
+        for _, row_1m in one_min_bars.iterrows():
+            if self.active_orders:
+                break
+            ts_1m = row_1m["timestamp"]
+            try:
+                ts_1m = int(float(ts_1m))
+            except (TypeError, ValueError):
+                ts_1m = 0
+            eval_bucket_ms = ts_1m if ts_1m > 10**12 else ts_1m * 1000
+            tick_dt = self._parse_start_timestamp(ts_1m) if ts_1m else self._current_dt
+            tick_price = (
+                float(row_1m["close"])
+                if "close" in row_1m and pd.notna(row_1m["close"])
+                else self.cur_close
+            )
+            tick_high = (
+                float(row_1m["high"])
+                if "high" in row_1m and pd.notna(row_1m["high"])
+                else tick_price
+            )
+            tick_low = (
+                float(row_1m["low"])
+                if "low" in row_1m and pd.notna(row_1m["low"])
+                else tick_price
+            )
+            tick_open = (
+                float(row_1m["open"])
+                if "open" in row_1m and pd.notna(row_1m["open"])
+                else tick_price
+            )
+            self._run_intrabar_entry_logic(
+                tick_price=tick_price,
+                tick_high=tick_high,
+                tick_low=tick_low,
+                tick_open=tick_open,
+            )
+            if self.active_orders:
+                for order in self.active_orders:
+                    if getattr(order, "opened_eval_ts_ms", None) is None:
+                        order.opened_eval_ts_ms = eval_bucket_ms
+                    if order.entry_time is None:
+                        order.entry_time = tick_dt
+        return True
 
     def _next_partial_group_id(self) -> int:
         return next_partial_group_id(self, INPUTS)
@@ -389,16 +705,93 @@ class FVG_Backtest(FVG_Strategy):
             print(f"⚠️ 1min data not found: {e}. Using 15m bar high/low for TP/SL.")
             return None
 
+    def _bar_duration_ms(self) -> int:
+        return _parse_timeframe_minutes(self.timeframe) * 60 * 1000
+
     def _get_1m_bars_for_15m_bar(self, bar_ts_ms: int) -> pd.DataFrame:
-        """Return 1m bars whose open time falls in the 15m bar [bar_ts_ms, bar_ts_ms + 15*60*1000)."""
+        """Return 1m bars whose open time falls in the bar window [open, open + bar_duration)."""
         if self._full_data_1m is None:
             return pd.DataFrame()
         ts_col = "timestamp"
         if ts_col not in self._full_data_1m.columns:
             return pd.DataFrame()
-        end_ms = bar_ts_ms + 15 * 60 * 1000
-        mask = (self._full_data_1m[ts_col] >= bar_ts_ms) & (self._full_data_1m[ts_col] < end_ms)
+        bar_start = _to_epoch_ms(bar_ts_ms)
+        if bar_start is None:
+            return pd.DataFrame()
+        bar_end = bar_start + self._bar_duration_ms()
+        ts_1m = _timestamp_series_ms(self._full_data_1m[ts_col])
+        mask = ts_1m.notna() & (ts_1m >= bar_start) & (ts_1m < bar_end)
         return self._full_data_1m.loc[mask].copy()
+
+    def restrict_to_1m_overlap(self) -> bool:
+        """
+        Trim loaded 15m/1m history to the contiguous range where every evaluated
+        15m bar has at least one matching 1m bar (avoids 15m high/low fallback).
+        Keeps warmup bars before the first overlapping 15m bar for indicators.
+        """
+        if self._full_data is None or self._full_data_1m is None:
+            return False
+        if self._full_data.empty or self._full_data_1m.empty:
+            return False
+
+        bar_minutes = _parse_timeframe_minutes(self.timeframe)
+        bounds = find_15m_1m_overlap_indices(
+            self._full_data,
+            self._full_data_1m,
+            bar_minutes=bar_minutes,
+        )
+        if bounds is None:
+            return False
+
+        first_idx, last_idx = bounds
+        warmup = max(1, int(self._warmup_bars or self._infer_warmup()), int(self._get_window_size()))
+        slice_start = max(0, first_idx - warmup)
+        slice_end = last_idx + 1
+
+        self._full_data = self._full_data.iloc[slice_start:slice_end].copy().reset_index(drop=True)
+
+        # Index of first overlap bar inside the trimmed 15m frame.
+        eval_first_idx = first_idx - slice_start
+        # If the overlap starts at the beginning of available history, we have no
+        # pre-overlap bars. Keep the first `warmup` overlap bars as indicator warmup
+        # and only evaluate/trade from there (avoids empty self.data / iloc[-3]).
+        min_start = min(warmup, max(0, len(self._full_data) - 1))
+        if eval_first_idx < min_start:
+            eval_first_idx = min_start
+
+        ts_15 = _timestamp_series_ms(self._full_data["timestamp"])
+        bar_start_ms = int(ts_15.iloc[eval_first_idx])
+        bar_end_ms = int(ts_15.iloc[-1]) + self._bar_duration_ms()
+        ts_1m = _timestamp_series_ms(self._full_data_1m["timestamp"])
+        mask_1m = ts_1m.notna() & (ts_1m >= bar_start_ms) & (ts_1m < bar_end_ms)
+        self._full_data_1m = self._full_data_1m.loc[mask_1m].copy().reset_index(drop=True)
+
+        self._cursor = eval_first_idx
+        self._htf_resampled = None
+        self._htf_source_indexed = None
+        self._htf_resample_period = None
+        self._htf_period_delta = None
+        self._build_htf_cache()
+
+        window = self._get_window_size()
+        data_start = max(0, self._cursor - window)
+        self.data = self._full_data.iloc[data_start:self._cursor].copy().reset_index(drop=True)
+
+        self._overlap_meta = {
+            "first_eval_bar_index": int(eval_first_idx),
+            "eval_15m_bars": int(len(self._full_data) - eval_first_idx),
+            "total_15m_bars": int(len(self._full_data)),
+            "total_1m_bars": int(len(self._full_data_1m)),
+            "eval_start_ms": bar_start_ms,
+            "eval_end_ms": bar_end_ms,
+        }
+        print(
+            "📊 Restricted to 15m/1m overlap: "
+            f"eval_bars={self._overlap_meta['eval_15m_bars']} "
+            f"(15m total={self._overlap_meta['total_15m_bars']}, "
+            f"1m={self._overlap_meta['total_1m_bars']})"
+        )
+        return True
 
     def _get_opened_eval_ts_ms_for_current_bar(self) -> int | None:
         """Last 1m bar timestamp in current 15m bar (for opened_eval_ts_ms). None if no 1m data."""
@@ -424,8 +817,21 @@ class FVG_Backtest(FVG_Strategy):
             return
         match = df[df["name"] == self.asset]
         if match.empty:
-            print(f"⚠️ No contract row found for asset '{self.asset}' in contracts.csv")
-            return
+            # Fallback: try matching by root symbol (e.g. MGCJ6 -> MGC)
+            # Prefer active contract when available.
+            asset_root = str(self.asset).strip()
+            if len(asset_root) >= 3:
+                asset_root = asset_root[:3]
+            candidates = df[df["name"].astype(str).str.startswith(asset_root, na=False)]
+            if "activeContract" in df.columns:
+                active = candidates[candidates["activeContract"] == True]  # noqa: E712
+                if not active.empty:
+                    candidates = active
+            if not candidates.empty:
+                match = candidates.head(1)
+            else:
+                print(f"⚠️ No contract row found for asset '{self.asset}' in contracts.csv")
+                return
         row = match.iloc[0]
         self.tick_size = row.get("tickSize")
         self.tick_value = row.get("tickValue")
@@ -764,15 +1170,18 @@ class FVG_Backtest(FVG_Strategy):
             "total_fees": order.fee_paid,
         }
         self.trades.append(row)
-        self._append_trade_csv(row)
-        # Persist full strategy/backtest state after each completed trade
-        try:
-            self.save_data()
-        except Exception:
-            # Saving should not break the backtest loop; ignore persistence errors
-            pass
+        if not _NO_DISK_IO:
+            self._append_trade_csv(row)
+            # Persist full strategy/backtest state after each completed trade
+            try:
+                self.save_data()
+            except Exception:
+                # Saving should not break the backtest loop; ignore persistence errors
+                pass
 
     def _append_trade_csv(self, row: dict):
+        if _NO_DISK_IO:
+            return
         # Ensure output directory exists
         os.makedirs(os.path.dirname(self.trades_csv_path), exist_ok=True)
         fieldnames = [
@@ -908,73 +1317,41 @@ class FVG_Backtest(FVG_Strategy):
         self.active_orders = remaining
 
     def run(self):
+        # Seed filter cache from warmup history (live: state after last closed bar before eval).
+        self.update_indicators()
+        self._cache_entry_filters()
+
         total_bars = len(self._full_data)
         while self._cursor < total_bars:
             if self.account_balance <= 0:
                 self._stopped = True
                 break
+
             new_row = self._full_data.iloc[[self._cursor]]
-            # Mirror live runners (Binance/ProjectX): keep only the most recent bars.
-            # This prevents self.data from growing unbounded and slowing indicator/entry checks.
-            self.data = pd.concat([self.data, new_row], ignore_index=True).iloc[-100:]
-            self.cur_close = float(new_row["close"].iloc[-1])
-            self.cur_volume = float(new_row["volume"].iloc[-1]) if "volume" in new_row.columns else 0.0
-            self._current_dt = self._extract_bar_time(new_row)
-            self._current_index = self._cursor
+            mirror_live = bool(getattr(self, "mirror_live_entry_timing", False))
+            intrabar_checked = False
+
+            # --- Live mirror: 1m phase while 15m bar is still forming (self.data excludes new_row) ---
+            if mirror_live and self._full_data_1m is not None:
+                intrabar_checked = self._mirror_live_1m_phase(new_row)
+            elif not mirror_live and self.active_orders:
+                self._legacy_process_1m_closes_for_bar(new_row)
+
+            # --- 15m bar close: append completed bar and refresh indicators/FVGs ---
+            self._append_closed_bar(new_row)
 
             if self._check_max_drawdown(self._current_dt, float(self.cur_close)):
                 self._cursor += 1
                 continue
 
-            # Mirror live bar_iteration session guard behavior:
-            # block new entries after cutoff and force-close at market close.
             self._apply_session_time_guards()
 
             if len(self.active_orders) > 0:
-                self._closed_any_this_bar = False
-                ts_val = new_row["timestamp"].iloc[-1]
-                try:
-                    bar_ts_ms = int(float(ts_val))
-                    if bar_ts_ms < 10**12:
-                        bar_ts_ms = int(bar_ts_ms * 1000)
-                except (TypeError, ValueError):
-                    bar_ts = self._extract_bar_time(new_row)
-                    bar_ts_ms = int(bar_ts.timestamp() * 1000) if bar_ts else 0
-                one_min_bars = self._get_1m_bars_for_15m_bar(bar_ts_ms)
+                if not mirror_live:
+                    self._legacy_process_1m_closes_for_bar(new_row)
+                elif not intrabar_checked:
+                    self._process_15m_bar_closes(new_row)
 
-                if one_min_bars.empty:
-                    current_high = float(new_row["high"].iloc[-1])
-                    current_low = float(new_row["low"].iloc[-1])
-                    self._process_order_closes(
-                        current_high, current_low, self.cur_close, self._current_dt,
-                        use_1m=False,
-                    )
-                else:
-                    for _, row_1m in one_min_bars.iterrows():
-                        if not self.active_orders:
-                            break
-                        ts_val = row_1m["timestamp"]
-                        try:
-                            ts_val = int(float(ts_val))
-                        except (TypeError, ValueError):
-                            ts_val = 0
-                        eval_bucket_ms = ts_val if ts_val > 10**12 else ts_val * 1000
-                        h_1m = float(row_1m["high"]) if "high" in row_1m else self.cur_close
-                        l_1m = float(row_1m["low"]) if "low" in row_1m else self.cur_close
-                        c_1m = float(row_1m["close"]) if "close" in row_1m else self.cur_close
-                        dt_1m = self._parse_start_timestamp(ts_val) if ts_val else self._current_dt
-                        self.update_stops(
-                            current_high=h_1m,
-                            current_low=l_1m,
-                            high_changed=True,
-                            low_changed=True,
-                            eval_bucket_ts_ms=eval_bucket_ms,
-                        )
-                        self._process_order_closes(
-                            h_1m, l_1m, c_1m, dt_1m,
-                            use_1m=True,
-                            eval_bucket_ts_ms=eval_bucket_ms,
-                        )
                 current_high = float(new_row["high"].iloc[-1])
                 current_low = float(new_row["low"].iloc[-1])
                 if self.active_orders:
@@ -987,80 +1364,30 @@ class FVG_Backtest(FVG_Strategy):
                     self.lastPositionWasLong = any(o.side == "BUY" for o in self.active_orders)
                     self.lastPositionWasShort = any(o.side == "SELL" for o in self.active_orders)
                     self._cleanup_partial_groups()
-                # Keep strategy state in sync with the latest closed 15m bar,
-                # but only after close checks to avoid same-bar lookahead exits.
+                # After exits: sync BOS/CHoCH/FVG state to the newly closed bar.
                 self.update_indicators()
                 self.add_fvg_zones()
+                self._cache_entry_filters()
                 if self.account_balance <= 0:
                     self._stopped = True
                     break
             else:
                 self.update_indicators()
                 self.add_fvg_zones()
+                self._cache_entry_filters()
                 if self.account_balance <= 0:
                     self._stopped = True
                     break
-                intrabar_checked = False
-                if (
-                    getattr(self, "require_intrabar_entry", False)
-                    and self._full_data_1m is not None
-                ):
-                    ts_val = new_row["timestamp"].iloc[-1]
-                    try:
-                        bar_ts_ms = int(float(ts_val))
-                        if bar_ts_ms < 10**12:
-                            bar_ts_ms = int(bar_ts_ms * 1000)
-                    except (TypeError, ValueError):
-                        bar_ts = self._extract_bar_time(new_row)
-                        bar_ts_ms = int(bar_ts.timestamp() * 1000) if bar_ts else 0
 
-                    one_min_bars = self._get_1m_bars_for_15m_bar(bar_ts_ms)
-                    if not one_min_bars.empty:
-                        intrabar_checked = True
-                        for _, row_1m in one_min_bars.iterrows():
-                            if self.active_orders:
-                                break
-
-                            ts_1m = row_1m["timestamp"]
-                            try:
-                                ts_1m = int(float(ts_1m))
-                            except (TypeError, ValueError):
-                                ts_1m = 0
-
-                            eval_bucket_ms = ts_1m if ts_1m > 10**12 else ts_1m * 1000
-                            tick_dt = (
-                                self._parse_start_timestamp(ts_1m)
-                                if ts_1m
-                                else self._current_dt
-                            )
-                            tick_price = (
-                                float(row_1m["close"])
-                                if "close" in row_1m and pd.notna(row_1m["close"])
-                                else self.cur_close
-                            )
-                            tick_high = (
-                                float(row_1m["high"])
-                                if "high" in row_1m and pd.notna(row_1m["high"])
-                                else tick_price
-                            )
-                            tick_low = (
-                                float(row_1m["low"])
-                                if "low" in row_1m and pd.notna(row_1m["low"])
-                                else tick_price
-                            )
-
-                            self._run_intrabar_entry_logic(
-                                tick_price=tick_price,
-                                tick_high=tick_high,
-                                tick_low=tick_low,
-                            )
-
-                            if self.active_orders:
-                                for order in self.active_orders:
-                                    if getattr(order, "opened_eval_ts_ms", None) is None:
-                                        order.opened_eval_ts_ms = eval_bucket_ms
-                                    if order.entry_time is None:
-                                        order.entry_time = tick_dt
+                if not mirror_live:
+                    intrabar_checked = False
+                    if (
+                        getattr(self, "require_intrabar_entry", False)
+                        and self._full_data_1m is not None
+                    ):
+                        intrabar_checked = self._legacy_process_1m_intrabar_entries(new_row)
+                        if intrabar_checked:
+                            self._apply_cached_entry_filters()
 
                 if not self.active_orders and not intrabar_checked:
                     last_index = self.data.index[-1]
@@ -1079,6 +1406,7 @@ class FVG_Backtest(FVG_Strategy):
                         if not ALLOW_INTRACANDLE_ENTRY:
                             self.data.at[last_index, "high"] = orig_high
                             self.data.at[last_index, "low"] = orig_low
+
                 if self.active_orders:
                     for active_order in self.active_orders:
                         if active_order.entry_time is None:
@@ -1091,6 +1419,8 @@ class FVG_Backtest(FVG_Strategy):
 
 
 if __name__ == "__main__":
+    if _is_futures_asset(ASSET):
+        configure_futures_backtest()
     data_path = DATA_CSV_PATH
     backtest = FVG_Backtest(
         asset=ASSET,

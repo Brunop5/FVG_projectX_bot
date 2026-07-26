@@ -82,13 +82,40 @@ def setup_global_logging(log_path: str) -> None:
 def init_api(username, api_key):
     res = login_to_api(username, api_key)
     if not res["success"]:
-        print(username)
-        print(res)
-        raise RuntimeError("❌ API login failed")
+        err = res.get("errorMessage") or res.get("message")
+        code = res.get("errorCode")
+        if not err and code is not None:
+            err = f"errorCode={code} (invalid or expired API key?)"
+        if not err:
+            err = res
+        print(f"❌ API login failed for {username}: {err}")
+        raise RuntimeError("❌ API login failed — check PROJECTX_USERNAME and PROJECTX_API_KEY in .env")
 
     global_token = res["token"]
     print(f"✅ API initialized.")
     return global_token
+
+
+def fetch_and_save_contracts(auth_token: str, output_dir: str | None = None) -> pd.DataFrame:
+    """Fetch available contracts from TopstepX and write contracts.csv."""
+    out_dir = output_dir or PROJECTX_RUNTIME_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    strat = ProjectX_Strategy(["CON.F.US.MGC.J26", "15min", ""])
+    strat.set_token(auth_token)
+    contracts = strat.get_assets()
+    df = pd.DataFrame(contracts)
+    csv_path = os.path.join(out_dir, "contracts.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"✅ Contract list updated: {len(df)} contracts -> {csv_path}")
+    mgc = df[
+        df["name"].astype(str).str.contains("MGC", case=False, na=False)
+        | df["id"].astype(str).str.contains("MGC", case=False, na=False)
+    ]
+    if not mgc.empty:
+        print("📋 Micro Gold (MGC) contracts:")
+        cols = [c for c in ("id", "name", "tickSize", "tickValue", "activeContract") if c in mgc.columns]
+        print(mgc[cols].to_string(index=False))
+    return df
 
 
 class ProjectX_Order(FVG_Order):
@@ -106,6 +133,10 @@ class ProjectX_Order(FVG_Order):
         self.account_id = account_id
         self.asset_id = asset_id
         self.auth_token = auth_token
+
+    @staticmethod
+    def _api_int(value) -> int:
+        return int(float(value))
 
     def place_order(self):
         """
@@ -128,15 +159,11 @@ class ProjectX_Order(FVG_Order):
         side_code = 0 if self.side.upper() == "BUY" else 1
         
         payload = {
-            "accountId": self.account_id,
-            "contractId": self.asset_id,
+            "accountId": self._api_int(self.account_id),
+            "contractId": str(self.asset_id),
             "type": 2,  # 2 = Market order
             "side": side_code,  # 0 = Bid (buy), 1 = Ask (sell)
-            "size": self.order_size,
-            "limitPrice": None,
-            "stopPrice": None,
-            "trailPrice": None,
-            "customTag": None,
+            "size": self._api_int(self.order_size),
         }
 
         try:
@@ -147,8 +174,11 @@ class ProjectX_Order(FVG_Order):
                 if result.get("success", False):
                     order_id = result.get("orderId")
                     print(f"✅ Order placed successfully. Order ID: {order_id}")
-                    print(f"   Side: {self.side}, Size: {self.order_size}, Entry: {self.entry_price:.5f}")
-                    print(f"   TP: {self.take_profit:.5f}, SL: {self.trailing_stop_loss:.5f}")
+                    print(f"   Side: {self.side}, Size: {self._api_int(self.order_size)}")
+                    if self.take_profit is not None:
+                        print(f"   TP: {self.take_profit:.5f}")
+                    if self.trailing_stop_loss is not None:
+                        print(f"   SL: {self.trailing_stop_loss:.5f}")
                     return {
                         'success': True,
                         'order_id': order_id,
@@ -197,8 +227,8 @@ class ProjectX_Order(FVG_Order):
         }
 
         payload = {
-            "accountId": self.account_id,
-            "contractId": self.asset_id
+            "accountId": self._api_int(self.account_id),
+            "contractId": str(self.asset_id),
         }
 
         try:
@@ -209,6 +239,26 @@ class ProjectX_Order(FVG_Order):
         except Exception as e:
             print(f"❌ Failed to close position: {e}")
             raise Exception(f"Unexpected response: {e}")
+
+
+def open_test_trade(auth_token: str, asset_tuple) -> dict:
+    account_id = get_account_id(auth_token, asset_tuple[2])
+    order = ProjectX_Order(
+        entry_atr=1.0,
+        account_id=account_id,
+        asset_id=asset_tuple[0],
+        auth_token=auth_token,
+        side="BUY",
+        order_size=1,
+        entry_price=0.0,
+    )
+    open_result = order.place_order()
+    if not (isinstance(open_result, dict) and open_result.get("success")):
+        return open_result
+    print("⏳ Test trade open — closing in 5 seconds...")
+    sleep(5)
+    close_result = order.close_order()
+    return {"open": open_result, "close": close_result}
 
 
 class ProjectX_Strategy(FVG_Strategy):
@@ -521,10 +571,77 @@ class ProjectX_Strategy(FVG_Strategy):
 
     def subscribe_to_price_updates(self):
         print("subscribed")
+        _last_fail_log = 0.0
+        _last_stale_log = 0.0
+        _fail_streak = 0
         while True:
             sleep(10)
-            new_row = fetch_data(self.asset, "1min", 1, self.auth_token, include_partial_bar=True)
-            self.update_price(new_row)
+            t0 = time.monotonic()
+            try:
+                new_row = fetch_data(
+                    self.asset,
+                    "1min",
+                    1,
+                    self.auth_token,
+                    include_partial_bar=True,
+                )
+            except Exception as exc:
+                _fail_streak += 1
+                now = time.monotonic()
+                if now - _last_fail_log >= 30.0 or _fail_streak <= 3:
+                    print(
+                        f"❌ Price poll fetch exception (streak={_fail_streak}, "
+                        f"{now - t0:.1f}s): {exc}"
+                    )
+                    _last_fail_log = now
+                continue
+
+            elapsed = time.monotonic() - t0
+            if elapsed >= 5.0:
+                print(
+                    f"⚠️  Price poll slow: fetch took {elapsed:.1f}s "
+                    f"(retries/blocking inside fetch_data?)"
+                )
+
+            if new_row is None or len(new_row) == 0:
+                _fail_streak += 1
+                now = time.monotonic()
+                if now - _last_fail_log >= 30.0 or _fail_streak <= 3:
+                    print(
+                        f"❌ Price poll: no 1m bar returned "
+                        f"(streak={_fail_streak}, fetch={elapsed:.1f}s)"
+                    )
+                    _last_fail_log = now
+                continue
+
+            _fail_streak = 0
+            try:
+                # Detect lagging "success" responses (common miss mode: got a bar,
+                # but not the minute that actually touched the zone).
+                ts_val = new_row["timestamp"].iloc[-1] if "timestamp" in new_row.columns else None
+                if ts_val is not None and pd.notna(ts_val):
+                    ts_num = float(ts_val)
+                    bar_ts = ts_num / 1000.0 if ts_num > 1e12 else ts_num
+                    lag_s = time.time() - bar_ts
+                    if lag_s > 90.0:
+                        now = time.monotonic()
+                        if now - _last_stale_log >= 60.0:
+                            bar_dt = datetime.utcfromtimestamp(bar_ts).strftime(
+                                "%Y-%m-%d %H:%M:%S"
+                            )
+                            print(
+                                f"⚠️  Price poll stale 1m bar: ts={bar_dt} UTC "
+                                f"(lag={lag_s:.0f}s) OHLCV="
+                                f"{float(new_row['open'].iloc[-1]):.2f}/"
+                                f"{float(new_row['high'].iloc[-1]):.2f}/"
+                                f"{float(new_row['low'].iloc[-1]):.2f}/"
+                                f"{float(new_row['close'].iloc[-1]):.2f}/"
+                                f"{float(new_row['volume'].iloc[-1]):.0f}"
+                            )
+                            _last_stale_log = now
+                self.update_price(new_row)
+            except Exception as exc:
+                print(f"❌ Price poll update_price failed: {exc}")
 
     def start_bar_iterations(self):
         sleep_until_next_boundary(self.timeframe)
@@ -733,13 +850,9 @@ if __name__ == "__main__":
         global_token = init_api(api["username"], api["api_key"])
 
         if INPUTS.UPDATE_CONTRACT_LIST:
-            strat = ProjectX_Strategy(api["assets_list"][0])
-            strat.username = api.get("username")
-            strat.init_api(global_token)
-            data = strat.get_assets()
-            data = pd.DataFrame(data)
-            data.to_csv(os.path.join(PROJECTX_RUNTIME_DIR, "contracts.csv"), index=False)
-            print("Contract list updated successfully!!")
+            fetch_and_save_contracts(global_token)
+        elif os.getenv("OPEN_TEST_TRADE", "").strip().lower() in ("1", "true", "yes"):
+            open_test_trade(global_token, api["assets_list"][0])
         elif INPUTS.SHOW_ACCOUNTS:
             strat = ProjectX_Strategy(api["assets_list"][0])
             strat.username = api.get("username")
@@ -769,12 +882,10 @@ if __name__ == "__main__":
                 print(res)
             except Exception as exc:
                 print(f"❌ Failed to fetch trades: {exc}")
-
         else:
             runner = ProjectX_AccountRunner(api)
             runner.start()
-
-
-    while True:
-        sleep(5)
+            while True:
+                sleep(5)
+        break
             
