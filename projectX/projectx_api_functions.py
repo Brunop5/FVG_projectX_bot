@@ -415,9 +415,9 @@ def fetch_data(
                             max_retry_seconds=_remaining_retry_seconds(),
                             _extra_lookback_days=5,
                         )
-                    if not (
-                        num_bars <= 2 and _is_likely_futures_session_closed()
-                    ):
+                    # Live 1m price polls often get empty responses from TopStepX;
+                    # keep that quiet. Still log for larger historical fetches.
+                    if num_bars > 2:
                         print(
                             f"⚠️  TopStepX returned empty bars "
                             f"(asset={asset}, tf={timeframe}, limit={num_bars}, "

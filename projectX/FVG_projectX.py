@@ -744,21 +744,15 @@ class ProjectX_Strategy(FVG_Strategy):
 
             if new_row is None or len(new_row) == 0:
                 _fail_streak += 1
+                # TopStepX commonly returns empty 1m polls; don't spam the log.
                 now = time.monotonic()
-                if session_closed:
-                    if now - _last_closed_log >= 600.0:
-                        print(
-                            "⏸️  Futures session likely closed; price poll idle "
-                            f"(empty 1m bars, streak={_fail_streak})."
-                        )
-                        _last_closed_log = now
-                    continue
-                if now - _last_fail_log >= 30.0 or _fail_streak <= 3:
+                if now - _last_closed_log >= 600.0:
+                    reason = "session closed" if session_closed else "empty API response"
                     print(
-                        f"❌ Price poll: no 1m bar returned "
-                        f"(streak={_fail_streak}, fetch={elapsed:.1f}s)"
+                        f"⏸️  Price poll idle ({reason}; "
+                        f"empty 1m bars, streak={_fail_streak})."
                     )
-                    _last_fail_log = now
+                    _last_closed_log = now
                 continue
 
             _fail_streak = 0
